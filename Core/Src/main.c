@@ -65,6 +65,7 @@
 
 // PID
 #define KP 0.5
+#define KD 0.1
 #define SETPOINT_ANGLE 0.0
 /* USER CODE END PD */
 
@@ -152,6 +153,8 @@ const char *wifiIp 		 = "192.168.100.79";
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
+
+static float previous_error = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -991,9 +994,11 @@ int main(void)
 
 			  calculate_tilt(ax, ay, az, &roll_deg, &pitch_deg);
 
-			  // Proportional control
+			  // PD control
 			  float error = SETPOINT_ANGLE - pitch_deg;
-			  float output = KP * error;
+			  float derivative = error - previous_error;
+			  float output = (KP * error) + (KD * derivative);
+			  previous_error = error;
 
 			  motorRightVelocity = (int16_t)output;
 			  motorLeftVelocity  = (int16_t)output;
