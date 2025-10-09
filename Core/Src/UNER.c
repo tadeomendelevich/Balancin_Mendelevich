@@ -46,8 +46,8 @@ static uint8_t   adcBufLen = 0;
 static int16_t *p_motorRightVel = NULL;		// Punteros a las variables de velocidad en main.c
 static int16_t *p_motorLeftVel  = NULL;
 
-static int16_t *p_roll  = NULL;
-static int16_t *p_pitch = NULL;
+static float *p_roll  = NULL;
+static float *p_pitch = NULL;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
@@ -306,14 +306,18 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         	break;
         case GETANGLE:
         	if (p_roll && p_pitch) {
-        		putHeaderOnTx(dataTx, GETANGLE, 5);
+			putHeaderOnTx(dataTx, GETANGLE, 9); // 1 byte cmd + 2*4 bytes for float angles
 
-				myWord.ui16[0] =  (int16_t)*p_roll; 	// Envio datos de INCLINACION
+				myWord.f32 = *p_roll; 	// Envio datos de INCLINACION
 				putByteOnTx(dataTx, myWord.ui8[0] );
 				putByteOnTx(dataTx, myWord.ui8[1] );
-				myWord.ui16[0] =  (int16_t)*p_pitch;
+				putByteOnTx(dataTx, myWord.ui8[2] );
+				putByteOnTx(dataTx, myWord.ui8[3] );
+				myWord.f32 = *p_pitch;
 				putByteOnTx(dataTx, myWord.ui8[0] );
 				putByteOnTx(dataTx, myWord.ui8[1] );
+				putByteOnTx(dataTx, myWord.ui8[2] );
+				putByteOnTx(dataTx, myWord.ui8[3] );
 
 				putByteOnTx(dataTx, dataTx->chk);
 
@@ -354,7 +358,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
-        	putHeaderOnTx(dataTx, SENDALLSENSORS, 33);
+		putHeaderOnTx(dataTx, SENDALLSENSORS, 37); // 1 cmd + 16 ADC + 12 MPU + 8 Angle
 
 			myWord.ui16[0] =  (int16_t)p_adcBuf[0]; 		// ADC 1
 			putByteOnTx(dataTx, myWord.ui8[0] );
@@ -401,12 +405,16 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			putByteOnTx(dataTx, myWord.ui8[0] );
 			putByteOnTx(dataTx, myWord.ui8[1] );
 
-			myWord.ui16[0] =  (int16_t)*p_roll; 	// Envio datos de INCLINACION
+			myWord.f32 = *p_roll; 	// Envio datos de INCLINACION
 			putByteOnTx(dataTx, myWord.ui8[0] );
 			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)*p_pitch;
+			putByteOnTx(dataTx, myWord.ui8[2] );
+			putByteOnTx(dataTx, myWord.ui8[3] );
+			myWord.f32 = *p_pitch;
 			putByteOnTx(dataTx, myWord.ui8[0] );
 			putByteOnTx(dataTx, myWord.ui8[1] );
+			putByteOnTx(dataTx, myWord.ui8[2] );
+			putByteOnTx(dataTx, myWord.ui8[3] );
 
 			putByteOnTx(dataTx, unerTx->chk);
 
@@ -453,7 +461,7 @@ void UNER_SendAllSensors(void) {
 	unerTx->indexR = 0;
 	unerTx->chk    = 0;
 
-	putHeaderOnTx(unerTx, SENDALLSENSORS, 33);
+	putHeaderOnTx(unerTx, SENDALLSENSORS, 37); // 1 cmd + 16 ADC + 12 MPU + 8 Angle
 
 	myWord.ui16[0] =  (int16_t)p_adcBuf[0]; 		// ADC 1
 	putByteOnTx(unerTx, myWord.ui8[0] );
@@ -500,12 +508,16 @@ void UNER_SendAllSensors(void) {
 	putByteOnTx(unerTx, myWord.ui8[0] );
 	putByteOnTx(unerTx, myWord.ui8[1] );
 
-	myWord.ui16[0] =  (int16_t)*p_roll; 	// Envio datos de INCLINACION
+	myWord.f32 = *p_roll; 	// Envio datos de INCLINACION
 	putByteOnTx(unerTx, myWord.ui8[0] );
 	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)*p_pitch;
+	putByteOnTx(unerTx, myWord.ui8[2] );
+	putByteOnTx(unerTx, myWord.ui8[3] );
+	myWord.f32 = *p_pitch;
 	putByteOnTx(unerTx, myWord.ui8[0] );
 	putByteOnTx(unerTx, myWord.ui8[1] );
+	putByteOnTx(unerTx, myWord.ui8[2] );
+	putByteOnTx(unerTx, myWord.ui8[3] );
 
 	putByteOnTx(unerTx, unerTx->chk);
 
@@ -543,7 +555,7 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr) {
     p_motorLeftVel  = leftPtr;
 }
 
-void UNER_RegisterAngle(int16_t *rollPtr, int16_t *pitchPtr)
+void UNER_RegisterAngle(float *rollPtr, float *pitchPtr)
 {
     p_roll  = rollPtr;
     p_pitch = pitchPtr;

@@ -83,6 +83,7 @@ typedef union{
     int16_t     i16[2];
     uint8_t     ui8[4];
     int8_t      i8[4];
+    float       f32;
 }_uWord;
 
 /**
@@ -139,7 +140,7 @@ void UNER_RegisterADCBuffer(uint16_t *buf, uint8_t len);
 /**< Registra dónde escribir la velocidad de los motores */
 void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr);
 
-void UNER_RegisterAngle(int16_t *rollPtr, int16_t *pitchPtr);
+void UNER_RegisterAngle(float *rollPtr, float *pitchPtr);
 
 void UNER_SendData(void);
 
