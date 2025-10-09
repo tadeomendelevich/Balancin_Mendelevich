@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdarg.h>
 #include <string.h>
+#include <math.h>
 #include "usbd_cdc_if.h"
 #include "ssd1306.h"
 #include "fonts.h"
@@ -59,7 +60,9 @@
 #define SCREEN_W     		SSD1306_WIDTH
 #define SCREEN_H    		SSD1306_HEIGHT
 
-#define CORDIC_K  			2478
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
 
 #define ESP_USB_BUF_SIZE	512
 
@@ -109,13 +112,9 @@ static uint8_t ema_initialized = 0;
 static uint8_t sendModulesCounter, aliveCounter, mpu6050Counter;
 uint8_t mpuDataReady = 0;
 uint8_t mpu_initialized = 0;
-static int16_t roll_deg = 0;	// eje x
-static int16_t pitch_deg = 0;	// eje y
+static float roll_deg = 0.0f;	// eje x
+static float pitch_deg = 0.0f;	// eje y
 
-/// Ángulos de reducción de CORDIC en grados * 2^8 (escala Q8)
-static const int16_t cordic_phase[16] = {
-    128, 76, 40, 20, 10, 5, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0
-};
 
 uint16_t adcValues[8];
 static uint32_t adcSum[BAR_COUNT] = {0};	// Sumas acumuladas de las últimas ADC_AVERAGE_SIZE muestras
@@ -198,9 +197,7 @@ void MPU6050_ProcessDMA(void);
 
 void UpdateADC_MovingAverage(void);
 
-uint16_t isqrt_uint32(uint32_t v);
-void calculate_tilt(int16_t ax, int16_t ay, int16_t az, int16_t *out_roll_deg, int16_t *out_pitch_deg);
-int16_t cordic_atan2_deg(int32_t y, int32_t x);
+void calculate_tilt(int16_t ax, int16_t ay, int16_t az, float *out_roll_deg, float *out_pitch_deg);
 
 void updateDisplay(void);
 
@@ -639,64 +636,17 @@ void mpu_errorCb(void *ctx, int err) {
     }
 }
 
-// Entero sqrt aproximado (Newton)
-// Devuelve floor(sqrt(v))
-uint16_t isqrt_uint32(uint32_t v) {
-    uint32_t x = v;
-    uint32_t y = (x + 1) >> 1;
-    while (y < x) {
-        x = y;
-        y = (v/x + x) >> 1;
-    }
-    return (uint16_t)x;
-}
-
-/// Devuelve atan2(y,x) en grados, enteros
-int16_t cordic_atan2_deg(int32_t y, int32_t x) {
-    int32_t xc = x, yc = y;
-    int16_t angle = 0;
-
-    // Llevamos el vector dentro del cuadrante primero
-    if (xc < 0) {
-        xc = -xc;
-        yc = -yc;
-        angle = 180;
-    }
-
-    // Normalizamos por K (opcional si tu hardware lo acelera)
-    xc = (xc * CORDIC_K) >> 12;
-    yc = (yc * CORDIC_K) >> 12;
-
-    // 16 iteraciones bastan para ~1°
-    for (int i = 0; i < 16; i++) {
-        int32_t x_shift = xc >> i;
-        int32_t y_shift = yc >> i;
-        if (yc > 0) {
-            xc += y_shift;
-            yc -= x_shift;
-            angle += cordic_phase[i];
-        } else {
-            xc -= y_shift;
-            yc += x_shift;
-            angle -= cordic_phase[i];
-        }
-    }
-
-    return angle;
-}
-
-/// Tu calculate_tilt usando cordic_atan2_deg:
 void calculate_tilt(int16_t ax, int16_t ay, int16_t az,
-                    int16_t *out_roll_deg, int16_t *out_pitch_deg)
+                    float *out_roll_deg, float *out_pitch_deg)
 {
     // roll = atan2( ay, az )
-    *out_roll_deg  = cordic_atan2_deg( ay, az );
+    *out_roll_deg = atan2f(ay, az) * (180.0f / M_PI);
 
     // pitch = atan2( -ax, sqrt( ay² + az² ) )
-    uint32_t mag2 = (uint32_t)ay*(uint32_t)ay + (uint32_t)az*(uint32_t)az;
-    // Para la raíz puedes usar una isqrt aproximada:
-    int32_t denom = isqrt_uint32(mag2);
-    *out_pitch_deg = cordic_atan2_deg( -ax, denom );
+    float ay_f = (float)ay;
+    float az_f = (float)az;
+    float denom = sqrtf(ay_f*ay_f + az_f*az_f);
+    *out_pitch_deg = atan2f(-ax, denom) * (180.0f / M_PI);
 }
 
 void UpdateADC_MovingAverage(void) {
