@@ -16,7 +16,7 @@
 extern void USB_Debug(const char *fmt, ...);
 
 //#define SERVER_IP    		"172.23.205.98"	// Facultad
-#define SERVER_IP 	 	"192.168.100.5"	// Departamento concordia
+#define SERVER_IP 	 	"192.168.100.79"	// Departamento concordia
 //#define SERVER_IP 	 		"192.168.123.57"	// Casa Clara
 #define SERVER_PORT  		30010
 #define LOCAL_PORT   		30000
@@ -487,11 +487,11 @@ static void ESP01ATDecode(){
 		case 2:
 		    if(value == '\n'){
 		        esp01HState = 0;
-		        if (aDbgStr) {
+		        /*if (aDbgStr) {
 					char dbgBuf[64];
 					sprintf(dbgBuf, "DEBUG: RECIBI OK - estado actual = %d\n", esp01ATSate);
 					aDbgStr(dbgBuf);
-				}
+				}*/
 		        switch(indexResponse){
 		        case 0://AT
 		        case 1:

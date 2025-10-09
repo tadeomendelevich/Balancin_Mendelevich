@@ -140,7 +140,7 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 
 const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
 const char *wifiPassword = "djg19dlk";
-const char *wifiIp 		 = "192.168.100.5";
+const char *wifiIp 		 = "192.168.100.79";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
