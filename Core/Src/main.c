@@ -62,6 +62,10 @@
 #define CORDIC_K  			2478
 
 #define ESP_USB_BUF_SIZE	512
+
+// PID
+#define KP 0.5
+#define SETPOINT_ANGLE 0.0
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -140,7 +144,7 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 
 const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
 const char *wifiPassword = "djg19dlk";
-const char *wifiIp 		 = "192.168.100.5";
+const char *wifiIp 		 = "192.168.100.79";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
@@ -986,6 +990,13 @@ int main(void)
 			  gz = (int16_t)gz_ema;
 
 			  calculate_tilt(ax, ay, az, &roll_deg, &pitch_deg);
+
+			  // Proportional control
+			  float error = SETPOINT_ANGLE - pitch_deg;
+			  float output = KP * error;
+
+			  motorRightVelocity = (int16_t)output;
+			  motorLeftVelocity  = (int16_t)output;
 		  }
 
 		  MotorControl(motorRightVelocity, motorLeftVelocity);
