@@ -67,8 +67,8 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 0.5
-#define KD 0.1
+#define KP 2.0f
+#define KD 1.5f
 #define SETPOINT_ANGLE 0.0
 
 // Complementary Filter

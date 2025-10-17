@@ -97,33 +97,21 @@ uint8_t MPU6050_WhoAmI(void);
 int MPU6050_Init(void);
 
 // Lanza lectura no bloqueante por DMA
-void MPU6050_StartRead_Accel_DMA(void);
-
-void MPU6050_StartRead_Gyro_DMA(void);
+void MPU6050_StartRead_DMA(void);
 
 // --------------------------------------------
 // ➤ Estado y acceso a datos
 // --------------------------------------------
 /**
- * @brief  Indica si hay nueva lectura de acelerómetro lista.
+ * @brief  Indica si hay un nuevo par de lecturas (Accel + Gyro) listo.
  * @retval 1 si hay datos, 0 si no.
  */
-uint8_t MPU6050_IsAccelReady(void);
-/**
- * @brief  Indica si hay nueva lectura de giroscopio lista.
- * @retval 1 si hay datos, 0 si no.
- */
-uint8_t MPU6050_IsGyroReady(void);
+uint8_t MPU6050_IsDataReady(void);
 
 /**
- * @brief Limpia el flag que indica que hay datos de acelerómetro listos.
+ * @brief Limpia el flag que indica que hay datos listos.
 */
-void MPU6050_ClearAccelReady(void);
-
-/**
- * @brief Limpia el flag que indica que hay datos de giroscopio listos.
- */
-void MPU6050_ClearGyroReady(void);
+void MPU6050_ClearDataReady(void);
 
 /**
  * @brief  Obtiene la última lectura de aceleración escalada.
