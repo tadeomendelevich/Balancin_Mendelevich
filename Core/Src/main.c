@@ -99,7 +99,7 @@ TIM_HandleTypeDef htim5;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-uint8_t is250us, tmo100ms, is10ms;
+uint8_t is250us, tmo100ms, is10ms, is2ms;
 
 uint8_t BufUSBTx[256], nBytesTx;
 extern USBD_HandleTypeDef hUsbDeviceFS;
@@ -246,10 +246,16 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM1) {        // 10 ms
         is10ms = 1;
     }
+
     if (htim->Instance == TIM2) {        // 250 µs
         is250us = 1;
     }
+
+    if (htim->Instance == TIM5) {        // 2 ms
+            is2ms = 1;
+    }
 }
+
 
 void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c) {
     if (hi2c->Instance != I2C1) return;
