@@ -854,7 +854,7 @@ int main(void)
   } else {
     mpu_initialized = 1;
     MPU6050_Calibrate();		// Calibración
-    MPU6050_StartRead_Accel_DMA();	// Lanzo priemra lectura
+    MPU6050_StartRead_DMA();	// Lanzo priemra lectura
   }
 
   tmo100ms = 10;
@@ -890,6 +890,7 @@ int main(void)
 		  if (tmo100ms == 0) {
 			  tmo100ms = 10;
 			  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin); // Blink LED
+			  HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_10);     // Blink LED PB10
 		  }
 
 		  sendModulesCounter++;
@@ -904,17 +905,13 @@ int main(void)
 		  if (mpu6050Counter >= 1 && mpu_initialized) {
 			mpu6050Counter = 0;
 			if (!i2c1_tx_busy) {
-			  MPU6050_StartRead_Accel_DMA();   // Lanzo la lectura de aceleracion y luego se lanza sola la de giroscopio dentro de su funcion
+			  MPU6050_StartRead_DMA();
 			}
 		  }
 
-		  if (MPU6050_IsAccelReady() && !i2c1_tx_busy) {
-			  MPU6050_ClearAccelReady();
-		  }
-
-		  if (MPU6050_IsGyroReady() && !i2c1_tx_busy) {
-			  MPU6050_ClearGyroReady();
-			  mpuDataReady    = 1;
+		  if (MPU6050_IsDataReady()) {
+			  MPU6050_ClearDataReady();
+			  mpuDataReady = 1;
 		  }
 
 		  if (mpuDataReady) {		// Valores de MPU6050 listos para ser utilizados
@@ -1484,7 +1481,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10|GPIO_PIN_2, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
@@ -1493,8 +1490,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PB2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  /*Configure GPIO pins : PB10 PB2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_2;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
