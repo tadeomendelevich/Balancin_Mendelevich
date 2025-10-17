@@ -112,8 +112,8 @@ static uint8_t ema_initialized = 0;
 static uint8_t sendModulesCounter, aliveCounter, mpu6050Counter;
 uint8_t mpuDataReady = 0;
 uint8_t mpu_initialized = 0;
-static float roll_deg = 0.0f;	// eje x
-static float pitch_deg = 0.0f;	// eje y
+static float roll_deg = 0.0f;	// Ángulo de balanceo (eje Y, usado para el equilibrio)
+static float pitch_deg = 0.0f;	// Ángulo de inclinación (eje X)
 
 
 uint16_t adcValues[8];
@@ -945,7 +945,7 @@ int main(void)
 			  calculate_tilt(ax, ay, az, &roll_deg, &pitch_deg);
 
 			  // PD control
-			  float error = SETPOINT_ANGLE - pitch_deg;
+			  float error = SETPOINT_ANGLE - roll_deg;
 			  float derivative = error - previous_error;
 			  float output = (KP * error) + (KD * derivative);
 			  previous_error = error;
