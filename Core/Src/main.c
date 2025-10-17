@@ -901,7 +901,7 @@ int main(void)
 		  }
 
 		  mpu6050Counter++;
-		  if (mpu6050Counter >= 2 && mpu_initialized) {
+		  if (mpu6050Counter >= 1 && mpu_initialized) {
 			mpu6050Counter = 0;
 			if (!i2c1_tx_busy) {
 			  MPU6050_StartRead_Accel_DMA();   // Lanzo la lectura de aceleracion y luego se lanza sola la de giroscopio dentro de su funcion
