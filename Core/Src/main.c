@@ -73,7 +73,7 @@
 
 // Complementary Filter
 #define ALPHA 0.98f
-#define DT 0.01f
+#define DT 0.002f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -810,6 +810,7 @@ int main(void)
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcValues, 8);
   HAL_TIM_Base_Start_IT(&htim1);   // 10 ms
   HAL_TIM_Base_Start_IT(&htim2);   // 250 us (si lo vas a usar)
+  HAL_TIM_Base_Start_IT(&htim5);   // 2 ms (500 Hz)
 
   PWM_init();
 
@@ -879,6 +880,46 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  if(is2ms) {
+		  is2ms = 0;
+
+		  // Iniciar lectura del sensor MPU6050
+		  if (mpu_initialized && !i2c1_tx_busy) {
+			  MPU6050_StartRead_DMA();
+		  }
+
+		  // Comprobar si hay datos listos
+		  if (MPU6050_IsDataReady()) {
+			  MPU6050_ClearDataReady();
+			  mpuDataReady = 1;
+		  }
+
+		  if (mpuDataReady) {
+			  mpuDataReady = 0;
+			  MPU6050_GetAccel(&ax, &ay, &az);
+			  MPU6050_GetGyro(&gx, &gy, &gz);
+
+			  // EMA, filtro complementario, control PD...
+			  // ... (toda la lógica de control se ejecuta aquí)
+
+			  // --- Complementary Filter & PD Control ---
+			  float accel_roll_deg = atan2f(ay, az) * (180.0f / M_PI);
+			  float gyro_y_dps = (float)gy / 100.0f;
+			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_y_dps * DT) + (1.0f - ALPHA) * accel_roll_deg;
+			  float error = SETPOINT_ANGLE - filtered_roll_deg;
+			  float derivative = error - previous_error;
+			  float output = (KP * error) + (KD * derivative);
+			  previous_error = error;
+			  motorRightVelocity = (int16_t)output;
+			  motorLeftVelocity  = (int16_t)output;
+
+			  // Actualizar variables para reporte
+			  roll_deg = filtered_roll_deg;
+		  }
+
+		  // Actualizar motores
+		  MotorControl(motorRightVelocity, motorLeftVelocity);
+	  }
 
 	  if(is10ms) {
 		  is10ms = 0;
@@ -901,78 +942,9 @@ int main(void)
 			  }
 		  }
 
-		  mpu6050Counter++;
-		  if (mpu6050Counter >= 1 && mpu_initialized) {
-			mpu6050Counter = 0;
-			if (!i2c1_tx_busy) {
-			  MPU6050_StartRead_DMA();
-			}
-		  }
-
-		  if (MPU6050_IsDataReady()) {
-			  MPU6050_ClearDataReady();
-			  mpuDataReady = 1;
-		  }
-
-		  if (mpuDataReady) {		// Valores de MPU6050 listos para ser utilizados
-			  mpuDataReady = 0;
-			  MPU6050_GetAccel(&ax, &ay, &az);
-			  MPU6050_GetGyro(&gx, &gy, &gz);
-
-			  if (!ema_initialized) {
-				  // Primera muestra: inicializar
-				  ax_ema = ax;  ay_ema = ay;  az_ema = az;
-				  gx_ema = gx;  gy_ema = gy;  gz_ema = gz;
-				  ema_initialized = 1;
-			  } else {
-				  // EMA: new_ema = ((old_ema*(MPU_AVERAGE_SIZE-1)) + sample) / MPU_AVERAGE_SIZE
-				  ax_ema = ((ax_ema * (MPU_AVERAGE_SIZE - 1)) + ax) / MPU_AVERAGE_SIZE;
-				  ay_ema = ((ay_ema * (MPU_AVERAGE_SIZE - 1)) + ay) / MPU_AVERAGE_SIZE;
-				  az_ema = ((az_ema * (MPU_AVERAGE_SIZE - 1)) + az) / MPU_AVERAGE_SIZE;
-
-				  gx_ema = ((gx_ema * (MPU_AVERAGE_SIZE - 1)) + gx) / MPU_AVERAGE_SIZE;
-				  gy_ema = ((gy_ema * (MPU_AVERAGE_SIZE - 1)) + gy) / MPU_AVERAGE_SIZE;
-				  gz_ema = ((gz_ema * (MPU_AVERAGE_SIZE - 1)) + gz) / MPU_AVERAGE_SIZE;
-			  }
-
-			  // Sobrescribimos las variables que UNER enviará:
-			  ax = (int16_t)ax_ema;
-			  ay = (int16_t)ay_ema;
-			  az = (int16_t)az_ema;
-
-			  gx = (int16_t)gx_ema;
-			  gy = (int16_t)gy_ema;
-			  gz = (int16_t)gz_ema;
-
-			  // --- Complementary Filter ---
-			  // 1. Calculate roll from accelerometer
-			  float accel_roll_deg = atan2f(ay, az) * (180.0f / M_PI);
-
-			  // 2. Get gyro data (already in centi-dps) and convert to dps
-			  float gyro_y_dps = (float)gy / 100.0f;
-
-			  // 3. Apply filter
-			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_y_dps * DT) + (1.0f - ALPHA) * accel_roll_deg;
-
-			  // --- PD control ---
-			  float error = SETPOINT_ANGLE - filtered_roll_deg;
-			  float derivative = error - previous_error;
-			  float output = (KP * error) + (KD * derivative);
-			  previous_error = error;
-
-			  motorRightVelocity = (int16_t)output;
-			  motorLeftVelocity  = (int16_t)output;
-
-			  // Update legacy variables for UNER reporting
-			  roll_deg = filtered_roll_deg;
-			  calculate_tilt(ax, ay, az, &roll_deg, &pitch_deg);
-		  }
-
-		  MotorControl(motorRightVelocity, motorLeftVelocity);
-
+		  // La lógica de ADC y Display se queda aquí para no sobrecargar el bucle rápido
 		  UpdateADC_MovingAverage();
-
-		  if (SSD1306_IsUpdateDone()) {	// Actualizar display con valores de adc, mpu y estados
+		  if (SSD1306_IsUpdateDone()) {
 			  updateDisplay();
 		  }
 	  }
