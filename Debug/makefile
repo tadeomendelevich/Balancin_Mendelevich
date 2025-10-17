@@ -64,8 +64,8 @@ all: main-build
 main-build: Balancin_Mendelevich.elf secondary-outputs
 
 # Tool invocations
-Balancin_Mendelevich.elf Balancin_Mendelevich.map: $(OBJS) $(USER_OBJS) C:\Users\tadeo\STM32CubeIDE\workspace_1.18.1\Balancin_Mendelevich\STM32F411CEUX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "Balancin_Mendelevich.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\tadeo\STM32CubeIDE\workspace_1.18.1\Balancin_Mendelevich\STM32F411CEUX_FLASH.ld" --specs=nosys.specs -Wl,-Map="Balancin_Mendelevich.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+Balancin_Mendelevich.elf Balancin_Mendelevich.map: $(OBJS) $(USER_OBJS) ../STM32F411CEUX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "Balancin_Mendelevich.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"../STM32F411CEUX_FLASH.ld" --specs=nosys.specs -Wl,-Map="Balancin_Mendelevich.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
