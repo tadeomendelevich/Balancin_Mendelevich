@@ -70,6 +70,10 @@
 #define KP 0.5
 #define KD 0.1
 #define SETPOINT_ANGLE 0.0
+
+// Complementary Filter
+#define ALPHA 0.98f
+#define DT 0.01f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -154,6 +158,7 @@ int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
 
 static float previous_error = 0.0f;
+static float filtered_roll_deg = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -942,16 +947,28 @@ int main(void)
 			  gy = (int16_t)gy_ema;
 			  gz = (int16_t)gz_ema;
 
-			  calculate_tilt(ax, ay, az, &roll_deg, &pitch_deg);
+			  // --- Complementary Filter ---
+			  // 1. Calculate roll from accelerometer
+			  float accel_roll_deg = atan2f(ay, az) * (180.0f / M_PI);
 
-			  // PD control
-			  float error = SETPOINT_ANGLE - roll_deg;
+			  // 2. Get gyro data (already in centi-dps) and convert to dps
+			  float gyro_y_dps = (float)gy / 100.0f;
+
+			  // 3. Apply filter
+			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_y_dps * DT) + (1.0f - ALPHA) * accel_roll_deg;
+
+			  // --- PD control ---
+			  float error = SETPOINT_ANGLE - filtered_roll_deg;
 			  float derivative = error - previous_error;
 			  float output = (KP * error) + (KD * derivative);
 			  previous_error = error;
 
 			  motorRightVelocity = (int16_t)output;
 			  motorLeftVelocity  = (int16_t)output;
+
+			  // Update legacy variables for UNER reporting
+			  roll_deg = filtered_roll_deg;
+			  calculate_tilt(ax, ay, az, &roll_deg, &pitch_deg);
 		  }
 
 		  MotorControl(motorRightVelocity, motorLeftVelocity);
