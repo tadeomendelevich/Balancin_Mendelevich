@@ -46,7 +46,10 @@ static uint8_t   adcBufLen = 0;
 static int16_t *p_motorRightVel = NULL;		// Punteros a las variables de velocidad en main.c
 static int16_t *p_motorLeftVel  = NULL;
 
-static float *p_roll  = NULL;
+static float *p_KP = NULL;		// Punteros a las variables de control proporcional en main.c
+static float *p_KD  = NULL;
+
+static float *p_roll  = NULL;	// Punteros a las variables de inclinacion en main.c
 static float *p_pitch = NULL;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
@@ -355,6 +358,31 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			else if (vRight < -100) vRight = -100;
 			if (p_motorRightVel) *p_motorRightVel = vRight;
 		break;
+
+        case MODIFYKP:
+        	putHeaderOnTx(dataTx, MODIFYKP, 2);
+			putByteOnTx(dataTx, ACK );
+			putByteOnTx(dataTx, dataTx->chk);
+			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
+			float new_KP = myWord.i32;
+			*p_KP = new_KP;
+        break;
+
+        case MODIFYKD:
+			putHeaderOnTx(dataTx, MODIFYKD, 2);
+			putByteOnTx(dataTx, ACK );
+			putByteOnTx(dataTx, dataTx->chk);
+			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
+			float new_KD = myWord.i32;
+			*p_KD = new_KD;
+		break;
+
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
@@ -429,6 +457,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
     }
 }
+
 
 void UNER_SendAlive(void) {
     USB_Debug(">>> UNER_SendAlive llamado\n");
@@ -554,6 +583,12 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr) {
     p_motorRightVel = rightPtr;
     p_motorLeftVel  = leftPtr;
 }
+
+void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr) {
+    p_KP = kpPtr;
+    p_KD  = kdPtr;
+}
+
 
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr)
 {

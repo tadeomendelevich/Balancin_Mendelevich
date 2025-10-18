@@ -100,6 +100,9 @@ typedef enum{
 	GETANGLE = 0XA7,
     RADAR = 0xA8,
 	SENDALLSENSORS = 0xA9,
+	MODIFYKP = 0xB1,
+	MODIFYKD = 0xB2,
+	MODIFYKI = 0xB3,
     ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -141,6 +144,8 @@ void UNER_RegisterADCBuffer(uint16_t *buf, uint8_t len);
 void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr);
 
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr);
+
+void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr);
 
 void UNER_SendData(void);
 

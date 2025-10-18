@@ -67,8 +67,8 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 2.0f
-#define KD 1.5f
+#define KP 17.5f
+#define KD 100.0f
 
 #define SETPOINT_ANGLE 0.0
 
@@ -112,8 +112,6 @@ static volatile uint16_t tx_tail = 0;
 static volatile uint8_t usb_tx_busy = 0;
 static const char HEX_DIGITS[] = "0123456789ABCDEF";	// Tabla de dígitos hex para USB
 
-static int32_t ax_ema = 0, ay_ema = 0, az_ema = 0;
-static int32_t gx_ema = 0, gy_ema = 0, gz_ema = 0;
 static uint8_t ema_initialized = 0;
 static uint8_t sendModulesCounter, aliveCounter, mpu6050Counter;
 uint8_t mpuDataReady = 0;
@@ -148,19 +146,22 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 //const char *wifiPassword = "fcalconcordia.06-2019";
 //const char *wifiIp = "172.23.205.98";
 
-const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-const char *wifiPassword = "djg19dlk";
-const char *wifiIp 		 = "192.168.100.5";
+//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+//const char *wifiPassword = "djg19dlk";
+//const char *wifiIp 		 = "192.168.100.5";
 
-//const char *wifiSSID     = "Delco_Mendelevich";
-//const char *wifiPassword = "toyotakia";
-//const char *wifiIp = "192.168.123.57";
+const char *wifiSSID     = "Delco_Mendelevich";
+const char *wifiPassword = "toyotakia";
+const char *wifiIp = "192.168.123.174";
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
 
 static float previous_error = 0.0f;
 static float filtered_roll_deg = 0.0f;
+
+float KP_value;
+float KD_value;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -850,6 +851,7 @@ int main(void)
   UNER_RegisterADCBuffer(adcAvg, 8);  // array adcValues[8]
   UNER_RegisterMotorSpeed(&motorRightVelocity, &motorLeftVelocity);
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
+  UNER_RegisterProportionalControl(&KP_value, &KD_value);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();
@@ -880,7 +882,10 @@ int main(void)
   esp01IwRx = 0;
   esp01IrRx = 0;
 
-  HAL_Delay(2000);
+  KP_value = KP;
+  KP_value = KD;
+
+  HAL_Delay(500);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -918,7 +923,7 @@ int main(void)
 			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_y_dps * DT) + (1.0f - ALPHA) * accel_roll_deg;
 			  float error = SETPOINT_ANGLE - filtered_roll_deg;
 			  float derivative = error - previous_error;
-			  float output = (KP * error) + (KD * derivative);
+			  float output = (KP_value * error) + (KD_value * derivative);
 			  previous_error = error;
 			  motorRightVelocity = (int16_t)output;
 			  motorLeftVelocity  = (int16_t)output;
