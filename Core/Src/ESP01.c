@@ -196,7 +196,7 @@ _eESP01STATUS ESP01_StartUDP(const char *RemoteIP, uint16_t RemotePORT, uint16_t
 	if(esp01Flags.bit.WIFICONNECTED == 0)
 		return ESP01_WIFI_DISCONNECTED;
 
-	esp01ATSate = ESP01ATPREPUDP;
+	esp01ATSate = ESP01ATCIPCLOSE;
 
 	return ESP01_UDPTCP_CONNECTING;
 }
@@ -498,8 +498,9 @@ static void ESP01ATDecode(){
 		            if (   esp01ATSate == ESP01ATRESPONSE
 		                || esp01ATSate == ESP01ATCWMODE_RESPONSE
 		                || esp01ATSate == ESP01ATCWDHCP_RESPONSE
-		                || esp01ATSate == ESP01CWJAPRESPONSE ) {
-		                aDbgStr(">>> DEBUG: marcando ATRESPONSEOK = 1\n");
+		                || esp01ATSate == ESP01CWJAPRESPONSE
+						|| esp01ATSate == ESP01ATCIPCLOSE
+						|| esp01ATSate == ESP01ATCIPMUX) {
 		                esp01TimeoutTask = 0;
 		                esp01Flags.bit.ATRESPONSEOK = 1;
 		            }
@@ -854,34 +855,15 @@ static void ESP01DOConnection(){
 	    break;
 
 	case ESP01ATCIPMUX:
-	    if (strcmp(esp01PROTO, "TCP") == 0) {
-	        // multiplicado y server en TCP
-	        ESP01StrToBufTX("AT+CIPMUX=1\r\n");
-	        ESP01StrToBufTX("AT+CIPSERVER=1,80\r\n");
-	        aDbgStr("+&DBGESP01ATCIPMUX+SERVER\n");
-	        esp01ATSate = ESP01ATCIFSR;        // sigue con CIFSR en TCP
-	    } else {
-	        // UDP: multiplex = 0, NO server
-	        ESP01StrToBufTX("AT+CIPMUX=0\r\n");
-	        aDbgStr("+&DBGESP01ATCIPMUX(single)\n");
-	        esp01ATSate = ESP01ATPREPUDP;
-	    }
-	    break;
-	case ESP01ATPREPUDP:
-	    ESP01StrToBufTX("AT+CIPSERVER=0\r\n");
-	    //ESP01StrToBufTX("AT+CIPCLOSE=0\r\n");
-	    ESP01StrToBufTX(ATCIPCLOSE);
-	    ESP01StrToBufTX("AT+CIPMUX=0\r\n");
-	    ESP01StrToBufTX("AT+CIPSTART=\"UDP\",\"");
-	    ESP01StrToBufTX(esp01RemoteIP);
-	    ESP01StrToBufTX("\",");
-	    ESP01StrToBufTX(esp01RemotePORT);
-	    ESP01StrToBufTX(",");
-	    ESP01StrToBufTX(esp01LocalPORT);
-	    ESP01StrToBufTX(",0\r\n");
-	    esp01ATSate      = ESP01CIPSTARTRESPONSE;
-	    esp01TimeoutTask = 3000;
-	    break;
+		if(!esp01Flags.bit.ATRESPONSEOK)
+			break;
+		ESP01StrToBufTX("AT+CIPMUX=0\r\n");
+		if(aDbgStr != NULL)
+			aDbgStr("+&DBGESP01ATCIPMUX(single)\n");
+		esp01Flags.bit.ATRESPONSEOK = 0;
+		esp01ATSate = ESP01ATCIPSTART;
+		esp01TimeoutTask = 500;
+		break;
 	case ESP01ATCWJAP:
 		if(esp01Flags.bit.WIFICONNECTED){
 			esp01ATSate = ESP01ATCIFSR;
@@ -939,32 +921,26 @@ static void ESP01DOConnection(){
 		ESP01StrToBufTX(ATCIPCLOSE);
 		if(aDbgStr != NULL)
 			aDbgStr("+&DBGESP01ATCIPCLOSE\n");
-		esp01ATSate = ESP01ATCIPSTART;
+		esp01Flags.bit.ATRESPONSEOK = 0;
+		esp01ATSate = ESP01ATCIPMUX;
+		esp01TimeoutTask = 500;
 		break;
 	case ESP01ATCIPSTART:
-		ESP01StrToBufTX(ATCIPSTART);
-		ESP01ByteToBufTX('\"');
-		ESP01StrToBufTX(esp01PROTO);
-		ESP01ByteToBufTX('\"');
-		ESP01ByteToBufTX(',');
-		ESP01ByteToBufTX('\"');
+		if(!esp01Flags.bit.ATRESPONSEOK)
+			break;
+		ESP01StrToBufTX("AT+CIPSTART=\"UDP\",\"");
 		ESP01StrToBufTX(esp01RemoteIP);
-		ESP01ByteToBufTX('\"');
-		ESP01ByteToBufTX(',');
+		ESP01StrToBufTX("\",");
 		ESP01StrToBufTX(esp01RemotePORT);
-		ESP01ByteToBufTX(',');
+		ESP01StrToBufTX(",");
 		ESP01StrToBufTX(esp01LocalPORT);
-		ESP01StrToBufTX(",0\r\n");  // <-- ¡añadido ,0!
+		ESP01StrToBufTX(",0\r\n");
 		if(aDbgStr != NULL)
 			aDbgStr("+&DBGESP01ATCIPSTART\n");
 		esp01Flags.bit.ATRESPONSEOK = 0;
 		esp01Flags.bit.UDPTCPCONNECTED = 0;
 		esp01ATSate = ESP01CIPSTARTRESPONSE;
-		// Si es UDP, usamos un timeout corto para el workaround
-		if (strcmp(esp01PROTO, "UDP") == 0)
-		    esp01TimeoutTask = 3000;   // 1 segundo
-		else
-		    esp01TimeoutTask = 30000;  // 30 s para TCP
+		esp01TimeoutTask = 3000;
 		break;
 	case ESP01CIPSTARTRESPONSE:
 		if (esp01Flags.bit.ATRESPONSEOK) {
@@ -991,19 +967,12 @@ static void ESP01DOConnection(){
 		break;
 
 	case ESP01ATCONNECTED:
-		// <<< debug: máquina en ESP01ATCONNECTED con UDP >>>
-		if (strcmp(esp01PROTO, "UDP")==0 && aDbgStr) {
-			aDbgStr(">>> DEBUG: DOConnection en ESP01ATCONNECTED (UDP vivo)\r\n");
-		}
-
-		// si perdimos wifi o la conexión UDP, reintenta
-		if (!esp01Flags.bit.WIFICONNECTED) {
-			esp01ATSate = ESP01ATAT;
-		} else if (!esp01Flags.bit.UDPTCPCONNECTED) {
+		if(!esp01Flags.bit.UDPTCPCONNECTED){
 			esp01ATSate = ESP01ATCIPCLOSE;
-		} else {
 			esp01TimeoutTask = 0;
+			break;
 		}
+		esp01TimeoutTask = 100;
 		break;
 	}
 }

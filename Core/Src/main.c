@@ -766,11 +766,10 @@ static void esp01_chpd(uint8_t val) {
 }
 
 void appOnESP01ChangeState(_eESP01STATUS state) {
-    if (state == ESP01_WIFI_NEW_IP) {
-        // Ahora que ya tenemos IP propia, arrancamos el socket UDP
-        ESP01_StartUDP(wifiIp, 30010, 30000);
-    }
-    // Si más adelante quieres TCP, aquí gestionas ESP01_UDPTCP_CONNECTED, etc.
+	if (state == ESP01_WIFI_NEW_IP) {
+		// Ahora que ya tenemos IP propia, arrancamos el socket UDP
+		ESP01_StartUDP(wifiIp, 30010, 30000);
+	}
 }
 /* USER CODE END 0 */
 

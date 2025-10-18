@@ -1,0 +1,6 @@
+# Ignore build artifacts
+Debug/
+Release/
+
+# Ignore IDE-specific files
+.settings/
