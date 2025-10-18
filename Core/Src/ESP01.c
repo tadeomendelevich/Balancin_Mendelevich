@@ -679,54 +679,8 @@ static void ESP01ATDecode(){
 		        }
 		        if (aDbgStr) aDbgStr("\r\n");
 
-		        // 5) si viene la trama de configuración UDP, la procesamos sólo una vez
-		        if (!configUDPObtenida) {
-		            // extraemos la cadena completa
-		            char cmd[lastIPDlen + 1];
-		            for (uint16_t i = 0; i < lastIPDlen; ++i) {
-		                cmd[i] = esp01Handle.bufRX[(start + i) % esp01Handle.sizeBufferRX];
-		            }
-		            cmd[lastIPDlen] = '\0';
-
-		            // tokenizamos por comas: SSID,PASS,REMOTE_IP,REMOTE_PORT
-		            char *p = strtok(cmd, ",");
-		            if (p) {
-		                // SSID
-		                strncpy(esp01SSID, p, sizeof(esp01SSID) - 1);
-		                esp01SSID[sizeof(esp01SSID) - 1] = '\0';
-
-		                // PASSWORD
-		                p = strtok(NULL, ",");
-		                if (!p) break;
-		                strncpy(esp01PASSWORD, p, sizeof(esp01PASSWORD) - 1);
-		                esp01PASSWORD[sizeof(esp01PASSWORD) - 1] = '\0';
-
-		                // REMOTE_IP
-		                p = strtok(NULL, ",");
-		                if (!p) break;
-		                strncpy(esp01RemoteIP, p, sizeof(esp01RemoteIP) - 1);
-		                esp01RemoteIP[sizeof(esp01RemoteIP) - 1] = '\0';
-
-		                // REMOTE_PORT
-		                p = strtok(NULL, ",");
-		                if (!p) break;
-		                uint16_t port = atoi(p);
-
-		                // debug
-		                aDbgStr("Configuracion recibida:\n");
-		                aDbgStr("  SSID: ");     aDbgStr(esp01SSID);    aDbgStr("\n");
-		                aDbgStr("  PASS: ");     aDbgStr(esp01PASSWORD);aDbgStr("\n");
-		                aDbgStr("  IP:   ");     aDbgStr(esp01RemoteIP); aDbgStr("\n");
-		                aDbgStr("  PORT: ");     { char buf[6]; itoa(port,buf,10); aDbgStr(buf); } aDbgStr("\n");
-
-		                // arrancamos UDP con nuevos parámetros
-		                ESP01_StartUDP(esp01RemoteIP, port, LOCAL_PORT);
-		                configUDPObtenida = 1;
-		                // forzamos que en el próximo Task() vaya directo a DOConnection()
-		                esp01ATSate     = ESP01ATCIPMUX;
-		                esp01TimeoutTask = 0;
-		            }
-		        }
+		        // 5) El código para reconfigurar por UDP ha sido eliminado
+		        //    para mantener main.c como única fuente de configuración.
 		    }
 		    break;
 
