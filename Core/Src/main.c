@@ -68,7 +68,8 @@
 
 // PID
 #define KP 17.5f
-#define KD 110.0f
+#define KD 0.22f  // Corregido para DT: 110.0f * 0.002f
+#define KI 0.0f
 
 #define SETPOINT_ANGLE 0.0
 
@@ -158,10 +159,12 @@ int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
 
 static float previous_error = 0.0f;
+static float integral = 0.0f;
 static float filtered_roll_deg = 0.0f;
 
 float KP_value;
 float KD_value;
+float KI_value;
 
 uint8_t f_balancing = 1;
 /* USER CODE END PV */
@@ -853,7 +856,7 @@ int main(void)
   UNER_RegisterADCBuffer(adcAvg, 8);  // array adcValues[8]
   UNER_RegisterMotorSpeed(&motorRightVelocity, &motorLeftVelocity);
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
-  UNER_RegisterProportionalControl(&KP_value, &KD_value);
+  UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value);
   UNER_RegisterFlags(&f_balancing);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
@@ -886,7 +889,8 @@ int main(void)
   esp01IrRx = 0;
 
   KP_value = KP;
-  KP_value = KD;
+  KD_value = KD;
+  KI_value = KI;
 
   HAL_Delay(500);
   /* USER CODE END 2 */
@@ -920,14 +924,24 @@ int main(void)
 			  // EMA, filtro complementario, control PD...
 			  // ... (toda la lógica de control se ejecuta aquí)
 
-			  // --- Complementary Filter & PD Control ---
+			  // --- Complementary Filter & PID Control ---
 			  float accel_roll_deg = atan2f(ay, az) * (180.0f / M_PI);
-			  float gyro_y_dps = (float)gy / 100.0f;
+			  float gyro_y_dps = (float)gy / 131.0f; // Sensibilidad del giróscopo a ±250dps
 			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_y_dps * DT) + (1.0f - ALPHA) * accel_roll_deg;
 			  float error = SETPOINT_ANGLE - filtered_roll_deg;
-			  float derivative = error - previous_error;
-			  float output = (KP_value * error) + (KD_value * derivative);
+
+			  // Término Integral con Anti-Windup
+			  integral += error * DT;
+			  if (integral > 100.0f) integral = 100.0f;       // Limitar para evitar sobreimpulso
+			  else if (integral < -100.0f) integral = -100.0f;
+
+			  // Término Derivativo
+			  float derivative = (error - previous_error) / DT;
+
+			  // Salida PID
+			  float output = (KP_value * error) + (KI_value * integral) + (KD_value * derivative);
 			  previous_error = error;
+
 			  motorRightVelocity = (int16_t)output;
 			  motorLeftVelocity  = (int16_t)output;
 

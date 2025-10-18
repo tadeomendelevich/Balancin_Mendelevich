@@ -146,7 +146,7 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr);
 
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr);
 
-void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr);
+void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr);
 
 void UNER_RegisterFlags(uint8_t *flagPtr);
 
