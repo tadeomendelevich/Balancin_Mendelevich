@@ -103,6 +103,7 @@ typedef enum{
 	MODIFYKP = 0xB1,
 	MODIFYKD = 0xB2,
 	MODIFYKI = 0xB3,
+	BALANCE = 0xB4,
     ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -146,6 +147,8 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr);
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr);
 
 void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr);
+
+void UNER_RegisterFlags(uint8_t *flagPtr);
 
 void UNER_SendData(void);
 

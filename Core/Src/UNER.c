@@ -52,6 +52,8 @@ static float *p_KD  = NULL;
 static float *p_roll  = NULL;	// Punteros a las variables de inclinacion en main.c
 static float *p_pitch = NULL;
 
+static uint8_t *p_balance_flag = NULL;
+
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
     unerTx = tx;
@@ -234,19 +236,15 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 {
     switch(dataRx->buff[dataRx->indexData]){
         case ALIVE:
-        	USB_Debug("\n ALIVE RECIBIDOOOO\n");
+        	USB_Debug("\n ALIVE RECIBIDO!\n");
             putHeaderOnTx(dataTx, ALIVE, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);
-
-            UNER_SendData();
         break;
         case FIRMWARE:
             putHeaderOnTx(dataTx, FIRMWARE, 12);
             putStrOntx(dataTx, firmware);
             putByteOnTx(dataTx, dataTx->chk);
-
-            UNER_SendData();
         break;
         case GETADCVALUES:
         	putHeaderOnTx(dataTx, GETADCVALUES, 17);
@@ -277,8 +275,6 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			putByteOnTx(dataTx, myWord.ui8[1] );
 
 			putByteOnTx(dataTx, dataTx->chk);
-
-			UNER_SendData();
         	break;
         case GETMPU6050VALUES:
         	putHeaderOnTx(dataTx, GETMPU6050VALUES, 13);
@@ -304,12 +300,10 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			putByteOnTx(dataTx, myWord.ui8[1] );
 
 			putByteOnTx(dataTx, dataTx->chk);
-
-			UNER_SendData();
         	break;
         case GETANGLE:
         	if (p_roll && p_pitch) {
-			putHeaderOnTx(dataTx, GETANGLE, 9); // 1 byte cmd + 2*4 bytes for float angles
+        		putHeaderOnTx(dataTx, GETANGLE, 9); // 1 byte cmd + 2*4 bytes for float angles
 
 				myWord.f32 = *p_roll; 	// Envio datos de INCLINACION
 				putByteOnTx(dataTx, myWord.ui8[0] );
@@ -323,15 +317,11 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 				putByteOnTx(dataTx, myWord.ui8[3] );
 
 				putByteOnTx(dataTx, dataTx->chk);
-
-				UNER_SendData();
 			} else {
 				// si no está registrado, devolvemos sólo ACK
 				putHeaderOnTx(dataTx, GETANGLE, 2);
 				putByteOnTx(dataTx, ACK);
 				putByteOnTx(dataTx, dataTx->chk);
-
-				UNER_SendData();
 			}
         	break;
         case SETMOTORSPEED:
@@ -368,7 +358,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
 			float new_KP = myWord.i32;
-			*p_KP = new_KP;
+			if (p_KP) *p_KP = new_KP;
         break;
 
         case MODIFYKD:
@@ -380,13 +370,31 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
 			float new_KD = myWord.i32;
-			*p_KD = new_KD;
+			if (p_KD) *p_KD = new_KD;
 		break;
+
+        /*case MODIFYKI:
+			putHeaderOnTx(dataTx, MODIFYKI, 2);
+			putByteOnTx(dataTx, ACK );
+			putByteOnTx(dataTx, dataTx->chk);
+			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
+			float new_KI = myWord.i32;
+			if (p_KI) *p_KI = new_KI;
+		break;*/
+
+        case BALANCE:
+        	if (p_balance_flag != NULL) {
+				*p_balance_flag = !(*p_balance_flag);
+			}
+        break;
 
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
-		putHeaderOnTx(dataTx, SENDALLSENSORS, 37); // 1 cmd + 16 ADC + 12 MPU + 8 Angle
+        	putHeaderOnTx(dataTx, SENDALLSENSORS, 37); // 1 cmd + 16 ADC + 12 MPU + 8 Angle
 
 			myWord.ui16[0] =  (int16_t)p_adcBuf[0]; 		// ADC 1
 			putByteOnTx(dataTx, myWord.ui8[0] );
@@ -445,17 +453,14 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			putByteOnTx(dataTx, myWord.ui8[3] );
 
 			putByteOnTx(dataTx, unerTx->chk);
-
-			UNER_SendData();
         	break;
         default:
             putHeaderOnTx(dataTx, (_eCmd)dataRx->buff[dataRx->indexData], 2);
             putByteOnTx(dataTx,UNKNOWN );
             putByteOnTx(dataTx, dataTx->chk);
-
-            UNER_SendData();
         break;
     }
+    UNER_SendData();
 }
 
 
@@ -589,12 +594,16 @@ void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr) {
     p_KD  = kdPtr;
 }
 
-
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr)
 {
     p_roll  = rollPtr;
     p_pitch = pitchPtr;
 }
+
+void UNER_RegisterFlags(uint8_t *flagPtr) {
+    p_balance_flag = flagPtr;
+}
+
 
 // Envía el ring-buffer por USB y por UDP
 void UNER_SendData(void) {

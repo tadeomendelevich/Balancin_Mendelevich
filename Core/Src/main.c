@@ -68,7 +68,7 @@
 
 // PID
 #define KP 17.5f
-#define KD 100.0f
+#define KD 110.0f
 
 #define SETPOINT_ANGLE 0.0
 
@@ -162,6 +162,8 @@ static float filtered_roll_deg = 0.0f;
 
 float KP_value;
 float KD_value;
+
+uint8_t f_balancing = 1;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -852,6 +854,7 @@ int main(void)
   UNER_RegisterMotorSpeed(&motorRightVelocity, &motorLeftVelocity);
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
   UNER_RegisterProportionalControl(&KP_value, &KD_value);
+  UNER_RegisterFlags(&f_balancing);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();
@@ -932,8 +935,11 @@ int main(void)
 			  roll_deg = filtered_roll_deg;
 		  }
 
-		  // Actualizar motores
-		  MotorControl(motorRightVelocity, motorLeftVelocity);
+		  if(f_balancing) { // Si estoy en modo balanceo
+			  MotorControl(motorRightVelocity, motorLeftVelocity);	// Actualizo motores con valores de PID
+		  } else {
+			  MotorControl(0, 0);	// Apago motores
+		  }
 	  }
 
 	  if(is10ms) {
