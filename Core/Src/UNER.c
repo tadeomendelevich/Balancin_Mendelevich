@@ -48,6 +48,7 @@ static int16_t *p_motorLeftVel  = NULL;
 
 static float *p_KP = NULL;		// Punteros a las variables de control proporcional en main.c
 static float *p_KD  = NULL;
+static float *p_KI  = NULL;
 
 static float *p_roll  = NULL;	// Punteros a las variables de inclinacion en main.c
 static float *p_pitch = NULL;
@@ -357,7 +358,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			float new_KP = myWord.i32;
+			float new_KP = myWord.f32;
 			if (p_KP) *p_KP = new_KP;
         break;
 
@@ -369,11 +370,11 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			float new_KD = myWord.i32;
+			float new_KD = myWord.f32;
 			if (p_KD) *p_KD = new_KD;
 		break;
 
-        /*case MODIFYKI:
+        case MODIFYKI:
 			putHeaderOnTx(dataTx, MODIFYKI, 2);
 			putByteOnTx(dataTx, ACK );
 			putByteOnTx(dataTx, dataTx->chk);
@@ -381,9 +382,9 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			float new_KI = myWord.i32;
+			float new_KI = myWord.f32;
 			if (p_KI) *p_KI = new_KI;
-		break;*/
+		break;
 
         case BALANCE:
         	if (p_balance_flag != NULL) {
@@ -589,9 +590,10 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr) {
     p_motorLeftVel  = leftPtr;
 }
 
-void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr) {
+void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr) {
     p_KP = kpPtr;
     p_KD  = kdPtr;
+    p_KI  = kiPtr;
 }
 
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr)
