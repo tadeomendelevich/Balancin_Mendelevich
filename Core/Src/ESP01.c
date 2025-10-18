@@ -18,7 +18,11 @@ extern void USB_Debug(const char *fmt, ...);
 #define SERVER_IP    		"192.168.123.174"
 #define SERVER_PORT  		30010
 #define LOCAL_PORT   		30000
-#define ALIVE_INTERVAL_MS 	5000
+#define ALIVE_INTERVAL_FAST_MS 	5000
+#define ALIVE_INTERVAL_SLOW_MS 	10000
+#define ALIVE_FAST_COUNT 		20
+
+static uint8_t alive_counter = 0;
 
 static enum {
 	ESP01ATIDLE,
@@ -70,9 +74,9 @@ static uint32_t esp01TimeoutTxSymbol = 0;
 static OnESP01ChangeState aESP01ChangeState = NULL;
 static ESP01DebugStr aDbgStr = NULL;
 
-static char esp01SSID[64] = {0};
-static char esp01PASSWORD[32] = {0};
-static char esp01RemoteIP[16] = {0};
+static const char *esp01SSID = NULL;
+static const char *esp01PASSWORD = NULL;
+static const char *esp01RemoteIP = NULL;
 //static char esp01PROTO[4] = "TCP";
 static char esp01PROTO[4] = "UDP";
 static char esp01RemotePORT[6] = {0};
@@ -156,10 +160,8 @@ void ESP01_SetWIFI(const char *ssid, const char *password){
 	esp01ATSate = ESP01ATIDLE;
 	esp01Flags.byte = 0;
 
-	strncpy(esp01SSID, ssid, 64);
-	esp01SSID[63] = '\0';
-	strncpy(esp01PASSWORD, password, 32);
-	esp01PASSWORD[31] = '\0';
+	esp01SSID = ssid;
+	esp01PASSWORD = password;
 
 	esp01TimeoutTask = 50;
 	esp01ATSate = ESP01ATHARDRST0;
@@ -184,14 +186,13 @@ _eESP01STATUS ESP01_StartUDP(const char *RemoteIP, uint16_t RemotePORT, uint16_t
 	strcpy(esp01PROTO, "UDP");
 	udpIniciado      = 0;
 
-	// <<< AQUÍ copio la IP PASADA desde main.c >>>
-	strncpy(esp01RemoteIP, RemoteIP, sizeof(esp01RemoteIP)-1);
-	esp01RemoteIP[sizeof(esp01RemoteIP)-1] = '\0';
+	// <<< AQUÍ guardo el puntero a la IP PASADA desde main.c >>>
+	esp01RemoteIP = RemoteIP;
 
 	itoa(RemotePORT, esp01RemotePORT, 10);
 	itoa(LocalPORT, esp01LocalPORT, 10);
 
-	if(esp01SSID[0] == '\0')
+	if(esp01SSID == NULL)
 		return ESP01_WIFI_NOT_SETED;
 
 	if(esp01Flags.bit.WIFICONNECTED == 0)
@@ -211,13 +212,12 @@ _eESP01STATUS ESP01_StartTCP(const char *RemoteIP, uint16_t RemotePORT, uint16_t
 
 	strcpy(esp01PROTO, "TCP");
 
-	strncpy(esp01RemoteIP, RemoteIP, 15);
-	esp01RemoteIP[15] = '\0';
+	esp01RemoteIP = RemoteIP;
 
 	itoa(RemotePORT, esp01RemotePORT, 10);
 	itoa(LocalPORT, esp01LocalPORT, 10);
 
-	if(esp01SSID[0] == '\0')
+	if(esp01SSID == NULL)
 		return ESP01_WIFI_NOT_SETED;
 
 	if(esp01Flags.bit.WIFICONNECTED == 0)
@@ -364,13 +364,18 @@ void ESP01_Task(){
 	// ——— Alive periódico UDP ———
 	if (strcmp(esp01PROTO, "UDP")==0 && esp01Flags.bit.UDPTCPCONNECTED) {
 	    uint32_t now = HAL_GetTick();
-	    if ((now - lastAliveTick) >= ALIVE_INTERVAL_MS) {
+		uint32_t current_interval = (alive_counter < ALIVE_FAST_COUNT) ? ALIVE_INTERVAL_FAST_MS : ALIVE_INTERVAL_SLOW_MS;
+
+	    if ((now - lastAliveTick) >= current_interval) {
 	        // sólo enviamos si no estamos ya en medio de un envío
 	        // y si no hay bytes +IPD pendientes de procesar
 	        if (!esp01Flags.bit.SENDINGDATA
 	            && esp01irRXAT == esp01iwRXAT) {
 	            lastAliveTick = now;
 	            UNER_SendAlive();
+				if (alive_counter < 255) { // Evitar desbordamiento
+					alive_counter++;
+				}
 	        }
 	    }
 	}
@@ -895,7 +900,7 @@ static void ESP01DOConnection(){
 			esp01ATSate = ESP01ATCIFSR;
 			break;
 		}
-		if(esp01SSID[0] == '\0')
+		if(esp01SSID == NULL)
 			break;
 		ESP01StrToBufTX(ATCWJAP);
 		ESP01ByteToBufTX('\"');
@@ -942,7 +947,7 @@ static void ESP01DOConnection(){
 		}
 		break;
 	case ESP01ATCIPCLOSE:
-		if(esp01RemoteIP[0] == '\0')
+		if(esp01RemoteIP == NULL)
 			break;
 		ESP01StrToBufTX(ATCIPCLOSE);
 		if(aDbgStr != NULL)
@@ -1130,8 +1135,12 @@ void onESP01StateChange(_eESP01STATUS state) {
             // Una vez conectado el cliente UDP, enviamos UNER_SendAlive
         	if (!udpIniciado && strcmp(esp01PROTO, "UDP")==0) {
 				udpIniciado = 1;           // impide re-entradas
+				alive_counter = 0; // Reinicia el contador de alives
+				lastAliveTick = HAL_GetTick(); // Inicia el primer alive inmediatamente
 				ESP01_USB_DbgStr(">>> UDP conectado OK\r\n");
 				UNER_SendAlive();
+				if (alive_counter < 255) { alive_counter++; }
+
 
 				ESP01StrToBufTX("AT+CIPSTATUS\r\n");
 
