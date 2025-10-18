@@ -41,6 +41,7 @@ static enum {
 	ESP01ATHARDRST0,
 	ESP01ATHARDRST1,
 	ESP01ATHARDRSTSTOP,
+	ESP01ATRECONNECT,
 } esp01ATSate = ESP01ATIDLE;
 
 static union{
@@ -530,11 +531,13 @@ static void ESP01ATDecode(){
 				case 7://WIFI DISCONNECTED
 					esp01Flags.bit.UDPTCPCONNECTED = 0;
 					esp01Flags.bit.WIFICONNECTED = 0;
-					if(aESP01ChangeState != NULL)
+					if(aESP01ChangeState != NULL) {
 						aESP01ChangeState(ESP01_WIFI_DISCONNECTED);
-					if(esp01ATSate == ESP01CWJAPRESPONSE)
-						break;
-					esp01ATSate = ESP01ATHARDRSTSTOP;
+						aESP01ChangeState(ESP01_WIFI_RECONNECTING);
+					}
+					if(esp01ATSate != ESP01CWJAPRESPONSE) {
+						esp01ATSate = ESP01ATRECONNECT;
+					}
 					break;
 				case 8://DISCONNECTED
 					esp01Flags.bit.UDPTCPCONNECTED = 0;
@@ -768,17 +771,17 @@ static void ESP01DOConnection(){
 	}*/
 
 
-    // 2a) Si antes estábamos en ATCONNECTED pero ahora UDPTCPCONNECTED cayó, relanzamos UDP
-    if (esp01ATSate == ESP01ATCONNECTED && !esp01Flags.bit.UDPTCPCONNECTED) {
-        aDbgStr(">>> UDP perdido, reintentando conexión...\r\n");
-        // Volver al cierre para reabrir UDP en el próximo tick
-        esp01ATSate     = ESP01ATCIPCLOSE;
-        esp01TimeoutTask = 0;
+    // 2a) Si antes estábamos en ATCONNECTED pero ahora UDPTCPCONNECTED o WIFICONNECTED cayeron, relanzamos la conexión.
+    if (esp01ATSate == ESP01ATCONNECTED && (!esp01Flags.bit.UDPTCPCONNECTED || !esp01Flags.bit.WIFICONNECTED)) {
+        aDbgStr(">>> Conexión perdida, reintentando...\r\n");
+        esp01ATSate     = ESP01ATRECONNECT;
+        esp01TimeoutTask = 0; // Iniciar reconexión inmediatamente
+        if(aESP01ChangeState != NULL) aESP01ChangeState(ESP01_WIFI_RECONNECTING);
         return;
     }
-    // 2b) Si seguimos vivos por UDP, sólo esperamos antes de chequear de nuevo
+    // 2b) Si seguimos vivos, sólo esperamos antes de chequear de nuevo
     if (esp01ATSate == ESP01ATCONNECTED && esp01Flags.bit.UDPTCPCONNECTED) {
-        esp01TimeoutTask = 100;
+        esp01TimeoutTask = 500; // Chequeo cada 5 segundos
         return;
     }
 
@@ -787,6 +790,11 @@ static void ESP01DOConnection(){
 	switch(esp01ATSate){
 	case ESP01ATIDLE:
 		esp01TimeoutTask = 0;
+		break;
+	case ESP01ATRECONNECT:
+		if(aDbgStr != NULL) aDbgStr("+&DBGRECONNECTING...\n");
+		esp01ATSate = ESP01ATCWJAP; // Intentar reconectar al WiFi
+		esp01TimeoutTask = 100; // Dar un tiempo antes de reintentar
 		break;
 	case ESP01ATHARDRST0:
 		esp01Handle.aDoCHPD(0);
