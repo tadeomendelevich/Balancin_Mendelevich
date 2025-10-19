@@ -414,6 +414,54 @@ char SSD1306_Putc(char ch, const FontDef_t* Font, SSD1306_COLOR_t color) {
 	return ch;
 }
 
+char SSD1306_Putc_Small(char ch, const FontDef_t* Font, SSD1306_COLOR_t color) {
+    uint32_t i, b, j;
+
+    /* Check available space in LCD */
+    if (
+        SSD1306_WIDTH <= (SSD1306.CurrentX + Font->FontWidth) ||
+        SSD1306_HEIGHT <= (SSD1306.CurrentY + Font->FontHeight)
+    ) {
+        /* Error */
+        return 0;
+    }
+
+    /* Go through font */
+    uint8_t char_index;
+    if (ch >= '0' && ch <= '9') {
+        char_index = ch - '0';
+    } else if (ch == ':') {
+        char_index = 10;
+    } else if (ch == '-') {
+        char_index = 11;
+    } else if (ch == ' ') {
+        char_index = 12;
+    } else if (ch == 'A') {
+        char_index = 13;
+    } else if (ch == 'G') {
+        char_index = 14;
+    } else {
+        return 0; // Unsupported character
+    }
+
+    for (i = 0; i < Font->FontWidth; i++) {
+        b = ((uint8_t*)Font->data)[char_index * Font->FontWidth + i];
+        for (j = 0; j < Font->FontHeight; j++) {
+            if ((b >> j) & 0x01) {
+                SSD1306_DrawPixel(SSD1306.CurrentX + i, (SSD1306.CurrentY + j), (SSD1306_COLOR_t) color);
+            } else {
+                SSD1306_DrawPixel(SSD1306.CurrentX + i, (SSD1306.CurrentY + j), (SSD1306_COLOR_t)!color);
+            }
+        }
+    }
+
+    /* Increase pointer */
+    SSD1306.CurrentX += Font->FontWidth;
+
+    /* Return character written */
+    return ch;
+}
+
 char SSD1306_Puts(const char* str, const FontDef_t* Font, SSD1306_COLOR_t color) {
 	/* Write characters */
 	while (*str) {
@@ -429,6 +477,23 @@ char SSD1306_Puts(const char* str, const FontDef_t* Font, SSD1306_COLOR_t color)
 
 	/* Everything OK, zero should be returned */
 	return *str;
+}
+
+char SSD1306_Puts_Small(const char* str, const FontDef_t* Font, SSD1306_COLOR_t color) {
+    /* Write characters */
+    while (*str) {
+        /* Write character by character */
+        if (SSD1306_Putc_Small(*str, Font, color) != *str) {
+            /* Return error */
+            return *str;
+        }
+
+        /* Increase string pointer */
+        str++;
+    }
+
+    /* Everything OK, zero should be returned */
+    return *str;
 }
 
 

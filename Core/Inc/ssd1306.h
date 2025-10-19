@@ -157,6 +157,26 @@ char SSD1306_Putc(char ch, const FontDef_t* Font, SSD1306_COLOR_t color);
 char SSD1306_Puts(const char* str, const FontDef_t* Font, SSD1306_COLOR_t color);
 
 /**
+ * @brief  Puts character to internal RAM with a small font
+ * @note   @ref SSD1306_UpdateScreen() must be called after that in order to see updated LCD screen
+ * @param  ch: Character to be written
+ * @param  *Font: Pointer to @ref FontDef_t structure with used font
+ * @param  color: Color used for drawing. This parameter can be a value of @ref SSD1306_COLOR_t enumeration
+ * @retval Character written
+ */
+char SSD1306_Putc_Small(char ch, const FontDef_t* Font, SSD1306_COLOR_t color);
+
+/**
+ * @brief  Puts string to internal RAM with a small font
+ * @note   @ref SSD1306_UpdateScreen() must be called after that in order to see updated LCD screen
+ * @param  *str: String to be written
+ * @param  *Font: Pointer to @ref FontDef_t structure with used font
+ * @param  color: Color used for drawing. This parameter can be a value of @ref SSD1306_COLOR_t enumeration
+ * @retval Zero on success or character value when function failed
+ */
+char SSD1306_Puts_Small(const char* str, const FontDef_t* Font, SSD1306_COLOR_t color);
+
+/**
  * @brief  Draws line on LCD
  * @note   @ref SSD1306_UpdateScreen() must be called after that in order to see updated LCD screen
  * @param  x0: Line X start point. Valid input is 0 to SSD1306_WIDTH - 1

@@ -699,79 +699,46 @@ void updateDisplay(void) {
     // 1) Limpia todo el buffer
     SSD1306_Fill(SSD1306_COLOR_BLACK);
 
-    // 2) Línea divisoria en medio
-    SSD1306_DrawLine(
-        SCREEN_W/2, 0,
-        SCREEN_W/2, SCREEN_H - 1,
-        SSD1306_COLOR_WHITE
-    );
-
-    // 3) MPU6050 – valores en la mitad izquierda
-    //    Etiquetas con Font_7x10 (7px ancho), números con SSD1306_DrawDigit5x7 (5px ancho)
+    // 2) MPU6050 values
     {
-        const char* labels[6] = { "AX:", "AY:", "AZ:", "GX:", "GY:", "GZ:" };
-        int16_t    values[6];
-        // Suponemos que ax…gz ya están actualizados
-        MPU6050_GetAccel(&values[0], &values[1], &values[2]);
-        MPU6050_GetGyro (&values[3], &values[4], &values[5]);
+        int16_t accel[3];
+        int16_t gyro[3];
+        char buf[8];
 
-        char buf[7]; // para itoa
+        MPU6050_GetAccel(&accel[0], &accel[1], &accel[2]);
+        MPU6050_GetGyro(&gyro[0], &gyro[1], &gyro[2]);
 
-        for (int i = 0; i < 6; i++) {
-            // fila i → y = 2 + i*10 (10px de separación por fila)
-            uint16_t y = 2 + i * 10;
-            // etiqueta
-            SSD1306_GotoXY(2, y);
-            SSD1306_Puts(labels[i], &Font_5x7, SSD1306_COLOR_WHITE);
-            // convierte valor a cadena
-            itoa(values[i], buf, 10);
-            // dibuja cada dígito pequeño
-            uint16_t x = 2 + strlen(labels[i]) * Font_5x7.FontWidth;
-            for (char *p = buf; *p; p++) {
-                if (*p == '-') {
-                    // si quieres manejar el signo, puedes dibujar un guión simple
-                    SSD1306_DrawLine(x, y + 3, x + 4, y + 3, SSD1306_COLOR_WHITE);
-                    x += 6;
-                } else {
-                    SSD1306_DrawDigit5x7(*p - '0', x, y);
-                    x += Font_5x7.FontWidth + 1;
-                }
-            }
+        // Display accelerometer values
+        SSD1306_GotoXY(2, 2);
+        SSD1306_Puts_Small("A:", &Font_3x5, SSD1306_COLOR_WHITE);
+        for (int i = 0; i < 3; i++) {
+            itoa(accel[i], buf, 10);
+            SSD1306_GotoXY(10 + i * 20, 2);
+            SSD1306_Puts_Small(buf, &Font_3x5, SSD1306_COLOR_WHITE);
+        }
+
+        // Display gyroscope values
+        SSD1306_GotoXY(2, 12);
+        SSD1306_Puts_Small("G:", &Font_3x5, SSD1306_COLOR_WHITE);
+        for (int i = 0; i < 3; i++) {
+            itoa(gyro[i], buf, 10);
+            SSD1306_GotoXY(10 + i * 20, 12);
+            SSD1306_Puts_Small(buf, &Font_3x5, SSD1306_COLOR_WHITE);
         }
     }
 
-    // 4) Título “VALORES ADC” centrado sobre las barras, con Font_7x10
+    // 3) ADC Bars
     {
-        const char *title   = "VAL ADCs";
-        uint16_t   w        = strlen(title) * Font_7x10.FontWidth;
-        uint16_t   x0       = SCREEN_W/2 + ((SCREEN_W/2 - w)/2);
-        SSD1306_GotoXY(x0, 1);
-        SSD1306_Puts(title, &Font_7x10, SSD1306_COLOR_WHITE);
-    }
-
-    // 5) Barras en la mitad derecha (igual que antes)
-    {
-        const uint16_t title_h   = Font_7x10.FontHeight + 2;
-        const uint16_t region_x  = SCREEN_W/2;
-        const uint16_t region_y  = title_h;
-        const uint16_t region_w  = SCREEN_W/2;
-        const uint16_t region_h  = SCREEN_H - region_y - Font_5x7.FontHeight;
-
-        const uint16_t bar_spacing = BAR_SPACING;
-        const uint16_t bar_width   =
-            (region_w - (BAR_COUNT + 1)*bar_spacing) / BAR_COUNT;
+        const uint16_t region_y = 22;
+        const uint16_t region_h = SCREEN_H - region_y;
+        const uint16_t bar_width = (SCREEN_W - (BAR_COUNT + 1) * BAR_SPACING) / BAR_COUNT;
 
         for (uint8_t i = 0; i < BAR_COUNT; i++) {
-            uint16_t v  = adcAvg[i] > 4000 ? 4000 : adcAvg[i];
-            uint16_t h  = (uint32_t)v * region_h / 4000;
-            uint16_t x0 = region_x + bar_spacing + i*(bar_width + bar_spacing);
+            uint16_t v = adcAvg[i] > 4000 ? 4000 : adcAvg[i];
+            uint16_t h = (uint32_t)v * region_h / 4000;
+            uint16_t x0 = BAR_SPACING + i * (bar_width + BAR_SPACING);
             uint16_t y0 = region_y + (region_h - h);
             SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
-
-            // dígito bajo la barra
-            uint16_t tx = x0 + (bar_width - Font_5x7.FontWidth)/2;
-            uint16_t ty = region_y + region_h + ((Font_5x7.FontHeight + 2 - Font_5x7.FontHeight)/2);
-            SSD1306_DrawDigit5x7(i+1, tx, ty);
         }
     }
 
