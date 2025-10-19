@@ -173,38 +173,11 @@ const uint8_t Font5x7[] = {
 FontDef_t Font_5x7 = {
     5,    // ancho de carácter
     7,    // alto de carácter
-    (uint16_t *)Font5x7
-};
-
-const uint8_t Font3x5[] = {
-    // Digits 0-9
-    0x0E, 0x11, 0x0E, // 0
-    0x04, 0x1F, 0x00, // 1
-    0x1D, 0x15, 0x17, // 2
-    0x15, 0x15, 0x0A, // 3
-    0x07, 0x04, 0x1F, // 4
-    0x17, 0x15, 0x1D, // 5
-    0x0F, 0x15, 0x0E, // 6
-    0x11, 0x09, 0x07, // 7
-    0x0A, 0x15, 0x0A, // 8
-    0x0E, 0x15, 0x0F, // 9
-    // Symbols
-    0x00, 0x0A, 0x00, // :
-    0x04, 0x04, 0x04, // -
-    0x00, 0x00, 0x00, // ' '
-	// Letras
-	0x1F, 0x11, 0x11, // A
-	0x0E, 0x11, 0x13  // G
-};
-
-FontDef_t Font_3x5 = {
-    3,
-    5,
-	(uint16_t *)Font3x5
+    Font5x7
 };
 
 
-char* FONTS_GetStringSize(char* str, FON_SIZE_t* SizeStruct, FontDef_t* Font) {
+char* FONTS_GetStringSize(char* str, FONTS_SIZE_t* SizeStruct, FontDef_t* Font) {
 	/* Fill settings */
 	SizeStruct->Height = Font->FontHeight;
 	SizeStruct->Length = Font->FontWidth * strlen(str);

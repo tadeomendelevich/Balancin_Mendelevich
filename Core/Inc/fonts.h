@@ -85,11 +85,6 @@ extern const uint8_t Font5x7[];
  */
 extern FontDef_t Font_5x7;
 
-/**
- * @brief  3 x 5 pixels font size structure
- */
-extern FontDef_t Font_3x5;
-
 extern const uint8_t unerLogo[1024];
 
 /**
