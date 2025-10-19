@@ -67,7 +67,7 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 17.5f
+#define KP 12.0f
 #define KD 0.22f  // Corregido para DT: 110.0f * 0.002f
 #define KI 0.0f
 
@@ -681,6 +681,20 @@ void UpdateADC_MovingAverage(void) {
     maIndex = (maIndex + 1) % ADC_AVERAGE_SIZE;	    // Avanza en el buffer circular
 }
 
+static void esp01_chpd(uint8_t val) {
+    // CH_PD_GPIO_Port y CH_PD_Pin vienen de MX_GPIO_Init()
+    HAL_GPIO_WritePin(CH_PD_GPIO_Port, CH_PD_Pin,
+                      val ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+void appOnESP01ChangeState(_eESP01STATUS state) {
+    if (state == ESP01_WIFI_NEW_IP) {
+        // Ahora que ya tenemos IP propia, arrancamos el socket UDP
+        ESP01_StartUDP(wifiIp, 30010, 30000);
+    }
+    // Si más adelante quieres TCP, aquí gestionas ESP01_UDPTCP_CONNECTED, etc.
+}
+
 void updateDisplay(void) {
     // 1) Limpia todo el buffer
     SSD1306_Fill(SSD1306_COLOR_BLACK);
@@ -708,11 +722,11 @@ void updateDisplay(void) {
             uint16_t y = 2 + i * 10;
             // etiqueta
             SSD1306_GotoXY(2, y);
-            SSD1306_Puts(labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
+            SSD1306_Puts(labels[i], &Font_5x7, SSD1306_COLOR_WHITE);
             // convierte valor a cadena
             itoa(values[i], buf, 10);
             // dibuja cada dígito pequeño
-            uint16_t x = 2 + strlen(labels[i]) * Font_7x10.FontWidth;
+            uint16_t x = 2 + strlen(labels[i]) * Font_5x7.FontWidth;
             for (char *p = buf; *p; p++) {
                 if (*p == '-') {
                     // si quieres manejar el signo, puedes dibujar un guión simple
@@ -764,19 +778,8 @@ void updateDisplay(void) {
     SSD1306_RequestUpdate();
 }
 
-static void esp01_chpd(uint8_t val) {
-    // CH_PD_GPIO_Port y CH_PD_Pin vienen de MX_GPIO_Init()
-    HAL_GPIO_WritePin(CH_PD_GPIO_Port, CH_PD_Pin,
-                      val ? GPIO_PIN_SET : GPIO_PIN_RESET);
-}
 
-void appOnESP01ChangeState(_eESP01STATUS state) {
-    if (state == ESP01_WIFI_NEW_IP) {
-        // Ahora que ya tenemos IP propia, arrancamos el socket UDP
-        ESP01_StartUDP(wifiIp, 30010, 30000);
-    }
-    // Si más adelante quieres TCP, aquí gestionas ESP01_UDPTCP_CONNECTED, etc.
-}
+
 /* USER CODE END 0 */
 
 /**

@@ -351,45 +351,82 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 		break;
 
         case MODIFYKP:
-        	putHeaderOnTx(dataTx, MODIFYKP, 2);
-			putByteOnTx(dataTx, ACK );
-			putByteOnTx(dataTx, dataTx->chk);
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[0]=getByteFromRx(dataRx,1,0); // Extraigo datos de KP
 			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
 			float new_KP = myWord.f32;
 			if (p_KP) *p_KP = new_KP;
+
+			putHeaderOnTx(dataTx, MODIFYKP, 5);
+			myWord.f32 = *p_KP; 	// Envio datos de KP
+			putByteOnTx(dataTx, myWord.ui8[0]);
+			putByteOnTx(dataTx, myWord.ui8[1]);
+			putByteOnTx(dataTx, myWord.ui8[2]);
+			putByteOnTx(dataTx, myWord.ui8[3]);
+			putByteOnTx(dataTx, dataTx->chk);
         break;
 
         case MODIFYKD:
-			putHeaderOnTx(dataTx, MODIFYKD, 2);
-			putByteOnTx(dataTx, ACK );
-			putByteOnTx(dataTx, dataTx->chk);
 			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
 			float new_KD = myWord.f32;
 			if (p_KD) *p_KD = new_KD;
+
+			putHeaderOnTx(dataTx, MODIFYKD, 5);
+			myWord.f32 = *p_KD; 	// Envio datos de KD
+			putByteOnTx(dataTx, myWord.ui8[0]);
+			putByteOnTx(dataTx, myWord.ui8[1]);
+			putByteOnTx(dataTx, myWord.ui8[2]);
+			putByteOnTx(dataTx, myWord.ui8[3]);
+			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case MODIFYKI:
-			putHeaderOnTx(dataTx, MODIFYKI, 2);
-			putByteOnTx(dataTx, ACK );
-			putByteOnTx(dataTx, dataTx->chk);
 			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
 			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
 			float new_KI = myWord.f32;
 			if (p_KI) *p_KI = new_KI;
+
+			putHeaderOnTx(dataTx, MODIFYKI, 5);
+			myWord.f32 = *p_KI; 	// Envio datos de KI
+			putByteOnTx(dataTx, myWord.ui8[0]);
+			putByteOnTx(dataTx, myWord.ui8[1]);
+			putByteOnTx(dataTx, myWord.ui8[2]);
+			putByteOnTx(dataTx, myWord.ui8[3]);
+			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case BALANCE:
         	if (p_balance_flag != NULL) {
 				*p_balance_flag = !(*p_balance_flag);
 			}
+        break;
+
+        case GETPIDVALUES:
+        	putHeaderOnTx(dataTx, GETPIDVALUES, 13); // 1 byte cmd + 2*4 bytes for float values
+
+			myWord.f32 = *p_KP; 	// Envio datos de INCLINACION
+			putByteOnTx(dataTx, myWord.ui8[0] );
+			putByteOnTx(dataTx, myWord.ui8[1] );
+			putByteOnTx(dataTx, myWord.ui8[2] );
+			putByteOnTx(dataTx, myWord.ui8[3] );
+			myWord.f32 = *p_KD;
+			putByteOnTx(dataTx, myWord.ui8[0] );
+			putByteOnTx(dataTx, myWord.ui8[1] );
+			putByteOnTx(dataTx, myWord.ui8[2] );
+			putByteOnTx(dataTx, myWord.ui8[3] );
+			myWord.f32 = *p_KI;
+			putByteOnTx(dataTx, myWord.ui8[0] );
+			putByteOnTx(dataTx, myWord.ui8[1] );
+			putByteOnTx(dataTx, myWord.ui8[2] );
+			putByteOnTx(dataTx, myWord.ui8[3] );
+
+			putByteOnTx(dataTx, dataTx->chk);
         break;
 
         case SENDALLSENSORS:

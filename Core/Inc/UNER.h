@@ -104,7 +104,8 @@ typedef enum{
 	MODIFYKD = 0xB2,
 	MODIFYKI = 0xB3,
 	BALANCE = 0xB4,
-    ACK = 0x0D,
+	GETPIDVALUES= 0xB5,
+	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
 
