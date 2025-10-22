@@ -358,8 +358,20 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			float new_KP = myWord.f32;
 			if (p_KP) *p_KP = new_KP;
 
-			putHeaderOnTx(dataTx, MODIFYKP, 5);
+			putHeaderOnTx(dataTx, MODIFYKP, 13);
 			myWord.f32 = *p_KP; 	// Envio datos de KP
+			putByteOnTx(dataTx, myWord.ui8[0]);
+			putByteOnTx(dataTx, myWord.ui8[1]);
+			putByteOnTx(dataTx, myWord.ui8[2]);
+			putByteOnTx(dataTx, myWord.ui8[3]);
+
+			myWord.f32 = *p_KD; 	// Envio datos de KD
+			putByteOnTx(dataTx, myWord.ui8[0]);
+			putByteOnTx(dataTx, myWord.ui8[1]);
+			putByteOnTx(dataTx, myWord.ui8[2]);
+			putByteOnTx(dataTx, myWord.ui8[3]);
+
+			myWord.f32 = *p_KI; 	// Envio datos de KI
 			putByteOnTx(dataTx, myWord.ui8[0]);
 			putByteOnTx(dataTx, myWord.ui8[1]);
 			putByteOnTx(dataTx, myWord.ui8[2]);
@@ -375,8 +387,20 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			float new_KD = myWord.f32;
 			if (p_KD) *p_KD = new_KD;
 
-			putHeaderOnTx(dataTx, MODIFYKD, 5);
+			putHeaderOnTx(dataTx, MODIFYKD, 13);
+			myWord.f32 = *p_KP; 	// Envio datos de KP
+			putByteOnTx(dataTx, myWord.ui8[0]);
+			putByteOnTx(dataTx, myWord.ui8[1]);
+			putByteOnTx(dataTx, myWord.ui8[2]);
+			putByteOnTx(dataTx, myWord.ui8[3]);
+
 			myWord.f32 = *p_KD; 	// Envio datos de KD
+			putByteOnTx(dataTx, myWord.ui8[0]);
+			putByteOnTx(dataTx, myWord.ui8[1]);
+			putByteOnTx(dataTx, myWord.ui8[2]);
+			putByteOnTx(dataTx, myWord.ui8[3]);
+
+			myWord.f32 = *p_KI; 	// Envio datos de KI
 			putByteOnTx(dataTx, myWord.ui8[0]);
 			putByteOnTx(dataTx, myWord.ui8[1]);
 			putByteOnTx(dataTx, myWord.ui8[2]);
@@ -392,7 +416,19 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			float new_KI = myWord.f32;
 			if (p_KI) *p_KI = new_KI;
 
-			putHeaderOnTx(dataTx, MODIFYKI, 5);
+			putHeaderOnTx(dataTx, MODIFYKI, 13);
+			myWord.f32 = *p_KP; 	// Envio datos de KP
+			putByteOnTx(dataTx, myWord.ui8[0]);
+			putByteOnTx(dataTx, myWord.ui8[1]);
+			putByteOnTx(dataTx, myWord.ui8[2]);
+			putByteOnTx(dataTx, myWord.ui8[3]);
+
+			myWord.f32 = *p_KD; 	// Envio datos de KD
+			putByteOnTx(dataTx, myWord.ui8[0]);
+			putByteOnTx(dataTx, myWord.ui8[1]);
+			putByteOnTx(dataTx, myWord.ui8[2]);
+			putByteOnTx(dataTx, myWord.ui8[3]);
+
 			myWord.f32 = *p_KI; 	// Envio datos de KI
 			putByteOnTx(dataTx, myWord.ui8[0]);
 			putByteOnTx(dataTx, myWord.ui8[1]);
@@ -404,6 +440,9 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         case BALANCE:
         	if (p_balance_flag != NULL) {
 				*p_balance_flag = !(*p_balance_flag);
+				putHeaderOnTx(dataTx, BALANCE, 2);
+				putByteOnTx(dataTx, ACK);
+				putByteOnTx(dataTx, dataTx->chk);
 			}
         break;
 
@@ -628,7 +667,7 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr) {
 }
 
 void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr) {
-    p_KP = kpPtr;
+    p_KP  = kpPtr;
     p_KD  = kdPtr;
     p_KI  = kiPtr;
 }

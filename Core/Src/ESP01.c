@@ -15,7 +15,7 @@
 
 extern void USB_Debug(const char *fmt, ...);
 
-#define SERVER_IP    		"192.168.123.174"
+#define SERVER_IP    		"192.168.100.5"
 #define SERVER_PORT  		30010
 #define LOCAL_PORT   		30000
 #define ALIVE_INTERVAL_FAST_MS 	5000

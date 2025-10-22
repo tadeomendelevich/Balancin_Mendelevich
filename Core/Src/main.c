@@ -67,7 +67,7 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 12.0f
+#define KP 19.0f
 #define KD 0.22f  // Corregido para DT: 110.0f * 0.002f
 #define KI 0.0f
 
@@ -147,13 +147,13 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 //const char *wifiPassword = "fcalconcordia.06-2019";
 //const char *wifiIp = "172.23.205.98";
 
-//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-//const char *wifiPassword = "djg19dlk";
-//const char *wifiIp 		 = "192.168.100.5";
+const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+const char *wifiPassword = "djg19dlk";
+const char *wifiIp 		 = "192.168.100.5";
 
-const char *wifiSSID     = "Delco_Mendelevich";
-const char *wifiPassword = "toyotakia";
-const char *wifiIp = "192.168.123.174";
+//const char *wifiSSID     = "Delco_Mendelevich";
+//const char *wifiPassword = "toyotakia";
+//const char *wifiIp = "192.168.123.174";
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
@@ -755,7 +755,7 @@ void updateDisplay(void) {
         const uint16_t region_x  = SCREEN_W/2;
         const uint16_t region_y  = title_h;
         const uint16_t region_w  = SCREEN_W/2;
-        const uint16_t region_h  = SCREEN_H - region_y - Font_5x7.FontHeight;
+        const uint16_t region_h  = SCREEN_H - region_y - Font_7x10.FontHeight;
 
         const uint16_t bar_spacing = BAR_SPACING;
         const uint16_t bar_width   =
@@ -769,8 +769,8 @@ void updateDisplay(void) {
             SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
 
             // dígito bajo la barra
-            uint16_t tx = x0 + (bar_width - Font_5x7.FontWidth)/2;
-            uint16_t ty = region_y + region_h + ((Font_5x7.FontHeight + 2 - Font_5x7.FontHeight)/2);
+            uint16_t tx = x0 + (bar_width - Font_7x10.FontWidth)/2;
+            uint16_t ty = region_y + region_h + ((Font_7x10.FontHeight + 2 - Font_7x10.FontHeight)/2);
             SSD1306_DrawDigit5x7(i+1, tx, ty);
         }
     }
