@@ -67,9 +67,11 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 19.0f
-#define KD 0.22f  // Corregido para DT: 110.0f * 0.002f
+#define KP 0.25f
+#define KD 0.02f
 #define KI 0.0f
+
+#define MOTOR_GAIN 3.0f
 
 #define SETPOINT_ANGLE 0.0
 
@@ -160,6 +162,7 @@ int16_t motorLeftVelocity  = 0;
 
 static float previous_error = 0.0f;
 static float integral = 0.0f;
+static float steering_adjustment = 0.0f;
 static float filtered_roll_deg = 0.0f;
 
 float KP_value;
@@ -860,6 +863,7 @@ int main(void)
   UNER_RegisterMotorSpeed(&motorRightVelocity, &motorLeftVelocity);
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
   UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value);
+  UNER_RegisterSteering(&steering_adjustment);
   UNER_RegisterFlags(&f_balancing);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
@@ -945,8 +949,13 @@ int main(void)
 			  float output = (KP_value * error) + (KI_value * integral) + (KD_value * derivative);
 			  previous_error = error;
 
-			  motorRightVelocity = (int16_t)output;
-			  motorLeftVelocity  = (int16_t)output;
+			  float pwm_cmd = output * MOTOR_GAIN;
+
+			  if (pwm_cmd > 100.0f)  pwm_cmd = 100.0f;
+			  if (pwm_cmd < -100.0f) pwm_cmd = -100.0f;
+
+			  motorRightVelocity = (int16_t)(pwm_cmd + steering_adjustment);
+			  motorLeftVelocity  = (int16_t)(pwm_cmd - steering_adjustment);
 
 			  // Actualizar variables para reporte
 			  roll_deg = filtered_roll_deg;
