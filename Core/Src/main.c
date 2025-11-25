@@ -67,9 +67,11 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 19.0f
-#define KD 0.22f  // Corregido para DT: 110.0f * 0.002f
+#define KP 0.25f
+#define KD 0.02f
 #define KI 0.0f
+
+#define MOTOR_GAIN 3.0f
 
 #define SETPOINT_ANGLE 0.0
 
@@ -947,8 +949,13 @@ int main(void)
 			  float output = (KP_value * error) + (KI_value * integral) + (KD_value * derivative);
 			  previous_error = error;
 
-			  motorRightVelocity = (int16_t)(output + steering_adjustment);
-			  motorLeftVelocity  = (int16_t)(output - steering_adjustment);
+			  float pwm_cmd = output * MOTOR_GAIN;
+
+			  if (pwm_cmd > 100.0f)  pwm_cmd = 100.0f;
+			  if (pwm_cmd < -100.0f) pwm_cmd = -100.0f;
+
+			  motorRightVelocity = (int16_t)(pwm_cmd + steering_adjustment);
+			  motorLeftVelocity  = (int16_t)(pwm_cmd - steering_adjustment);
 
 			  // Actualizar variables para reporte
 			  roll_deg = filtered_roll_deg;
