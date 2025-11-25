@@ -53,6 +53,8 @@ static float *p_KI  = NULL;
 static float *p_roll  = NULL;	// Punteros a las variables de inclinacion en main.c
 static float *p_pitch = NULL;
 
+static float *p_steering = NULL;
+
 static uint8_t *p_balance_flag = NULL;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
@@ -468,6 +470,17 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			putByteOnTx(dataTx, dataTx->chk);
         break;
 
+        case MODIFYSTEERING:
+            myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+            myWord.ui8[1]=getByteFromRx(dataRx,1,0);
+            myWord.ui8[2]=getByteFromRx(dataRx,1,0);
+            myWord.ui8[3]=getByteFromRx(dataRx,1,0);
+            if (p_steering) *p_steering = myWord.f32;
+            putHeaderOnTx(dataTx, MODIFYSTEERING, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
@@ -676,6 +689,10 @@ void UNER_RegisterAngle(float *rollPtr, float *pitchPtr)
 {
     p_roll  = rollPtr;
     p_pitch = pitchPtr;
+}
+
+void UNER_RegisterSteering(float *steeringPtr) {
+    p_steering = steeringPtr;
 }
 
 void UNER_RegisterFlags(uint8_t *flagPtr) {
