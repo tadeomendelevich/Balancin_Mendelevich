@@ -67,8 +67,8 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 0.25f
-#define KD 0.02f
+#define KP 8.0f
+#define KD 1.0f
 #define KI 0.0f
 
 #define MOTOR_GAIN 3.0f
@@ -149,13 +149,13 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 //const char *wifiPassword = "fcalconcordia.06-2019";
 //const char *wifiIp = "172.23.205.98";
 
-const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-const char *wifiPassword = "djg19dlk";
-const char *wifiIp 		 = "192.168.100.5";
+//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+//const char *wifiPassword = "djg19dlk";
+//const char *wifiIp 		 = "192.168.100.5";
 
-//const char *wifiSSID     = "Delco_Mendelevich";
-//const char *wifiPassword = "toyotakia";
-//const char *wifiIp = "192.168.123.174";
+const char *wifiSSID     = "Delco_Mendelevich";
+const char *wifiPassword = "toyotakia";
+const char *wifiIp = "192.168.1.71";
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
