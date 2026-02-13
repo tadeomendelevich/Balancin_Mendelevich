@@ -38,6 +38,7 @@ typedef struct {
     uint8_t indexW;
     uint8_t indexData;
     uint8_t nBytes;
+    uint8_t payloadLen;
     uint8_t header;
     uint8_t chk;
     uint8_t mask;
@@ -110,6 +111,14 @@ typedef enum{
     UNKNOWN = 0xFF
 }_eCmd;
 
+typedef enum {
+    UNER_TYPE_UINT8,
+    UNER_TYPE_INT16,
+    UNER_TYPE_INT32,
+    UNER_TYPE_FLOAT,
+    UNER_TYPE_TOGGLE
+} UNER_VarType;
+
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr);
 
 void UNER_PushByte(uint8_t byte);
@@ -153,6 +162,8 @@ void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr);
 void UNER_RegisterSteering(float *steeringPtr);
 
 void UNER_RegisterFlags(uint8_t *flagPtr);
+
+void UNER_RegisterVariable(uint8_t cmdId, void* ptr, UNER_VarType type);
 
 void UNER_SendData(void);
 
