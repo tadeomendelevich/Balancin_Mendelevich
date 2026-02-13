@@ -169,7 +169,8 @@ float KP_value;
 float KD_value;
 float KI_value;
 
-uint8_t f_balancing = 0;
+uint8_t f_balancing = 0;	// En 0 (cero) desactiva los motores del PID y en 1 ativa los motores con el PID
+uint8_t f_resetMassCenter = 0; // Resetea el centro de gravedad en el cual el auto hace balance
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -864,7 +865,7 @@ int main(void)
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
   UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value);
   UNER_RegisterSteering(&steering_adjustment);
-  UNER_RegisterFlags(&f_balancing);
+  UNER_RegisterFlags(&f_balancing, &f_resetMassCenter);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();

@@ -55,7 +55,9 @@ static float *p_pitch = NULL;
 
 static float *p_steering = NULL;
 
-static uint8_t *p_balance_flag = NULL;
+static uint8_t *p_balance_flag = NULL;	// Bandera para activar o desctivar el balance del auto, si esta apagada, los motores estan desabilitados
+
+static uint8_t *p_resetMassCenter_flag = NULL;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
@@ -481,6 +483,15 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
             putByteOnTx(dataTx, dataTx->chk);
         break;
 
+        case RESETMASSCENTER:
+			if (p_resetMassCenter_flag != NULL) {
+				*p_resetMassCenter_flag = !(*p_resetMassCenter_flag);
+				putHeaderOnTx(dataTx, RESETMASSCENTER, 2);
+				putByteOnTx(dataTx, ACK);
+				putByteOnTx(dataTx, dataTx->chk);
+			}
+		break;
+
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
@@ -695,8 +706,9 @@ void UNER_RegisterSteering(float *steeringPtr) {
     p_steering = steeringPtr;
 }
 
-void UNER_RegisterFlags(uint8_t *flagPtr) {
-    p_balance_flag = flagPtr;
+void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2) {
+    p_balance_flag = flagPtr1;
+    p_resetMassCenter_flag = flagPtr2;
 }
 
 

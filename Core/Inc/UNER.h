@@ -106,6 +106,7 @@ typedef enum{
 	BALANCE = 0xB4,
 	GETPIDVALUES= 0xB5,
     MODIFYSTEERING = 0xB6,
+	RESETMASSCENTER = 0xB7,
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -152,7 +153,7 @@ void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr);
 
 void UNER_RegisterSteering(float *steeringPtr);
 
-void UNER_RegisterFlags(uint8_t *flagPtr);
+void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2);
 
 void UNER_SendData(void);
 
