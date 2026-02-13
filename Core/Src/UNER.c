@@ -59,6 +59,16 @@ static uint8_t *p_balance_flag = NULL;	// Bandera para activar o desctivar el ba
 
 static uint8_t *p_resetMassCenter_flag = NULL;
 
+typedef struct {
+    uint8_t cmdId;
+    void* ptr;
+    UNER_VarType type;
+} UNER_RegistryEntry;
+
+#define MAX_REGISTRY_ENTRIES 16
+static UNER_RegistryEntry registry[MAX_REGISTRY_ENTRIES];
+static uint8_t registryCount = 0;
+
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
     unerTx = tx;
@@ -123,6 +133,7 @@ void UNER_Task(void) {
                 break;
             case NBYTES:
                 unerRx->nBytes = unerRx->buff[unerRx->indexR];
+                unerRx->payloadLen = unerRx->nBytes;
                 unerRx->header = TOKEN;
                 break;
             case TOKEN:
@@ -239,7 +250,93 @@ uint8_t getByteFromRx(_sRx *dataRx, uint8_t iniPos, uint8_t finalPos){
 
 void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 {
-    switch(dataRx->buff[dataRx->indexData]){
+    uint8_t cmd = dataRx->buff[dataRx->indexData];
+
+    // Generic Registry Handler
+    for (int i = 0; i < registryCount; i++) {
+        if (registry[i].cmdId == cmd) {
+            uint8_t payloadLen = dataRx->payloadLen;
+            // payloadLen includes CMD byte. So data len = payloadLen - 1.
+
+            if (payloadLen > 1) {
+                // SET Command (Data present)
+                _uWord val;
+                val.ui32 = 0;
+                uint8_t dataLen = payloadLen - 1;
+
+                // Read up to 4 bytes
+                for(int j=0; j<dataLen && j<4; j++){
+                    val.ui8[j] = getByteFromRx(dataRx, 1, 0);
+                }
+
+                switch(registry[i].type){
+                    case UNER_TYPE_UINT8:
+                        *(uint8_t*)registry[i].ptr = val.ui8[0];
+                        break;
+                    case UNER_TYPE_INT16:
+                        *(int16_t*)registry[i].ptr = val.i16[0];
+                        break;
+                    case UNER_TYPE_INT32:
+                        *(int32_t*)registry[i].ptr = val.i32;
+                        break;
+                    case UNER_TYPE_FLOAT:
+                        *(float*)registry[i].ptr = val.f32;
+                        break;
+                    case UNER_TYPE_TOGGLE:
+                        *(uint8_t*)registry[i].ptr = (val.ui8[0] > 0);
+                        break;
+                }
+
+                // Send ACK
+                putHeaderOnTx(dataTx, (_eCmd)cmd, 2);
+                putByteOnTx(dataTx, ACK);
+                putByteOnTx(dataTx, dataTx->chk);
+
+            } else {
+                // GET or TOGGLE (No data)
+                if(registry[i].type == UNER_TYPE_TOGGLE){
+                     *(uint8_t*)registry[i].ptr = !(*(uint8_t*)registry[i].ptr);
+                     putHeaderOnTx(dataTx, (_eCmd)cmd, 2);
+                     putByteOnTx(dataTx, ACK);
+                     putByteOnTx(dataTx, dataTx->chk);
+                } else {
+                    // GET Value
+                    _uWord val;
+                    val.ui32 = 0;
+                    uint8_t len = 0;
+                     switch(registry[i].type){
+                        case UNER_TYPE_UINT8:
+                            val.ui8[0] = *(uint8_t*)registry[i].ptr;
+                            len = 1;
+                            break;
+                        case UNER_TYPE_INT16:
+                            val.i16[0] = *(int16_t*)registry[i].ptr;
+                            len = 2;
+                            break;
+                        case UNER_TYPE_INT32:
+                            val.i32 = *(int32_t*)registry[i].ptr;
+                            len = 4;
+                            break;
+                        case UNER_TYPE_FLOAT:
+                            val.f32 = *(float*)registry[i].ptr;
+                            len = 4;
+                            break;
+                        default: break;
+                    }
+
+                    putHeaderOnTx(dataTx, (_eCmd)cmd, len + 1);
+                    for(int k=0; k<len; k++){
+                        putByteOnTx(dataTx, val.ui8[k]);
+                    }
+                    putByteOnTx(dataTx, dataTx->chk);
+                }
+            }
+            UNER_SendData();
+            return;
+        }
+    }
+
+    switch(cmd){
         case ALIVE:
         	USB_Debug("\n ALIVE RECIBIDO!\n");
             putHeaderOnTx(dataTx, ALIVE, 2);
@@ -709,6 +806,15 @@ void UNER_RegisterSteering(float *steeringPtr) {
 void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2) {
     p_balance_flag = flagPtr1;
     p_resetMassCenter_flag = flagPtr2;
+}
+
+void UNER_RegisterVariable(uint8_t cmdId, void* ptr, UNER_VarType type) {
+    if (registryCount < MAX_REGISTRY_ENTRIES) {
+        registry[registryCount].cmdId = cmdId;
+        registry[registryCount].ptr = ptr;
+        registry[registryCount].type = type;
+        registryCount++;
+    }
 }
 
 

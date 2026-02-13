@@ -867,6 +867,9 @@ int main(void)
   UNER_RegisterSteering(&steering_adjustment);
   UNER_RegisterFlags(&f_balancing, &f_resetMassCenter);
 
+  // Ejemplo de cómo registrar una nueva variable usando el sistema genérico (Eficiente)
+  // UNER_RegisterVariable(0xCC, &mi_variable_float, UNER_TYPE_FLOAT);
+
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();
 
