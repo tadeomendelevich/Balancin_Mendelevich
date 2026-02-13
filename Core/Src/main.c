@@ -726,11 +726,11 @@ void updateDisplay(void) {
             uint16_t y = 2 + i * 10;
             // etiqueta
             SSD1306_GotoXY(2, y);
-            SSD1306_Puts(labels[i], &Font_5x7, SSD1306_COLOR_WHITE);
+            SSD1306_Puts(labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
             // convierte valor a cadena
             itoa(values[i], buf, 10);
             // dibuja cada dígito pequeño
-            uint16_t x = 2 + strlen(labels[i]) * Font_5x7.FontWidth;
+            uint16_t x = 2 + strlen(labels[i]) * Font_7x10.FontWidth;
             for (char *p = buf; *p; p++) {
                 if (*p == '-') {
                     // si quieres manejar el signo, puedes dibujar un guión simple
@@ -759,7 +759,7 @@ void updateDisplay(void) {
         const uint16_t region_x  = SCREEN_W/2;
         const uint16_t region_y  = title_h;
         const uint16_t region_w  = SCREEN_W/2;
-        const uint16_t region_h  = SCREEN_H - region_y - Font_7x10.FontHeight;
+        const uint16_t region_h  = SCREEN_H - region_y - Font_5x7.FontHeight;
 
         const uint16_t bar_spacing = BAR_SPACING;
         const uint16_t bar_width   =
@@ -773,8 +773,8 @@ void updateDisplay(void) {
             SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
 
             // dígito bajo la barra
-            uint16_t tx = x0 + (bar_width - Font_7x10.FontWidth)/2;
-            uint16_t ty = region_y + region_h + ((Font_7x10.FontHeight + 2 - Font_7x10.FontHeight)/2);
+            uint16_t tx = x0 + (bar_width - Font_5x7.FontWidth)/2;
+            uint16_t ty = region_y + region_h + ((Font_5x7.FontHeight + 2 - Font_5x7.FontHeight)/2);
             SSD1306_DrawDigit5x7(i+1, tx, ty);
         }
     }
@@ -994,6 +994,11 @@ int main(void)
 		  UpdateADC_MovingAverage();
 		  if (SSD1306_IsUpdateDone()) {
 			  updateDisplay();
+		  }
+
+		  if (f_resetMassCenter) {
+			  MPU6050_Calibrate();		// Calibración del mpu para restablecer el centro de gravedad y balance del auto
+			  f_resetMassCenter = 0;
 		  }
 	  }
 
