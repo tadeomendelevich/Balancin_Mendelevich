@@ -914,7 +914,7 @@ int main(void)
 		  is2ms = 0;
 
 		  // Iniciar lectura del sensor MPU6050
-		  if (mpu_initialized && !i2c1_tx_busy) {
+		  if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
 			  MPU6050_StartRead_DMA();
 		  }
 
@@ -997,8 +997,10 @@ int main(void)
 		  }
 
 		  if (f_resetMassCenter) {
-			  MPU6050_Calibrate();		// Calibración del mpu para restablecer el centro de gravedad y balance del auto
-			  f_resetMassCenter = 0;
+			  if (!i2c1_tx_busy) {
+				  MPU6050_Calibrate();		// Calibración del mpu para restablecer el centro de gravedad y balance del auto
+				  f_resetMassCenter = 0;
+			  }
 		  }
 	  }
 
