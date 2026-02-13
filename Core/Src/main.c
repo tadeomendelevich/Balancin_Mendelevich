@@ -67,7 +67,7 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 8.0f
+#define KP 3.0f
 #define KD 1.0f
 #define KI 0.0f
 
@@ -115,7 +115,7 @@ static volatile uint16_t tx_tail = 0;
 static volatile uint8_t usb_tx_busy = 0;
 static const char HEX_DIGITS[] = "0123456789ABCDEF";	// Tabla de dígitos hex para USB
 
-static uint8_t ema_initialized = 0;
+//static uint8_t ema_initialized = 0;
 static uint8_t sendModulesCounter, aliveCounter, mpu6050Counter;
 uint8_t mpuDataReady = 0;
 uint8_t mpu_initialized = 0;
@@ -145,17 +145,17 @@ static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrant
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
 
-//const char *wifiSSID     = "FCAL";
-//const char *wifiPassword = "fcalconcordia.06-2019";
-//const char *wifiIp = "172.23.205.98";
+const char *wifiSSID     = "FCAL";
+const char *wifiPassword = "fcalconcordia.06-2019";
+const char *wifiIp = "172.23.205.98";
 
 //const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
 //const char *wifiPassword = "djg19dlk";
 //const char *wifiIp 		 = "192.168.100.5";
 
-const char *wifiSSID     = "Delco_Mendelevich";
-const char *wifiPassword = "toyotakia";
-const char *wifiIp = "192.168.1.71";
+//const char *wifiSSID     = "Delco_Mendelevich";
+//const char *wifiPassword = "toyotakia";
+//const char *wifiIp = "192.168.1.71";
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
@@ -169,7 +169,7 @@ float KP_value;
 float KD_value;
 float KI_value;
 
-uint8_t f_balancing = 1;
+uint8_t f_balancing = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
