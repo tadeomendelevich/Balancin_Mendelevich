@@ -870,7 +870,7 @@ static void ESP01DOConnection(){
 			aDbgStr("+&DBGESP01ATCWJAP\n");
 		esp01Flags.bit.ATRESPONSEOK = 0;
 		esp01ATSate = ESP01CWJAPRESPONSE;
-		esp01TimeoutTask = 1500;
+		esp01TimeoutTask = 2000;
 		break;
 	case ESP01CWJAPRESPONSE:
 		if(esp01Flags.bit.ATRESPONSEOK){
