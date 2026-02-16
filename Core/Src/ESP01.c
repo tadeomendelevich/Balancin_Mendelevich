@@ -128,6 +128,7 @@ const char respIPD[] = "0410+IPD";
 const char respReady[] = "0702ready\r\n";
 const char respBUSYP[] = "0602busy p";
 const char respBUSYS[] = "0602busy s";
+const char respFAIL[]  = "0602FAIL\r\n";
 // 	  const char respCIFSRAPIP[] = "1102+CIFSR:APIP";
 //    const char respCIFSRAPMAC[] = "1202+CIFSR:APMAC";
 //    const char respCIFSRSTAIP[] = "1205+CIFSR:STAIP";
@@ -135,7 +136,7 @@ const char respBUSYS[] = "0602busy s";
 
 const char *const responses[] = {respAT, respATp, respOK, respERROR, respWIFIGOTIP, respWIFICONNECTED,
 								 respWIFIDISCONNECT, respWIFIDISCONNECTED, respDISCONNECTED, respSENDOK, respCONNECT, respCLOSED,
-								 respCIFSRAPIP, respBUSY, respIPD, respReady, respBUSYP, respBUSYS, NULL};
+								 respCIFSRAPIP, respBUSY, respIPD, respReady, respBUSYP, respBUSYS, respFAIL, NULL};
 
 static uint8_t indexResponse = 0;
 static uint8_t indexResponseChar = 0;
@@ -575,6 +576,19 @@ static void ESP01ATDecode(){
 					break;
 				case 17://busy s
 					break;
+				case 18://FAIL
+				    {
+				        aDbgStr(">>> DEBUG: FAIL received\r\n");
+				        if (esp01ATSate == ESP01CWJAPRESPONSE) {
+				             esp01ATSate = ESP01ATAT;
+				             esp01TimeoutTask = 0;
+				        }
+				        // Asegurar que se marque como desconectado
+				        esp01Flags.bit.WIFICONNECTED = 0;
+				        esp01Flags.bit.UDPTCPCONNECTED = 0;
+				        ESP01_NotifyStateChange(ESP01_WIFI_DISCONNECTED);
+				    }
+				    break;
 				}
 			}
 			break;
