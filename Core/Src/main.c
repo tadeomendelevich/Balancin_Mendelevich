@@ -153,9 +153,9 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 //const char *wifiPassword = "djg19dlk";
 //const char *wifiIp 		 = "192.168.100.5";
 
-const char *wifiSSID     = "Delco Mendelevich-5G";
+const char *wifiSSID     = "Delco_Mendelevich";
 const char *wifiPassword = "toyotakia";
-const char *wifiIp = "192.168.1.37";
+const char *wifiIp = "192.168.1.39";
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
@@ -169,7 +169,7 @@ float KP_value;
 float KD_value;
 float KI_value;
 
-uint8_t f_balancing = 1;	// En 0 (cero) desactiva los motores del PID y en 1 ativa los motores con el PID
+uint8_t f_balancing = 0;	// En 0 (cero) desactiva los motores del PID y en 1 ativa los motores con el PID
 uint8_t f_resetMassCenter = 0; // Resetea el centro de gravedad en el cual el auto hace balance
 /* USER CODE END PV */
 
