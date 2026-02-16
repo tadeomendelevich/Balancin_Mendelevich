@@ -149,13 +149,13 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 //const char *wifiPassword = "fcalconcordia.06-2019";
 //const char *wifiIp = "172.23.205.98";
 
-//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-//const char *wifiPassword = "djg19dlk";
-//const char *wifiIp 		 = "192.168.100.5";
+const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+const char *wifiPassword = "djg19dlk";
+const char *wifiIp 		 = "192.168.100.5";
 
-const char *wifiSSID     = "Delco Mendelevich-5G";
-const char *wifiPassword = "toyotakia";
-const char *wifiIp = "192.168.1.37";
+//const char *wifiSSID     = "Delco Mendelevich-5G";
+//const char *wifiPassword = "toyotakia";
+//const char *wifiIp = "192.168.1.37";
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
