@@ -64,6 +64,8 @@ static union{
 
 static void ESP01ATDecode();
 static void ESP01DOConnection();
+static void ESP01_InternalStateChange(_eESP01STATUS state);
+static void ESP01_NotifyStateChange(_eESP01STATUS state);
 static void ESP01SENDData();
 static void ESP01StrToBufTX(const char *str);
 static void ESP01ByteToBufTX(uint8_t value);
@@ -126,6 +128,7 @@ const char respIPD[] = "0410+IPD";
 const char respReady[] = "0702ready\r\n";
 const char respBUSYP[] = "0602busy p";
 const char respBUSYS[] = "0602busy s";
+const char respFAIL[]  = "0602FAIL\r\n";
 // 	  const char respCIFSRAPIP[] = "1102+CIFSR:APIP";
 //    const char respCIFSRAPMAC[] = "1202+CIFSR:APMAC";
 //    const char respCIFSRSTAIP[] = "1205+CIFSR:STAIP";
@@ -133,7 +136,7 @@ const char respBUSYS[] = "0602busy s";
 
 const char *const responses[] = {respAT, respATp, respOK, respERROR, respWIFIGOTIP, respWIFICONNECTED,
 								 respWIFIDISCONNECT, respWIFIDISCONNECTED, respDISCONNECTED, respSENDOK, respCONNECT, respCLOSED,
-								 respCIFSRAPIP, respBUSY, respIPD, respReady, respBUSYP, respBUSYS, NULL};
+								 respCIFSRAPIP, respBUSY, respIPD, respReady, respBUSYP, respBUSYS, respFAIL, NULL};
 
 static uint8_t indexResponse = 0;
 static uint8_t indexResponseChar = 0;
@@ -325,7 +328,6 @@ _eESP01STATUS ESP01_Send(uint8_t *buf, uint16_t irRingBuf, uint16_t length, uint
 void ESP01_Init(_sESP01Handle *hESP01){
 
 	memcpy(&esp01Handle, hESP01, sizeof(_sESP01Handle));
-	ESP01_AttachChangeState(onESP01StateChange);
 
 	esp01ATSate = ESP01ATIDLE;
 	esp01HState = 0;
@@ -511,7 +513,7 @@ static void ESP01ATDecode(){
 		            }
 		            else if (esp01ATSate == ESP01CIPSTARTRESPONSE && strcmp(esp01PROTO, "UDP") == 0) {
 		                esp01Flags.bit.ATRESPONSEOK = 1;
-		                if (aESP01ChangeState) aESP01ChangeState(ESP01_UDPTCP_CONNECTED);
+		                ESP01_NotifyStateChange(ESP01_UDPTCP_CONNECTED);
 		            }
 		            break;
 
@@ -527,8 +529,7 @@ static void ESP01ATDecode(){
 					if(esp01ATSate == ESP01CWJAPRESPONSE)
 						esp01Flags.bit.ATRESPONSEOK = 1;
 					esp01Flags.bit.WIFICONNECTED = 1;
-					if(aESP01ChangeState != NULL)
-						aESP01ChangeState(ESP01_WIFI_CONNECTED);
+					ESP01_NotifyStateChange(ESP01_WIFI_CONNECTED);
 					break;
 				case 5://WIFI CONNECTED
 					break;
@@ -536,10 +537,8 @@ static void ESP01ATDecode(){
 				case 7://WIFI DISCONNECTED
 					esp01Flags.bit.UDPTCPCONNECTED = 0;
 					esp01Flags.bit.WIFICONNECTED = 0;
-					if(aESP01ChangeState != NULL) {
-						aESP01ChangeState(ESP01_WIFI_DISCONNECTED);
-						aESP01ChangeState(ESP01_WIFI_RECONNECTING);
-					}
+					ESP01_NotifyStateChange(ESP01_WIFI_DISCONNECTED);
+					ESP01_NotifyStateChange(ESP01_WIFI_RECONNECTING);
 					if(esp01ATSate != ESP01CWJAPRESPONSE) {
 						esp01ATSate = ESP01ATRECONNECT;
 					}
@@ -549,8 +548,7 @@ static void ESP01ATDecode(){
 					break;
 				case 9://SEND OK
 					esp01Flags.bit.SENDINGDATA = 0;
-					if(aESP01ChangeState != NULL)
-						aESP01ChangeState(ESP01_SEND_OK);
+					ESP01_NotifyStateChange(ESP01_SEND_OK);
 					break;
 				case 10://CONNECT
 					if (waitingForTCPClient) {
@@ -560,8 +558,7 @@ static void ESP01ATDecode(){
 					esp01TimeoutTask = 0;
 					esp01Flags.bit.ATRESPONSEOK = 1;
 					esp01Flags.bit.UDPTCPCONNECTED = 1;
-					if(aESP01ChangeState != NULL)
-						aESP01ChangeState(ESP01_UDPTCP_CONNECTED);
+					ESP01_NotifyStateChange(ESP01_UDPTCP_CONNECTED);
 					break;
 				case 11://CLOSED
 					esp01Flags.bit.UDPTCPCONNECTED = 0;
@@ -579,6 +576,19 @@ static void ESP01ATDecode(){
 					break;
 				case 17://busy s
 					break;
+				case 18://FAIL
+				    {
+				        aDbgStr(">>> DEBUG: FAIL received\r\n");
+				        if (esp01ATSate == ESP01CWJAPRESPONSE) {
+				             esp01ATSate = ESP01ATAT;
+				             esp01TimeoutTask = 0;
+				        }
+				        // Asegurar que se marque como desconectado
+				        esp01Flags.bit.WIFICONNECTED = 0;
+				        esp01Flags.bit.UDPTCPCONNECTED = 0;
+				        ESP01_NotifyStateChange(ESP01_WIFI_DISCONNECTED);
+				    }
+				    break;
 				}
 			}
 			break;
@@ -617,8 +627,7 @@ static void ESP01ATDecode(){
 				}
 				else
 					esp01LocalIP[0] = '\0';
-				if(aESP01ChangeState != NULL)
-					aESP01ChangeState(ESP01_WIFI_NEW_IP);
+				ESP01_NotifyStateChange(ESP01_WIFI_NEW_IP);
 			}
 			break;
 		case 10:  // acabamos de detectar "+IPD"
@@ -735,7 +744,7 @@ static void ESP01DOConnection(){
         aDbgStr(">>> Conexión perdida, reintentando...\r\n");
         esp01ATSate     = ESP01ATRECONNECT;
         esp01TimeoutTask = 0; // Iniciar reconexión inmediatamente
-        if(aESP01ChangeState != NULL) aESP01ChangeState(ESP01_WIFI_RECONNECTING);
+        ESP01_NotifyStateChange(ESP01_WIFI_RECONNECTING);
         return;
     }
     // 2b) Si seguimos vivos, sólo esperamos antes de chequear de nuevo
@@ -945,8 +954,7 @@ static void ESP01DOConnection(){
 			}
 
 
-			if (aESP01ChangeState)
-				aESP01ChangeState(ESP01_UDPTCP_CONNECTED);
+			ESP01_NotifyStateChange(ESP01_UDPTCP_CONNECTED);
 		} else if (tryingTCP) {
 			tryingTCP = 0;
 			ESP01_USB_DbgStr(">>> TCP CONNECT falló, cambiando a UDP...\r\n");
@@ -1036,7 +1044,14 @@ void ESP01_USB_DbgStr(const char *dbgStr) {
     USB_DebugStr(dbgStr);
 }
 
-void onESP01StateChange(_eESP01STATUS state) {
+static void ESP01_NotifyStateChange(_eESP01STATUS state) {
+    ESP01_InternalStateChange(state);
+    if (aESP01ChangeState != NULL) {
+        aESP01ChangeState(state);
+    }
+}
+
+static void ESP01_InternalStateChange(_eESP01STATUS state) {
     switch (state) {
     	case ESP01_WIFI_CONNECTED:
 			// Cuando ya estamos en la red, arrancamos UDP (single-connection)
@@ -1062,27 +1077,11 @@ void onESP01StateChange(_eESP01STATUS state) {
 			break;
 
         case ESP01_WIFI_NEW_IP:
-        	if (state == ESP01_WIFI_NEW_IP) {
-        	  // Lanza aquí tu UDP (solo una vez)
-        	  ESP01_StartUDP(SERVER_IP, 30010, 30000);
-        	}
-        	else if (state == ESP01_UDPTCP_CONNECTED) {
-        	  // Ya puedes enviar datos
-        	  // por ejemplo: ESP01_Send(buf, ir, len, size);
-        	}
-
-        	// Sólo arrancar el servidor TCP la primera vez que recibimos IP
-            /*if (!tcpServerStarted && strcmp(esp01PROTO, "TCP") == 0) {
-                // Habilitar multiplexado y servidor en el ESP01
-                ESP01StrToBufTX("AT+CIPMUX=1\r\n");
-                {
-                    char cmd[32];
-                    snprintf(cmd, sizeof(cmd), "AT+CIPSERVER=1,%d\r\n", LOCAL_PORT);
-                    ESP01StrToBufTX(cmd);
-                }
-                aDbgStr(">>> Servidor TCP arrancado\r\n");
-                tcpServerStarted = 1;
-            }*/
+            // La inicialización de UDP se delega al callback de usuario (appOnESP01ChangeState)
+            // para que pueda especificar la IP de destino correcta.
+            // if (state == ESP01_WIFI_NEW_IP) {
+            //   ESP01_StartUDP(SERVER_IP, 30010, 30000);
+            // }
             break;
 
         case ESP01_UDPTCP_CONNECTED:
