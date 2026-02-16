@@ -145,17 +145,17 @@ static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrant
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
 
-const char *wifiSSID     = "FCAL";
-const char *wifiPassword = "fcalconcordia.06-2019";
-const char *wifiIp = "172.23.205.98";
+//const char *wifiSSID     = "FCAL";
+//const char *wifiPassword = "fcalconcordia.06-2019";
+//const char *wifiIp = "172.23.205.98";
 
 //const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
 //const char *wifiPassword = "djg19dlk";
 //const char *wifiIp 		 = "192.168.100.5";
 
-//const char *wifiSSID     = "Delco_Mendelevich";
-//const char *wifiPassword = "toyotakia";
-//const char *wifiIp = "192.168.1.71";
+const char *wifiSSID     = "Delco Mendelevich-5G";
+const char *wifiPassword = "toyotakia";
+const char *wifiIp = "192.168.1.37";
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
@@ -169,7 +169,7 @@ float KP_value;
 float KD_value;
 float KI_value;
 
-uint8_t f_balancing = 0;	// En 0 (cero) desactiva los motores del PID y en 1 ativa los motores con el PID
+uint8_t f_balancing = 1;	// En 0 (cero) desactiva los motores del PID y en 1 ativa los motores con el PID
 uint8_t f_resetMassCenter = 0; // Resetea el centro de gravedad en el cual el auto hace balance
 /* USER CODE END PV */
 
@@ -914,7 +914,7 @@ int main(void)
 		  is2ms = 0;
 
 		  // Iniciar lectura del sensor MPU6050
-		  if (mpu_initialized && !i2c1_tx_busy) {
+		  if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
 			  MPU6050_StartRead_DMA();
 		  }
 
@@ -997,8 +997,10 @@ int main(void)
 		  }
 
 		  if (f_resetMassCenter) {
-			  MPU6050_Calibrate();		// Calibración del mpu para restablecer el centro de gravedad y balance del auto
-			  f_resetMassCenter = 0;
+			  if (!i2c1_tx_busy) {
+				  MPU6050_Calibrate();		// Calibración del mpu para restablecer el centro de gravedad y balance del auto
+				  f_resetMassCenter = 0;
+			  }
 		  }
 	  }
 
