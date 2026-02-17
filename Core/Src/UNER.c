@@ -167,7 +167,7 @@ void UNER_Send(uint8_t cmd, const uint8_t *payload, uint8_t length) {
         unerTx->indexW &= unerTx->mask;
     }
 
-    uint8_t len = length + 1; // incluye el cmd
+    uint8_t len = length + 2; // incluye el cmd y checksum
     unerTx->buff[unerTx->indexW++] = len;
     unerTx->indexW &= unerTx->mask;
     unerTx->buff[unerTx->indexW++] = ':';
