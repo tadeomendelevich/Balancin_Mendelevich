@@ -78,6 +78,10 @@
 // Complementary Filter
 #define ALPHA 0.98f
 #define DT 0.002f
+
+// LOGGING MACROS
+#define LOG_ENABLE 1
+#define LOG_DECIM  10
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -175,6 +179,12 @@ float KI_value;
 
 uint8_t f_balancing = 0;	// En 0 (cero) desactiva los motores del PID y en 1 ativa los motores con el PID
 uint8_t f_resetMassCenter = 0; // Resetea el centro de gravedad en el cual el auto hace balance
+
+// LOGGING VARIABLES
+static uint32_t log_counter = 0;
+static uint32_t last_log_us = 0;
+static uint8_t  log_header_sent = 0;
+uint8_t f_log = 1;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -227,6 +237,9 @@ static void esp01_chpd(uint8_t val);
 void ESP01_AttachChangeState(OnESP01ChangeState aOnESP01ChangeState);
 void appOnESP01ChangeState(_eESP01STATUS state);
 
+static inline uint32_t micros(void) {
+    return DWT->CYCCNT / (SystemCoreClock / 1000000);
+}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -904,6 +917,11 @@ int main(void)
   KD_value = KD;
   KI_value = KI;
 
+  // Initialize DWT for micros()
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNT_Msk;
+
   HAL_Delay(500);
   /* USER CODE END 2 */
 
@@ -951,19 +969,89 @@ int main(void)
 			  float derivative = (error - previous_error) / DT;
 
 			  // Salida PID
-			  float output = (KP_value * error) + (KI_value * integral) + (KD_value * derivative);
+			  float p_term = KP_value * error;
+			  float i_term = KI_value * integral;
+			  float d_term = KD_value * derivative;
+			  float output = p_term + i_term + d_term;
 			  previous_error = error;
 
 			  float pwm_cmd = output * MOTOR_GAIN;
+			  float pwm_sat = pwm_cmd;
+			  uint8_t sat_flag = 0;
 
-			  if (pwm_cmd > 100.0f)  pwm_cmd = 100.0f;
-			  if (pwm_cmd < -100.0f) pwm_cmd = -100.0f;
+			  if (pwm_sat > 100.0f)  { pwm_sat = 100.0f; sat_flag = 1; }
+			  if (pwm_sat < -100.0f) { pwm_sat = -100.0f; sat_flag = 1; }
 
-			  motorRightVelocity = (int16_t)(pwm_cmd + steering_adjustment);
-			  motorLeftVelocity  = (int16_t)(pwm_cmd - steering_adjustment);
+			  motorRightVelocity = (int16_t)(pwm_sat + steering_adjustment);
+			  motorLeftVelocity  = (int16_t)(pwm_sat - steering_adjustment);
 
 			  // Actualizar variables para reporte
 			  roll_deg = filtered_roll_deg;
+
+			  // --- LOGGING ---
+              log_counter++;
+              if (LOG_ENABLE && f_log && (log_counter % LOG_DECIM == 0)) {
+                  uint32_t now_us = micros();
+                  uint32_t dt_log_us = now_us - last_log_us;
+                  last_log_us = now_us;
+                  uint32_t t_ms = HAL_GetTick();
+
+                  // 1. USB CSV Logging
+                  if (!log_header_sent) {
+                      char *header = "t_ms,dt_us,accel_roll,gyro_y,roll_filt,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL\r\n";
+                      usb_enqueue_tx((uint8_t*)header, strlen(header));
+                      log_header_sent = 1;
+                  }
+
+                  char line[160];
+                  // Scale floats to integers for lightweight formatting
+                  // Angles/Error: x1000 (milli-degrees)
+                  // PID/Output: x1000
+                  // PWM: x100
+                  int32_t accel_mdeg = (int32_t)(accel_roll_deg * 1000.0f);
+                  int32_t gyro_mdps  = (int32_t)(gyro_y_dps * 1000.0f);
+                  int32_t roll_mdeg  = (int32_t)(filtered_roll_deg * 1000.0f);
+                  int32_t error_mdeg = (int32_t)(error * 1000.0f);
+                  int32_t p_m        = (int32_t)(p_term * 1000.0f);
+                  int32_t i_m        = (int32_t)(i_term * 1000.0f);
+                  int32_t d_m        = (int32_t)(d_term * 1000.0f);
+                  int32_t out_m      = (int32_t)(output * 1000.0f);
+                  int32_t pwm_cmd_c  = (int32_t)(pwm_cmd * 100.0f);
+                  int32_t pwm_sat_c  = (int32_t)(pwm_sat * 100.0f);
+
+                  int len = snprintf(line, sizeof(line),
+                      "%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%d\r\n",
+                      t_ms, dt_log_us,
+                      accel_mdeg, gyro_mdps, roll_mdeg, error_mdeg,
+                      p_m, i_m, d_m, out_m,
+                      pwm_cmd_c, pwm_sat_c, sat_flag,
+                      motorRightVelocity, motorLeftVelocity
+                  );
+
+                  if (len > 0) {
+                      usb_enqueue_tx((uint8_t*)line, len);
+                  }
+
+                  // 2. UDP UNER Binary Logging
+                  LogData_t logData;
+                  logData.t_ms       = t_ms;
+                  logData.dt_us      = dt_log_us;
+                  logData.accel_roll = accel_roll_deg;
+                  logData.gyro_y     = gyro_y_dps;
+                  logData.roll_filt  = filtered_roll_deg;
+                  logData.error      = error;
+                  logData.p_term     = p_term;
+                  logData.i_term     = i_term;
+                  logData.d_term     = d_term;
+                  logData.output     = output;
+                  logData.pwm_cmd    = pwm_cmd;
+                  logData.pwm_sat    = pwm_sat;
+                  logData.sat_flag   = sat_flag;
+                  logData.mR         = motorRightVelocity;
+                  logData.mL         = motorLeftVelocity;
+
+                  UNER_SendLogData(&logData);
+              }
 		  }
 
 		  if(f_balancing) { // Si estoy en modo balanceo

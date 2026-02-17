@@ -107,9 +107,28 @@ typedef enum{
 	GETPIDVALUES= 0xB5,
     MODIFYSTEERING = 0xB6,
 	RESETMASSCENTER = 0xB7,
+	CMD_LOG_DATA    = 0xB8,
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
+
+typedef struct __attribute__((packed)) {
+    uint32_t t_ms;
+    uint32_t dt_us;
+    float accel_roll;
+    float gyro_y;
+    float roll_filt;
+    float error;
+    float p_term;
+    float i_term;
+    float d_term;
+    float output;
+    float pwm_cmd;
+    float pwm_sat;
+    uint8_t sat_flag;
+    int16_t mR;
+    int16_t mL;
+} LogData_t;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr);
 
@@ -154,6 +173,8 @@ void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr);
 void UNER_RegisterSteering(float *steeringPtr);
 
 void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2);
+
+void UNER_SendLogData(LogData_t *data);
 
 void UNER_SendData(void);
 
