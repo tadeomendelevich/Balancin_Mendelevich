@@ -73,6 +73,7 @@ static void ESP01ByteToBufTX(uint8_t value);
 static uint32_t esp01TimeoutTask = 0;
 static uint32_t esp01TimeoutDataRx = 0;
 static uint32_t esp01TimeoutTxSymbol = 0;
+static uint32_t esp01TimeoutSending = 0;
 static OnESP01ChangeState aESP01ChangeState = NULL;
 static ESP01DebugStr aDbgStr = NULL;
 
@@ -351,6 +352,14 @@ void ESP01_Timeout10ms(){
 
 	if(esp01TimeoutTxSymbol)
 		esp01TimeoutTxSymbol--;
+
+	if(esp01TimeoutSending) {
+		esp01TimeoutSending--;
+		if(!esp01TimeoutSending && esp01Flags.bit.SENDINGDATA) {
+			esp01Flags.bit.SENDINGDATA = 0;
+			if(aDbgStr) aDbgStr(">>> TIMEOUT: SENDINGDATA cleared forcedly\r\n");
+		}
+	}
 }
 
 void ESP01_Task(){
