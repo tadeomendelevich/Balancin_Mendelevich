@@ -308,6 +308,7 @@ _eESP01STATUS ESP01_Send(uint8_t *buf, uint16_t irRingBuf, uint16_t length, uint
 
 		esp01Flags.bit.TXCIPSEND = 1;
 		esp01Flags.bit.SENDINGDATA = 1;
+		esp01TimeoutSending = 500;
 
 		if(aDbgStr != NULL){
 			aDbgStr("+&DBGSENDING DATA ");
@@ -1004,7 +1005,8 @@ static void ESP01SENDData(){
 		}
 		return;
 	}
-	if(esp01irTX != esp01iwTX){
+	uint8_t count = 0;
+	while(esp01irTX != esp01iwTX && count < 32){
 		value = esp01TXATBuf[esp01irTX];
 		if(esp01Flags.bit.TXCIPSEND){
 			if(value == '>')
@@ -1016,11 +1018,19 @@ static void ESP01SENDData(){
 					esp01Flags.bit.TXCIPSEND = 0;
 					esp01Flags.bit.WAITINGSYMBOL = 1;
 					esp01TimeoutTxSymbol = 5;
+					esp01irTX++;
+					if(esp01irTX == ESP01TXBUFAT)
+						esp01irTX = 0;
+					break;
 				}
 			}
 			esp01irTX++;
 			if(esp01irTX == ESP01TXBUFAT)
 				esp01irTX = 0;
+			count++;
+		}
+		else{
+			break;
 		}
 	}
 }
