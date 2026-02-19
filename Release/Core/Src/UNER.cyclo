@@ -18,3 +18,4 @@
 ../Core/Src/UNER.c:88:6:UNER_Task	17
 ../Core/Src/UNER.c:568:6:UNER_SendAlive	4
 ../Core/Src/UNER.c:591:6:UNER_SendAllSensors	2
+../Core/Src/UNER.c:734:6:UNER_SendLogData	4
