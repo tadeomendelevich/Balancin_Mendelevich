@@ -948,7 +948,8 @@ int main(void)
   // Initialize DWT for micros()
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CYCCNT = 0;
-  DWT->CTRL |= DWT_CTRL_CYCCNT_Msk;
+  // Use raw bit 0 if DWT_CTRL_CYCCNT_Msk is not defined (standard for Cortex-M4)
+  DWT->CTRL |= 1;
 
   HAL_Delay(500);
   /* USER CODE END 2 */
