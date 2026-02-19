@@ -1032,6 +1032,7 @@ int main(void)
                       usb_enqueue_tx((uint8_t*)line, len);
                   }
 
+                  /* UDP LOGGING (DISABLED FOR USB-ONLY TESTING)
                   // 2. UDP UNER Binary Logging
                   LogData_t logData;
                   logData.t_ms       = t_ms;
@@ -1051,6 +1052,7 @@ int main(void)
                   logData.mL         = motorLeftVelocity;
 
                   UNER_SendLogData(&logData);
+                  */
               }
 		  }
 
