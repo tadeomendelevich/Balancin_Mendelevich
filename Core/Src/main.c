@@ -67,8 +67,8 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 0.2f
-#define KD 0.01f
+#define KP 1.0f
+#define KD 0.12f
 #define KI 0.0f
 
 #define MOTOR_GAIN 3.0f
@@ -720,37 +720,30 @@ void updateDisplay(void) {
     // 1) Limpia todo el buffer
     SSD1306_Fill(SSD1306_COLOR_BLACK);
 
-    // 2) Línea divisoria en medio
+    // 2) Línea divisoria vertical en medio
     SSD1306_DrawLine(
         SCREEN_W/2, 0,
         SCREEN_W/2, SCREEN_H - 1,
         SSD1306_COLOR_WHITE
     );
 
-    // 3) MPU6050 – valores en la mitad izquierda
-    //    Etiquetas con Font_7x10 (7px ancho), números con SSD1306_DrawDigit5x7 (5px ancho)
+    // 3) MPU6050 – valores en la mitad izquierda (sin cambios)
     {
         const char* labels[6] = { "AX:", "AY:", "AZ:", "GX:", "GY:", "GZ:" };
         int16_t    values[6];
-        // Suponemos que ax…gz ya están actualizados
         MPU6050_GetAccel(&values[0], &values[1], &values[2]);
         MPU6050_GetGyro (&values[3], &values[4], &values[5]);
 
-        char buf[7]; // para itoa
+        char buf[7];
 
         for (int i = 0; i < 6; i++) {
-            // fila i → y = 2 + i*10 (10px de separación por fila)
             uint16_t y = 2 + i * 10;
-            // etiqueta
             SSD1306_GotoXY(2, y);
             SSD1306_Puts(labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
-            // convierte valor a cadena
             itoa(values[i], buf, 10);
-            // dibuja cada dígito pequeño
             uint16_t x = 2 + strlen(labels[i]) * Font_7x10.FontWidth;
             for (char *p = buf; *p; p++) {
                 if (*p == '-') {
-                    // si quieres manejar el signo, puedes dibujar un guión simple
                     SSD1306_DrawLine(x, y + 3, x + 4, y + 3, SSD1306_COLOR_WHITE);
                     x += 6;
                 } else {
@@ -761,44 +754,79 @@ void updateDisplay(void) {
         }
     }
 
-    // 4) Título “VALORES ADC” centrado sobre las barras, con Font_7x10
+    // 4) Mitad derecha: KP/KD/KI arriba + barras ADC (mitad de altura) abajo
     {
-        const char *title   = "VAL ADCs";
-        uint16_t   w        = strlen(title) * Font_7x10.FontWidth;
-        uint16_t   x0       = SCREEN_W/2 + ((SCREEN_W/2 - w)/2);
-        SSD1306_GotoXY(x0, 1);
-        SSD1306_Puts(title, &Font_7x10, SSD1306_COLOR_WHITE);
-    }
+        // Font_7x10: 7px de ancho por caracter.
+        // Zona derecha: 64px de ancho total.
+        // Etiqueta "P:" = 2 chars = 14px. Valor "0.20" = 4 chars = 28px. Total = 42px. OK.
+        // Si el valor es negativo "-0.20" = 5 chars = 35px + 14px = 49px. OK.
 
-    // 5) Barras en la mitad derecha (igual que antes)
-    {
-        const uint16_t title_h   = Font_7x10.FontHeight + 2;
-        const uint16_t region_x  = SCREEN_W/2;
-        const uint16_t region_y  = title_h;
-        const uint16_t region_w  = SCREEN_W/2;
-        const uint16_t region_h  = SCREEN_H - region_y - Font_5x7.FontHeight;
+        const uint16_t rx = SCREEN_W / 2 + 2;   // margen izquierdo de 2px
 
+        const char *pid_labels[3] = { "P:", "D:", "I:" };
+        float       pid_vals[3]   = { KP_value, KD_value, KI_value };
+
+        for (uint8_t i = 0; i < 3; i++) {
+            uint16_t y = 1 + i * 10;   // y = 1, 11, 21
+
+            // Etiqueta
+            SSD1306_GotoXY(rx, y);
+            SSD1306_Puts(pid_labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
+
+            // Valor float con 2 decimales, formateado manualmente
+            char fbuf[8];
+            float v = pid_vals[i];
+            uint8_t neg = (v < 0);
+            if (neg) v = -v;
+            uint32_t int_part  = (uint32_t)v;
+            uint32_t frac_part = (uint32_t)((v - (float)int_part) * 100.0f + 0.5f);
+            if (neg)
+                snprintf(fbuf, sizeof(fbuf), "-%lu.%02lu",
+                         (unsigned long)int_part, (unsigned long)frac_part);
+            else
+                snprintf(fbuf, sizeof(fbuf), "%lu.%02lu",
+                         (unsigned long)int_part, (unsigned long)frac_part);
+
+            // Posiciona tras los 2 chars de la etiqueta
+            SSD1306_GotoXY(rx + 2 * Font_7x10.FontWidth, y);
+            SSD1306_Puts(fbuf, &Font_7x10, SSD1306_COLOR_WHITE);
+        }
+
+        // Línea separadora tras los 3 PID (y = 3*10 + 2 = 32)
+        uint16_t sep_y = 32;
+        SSD1306_DrawLine(SCREEN_W/2, sep_y, SCREEN_W - 1, sep_y, SSD1306_COLOR_WHITE);
+
+        // --- Barras ADC ---
+        const uint16_t bar_region_y = sep_y + 2;                            // 34
+        const uint16_t digit_h      = Font_5x7.FontHeight + 2;              // espacio para dígito
+        const uint16_t bar_region_h = SCREEN_H - bar_region_y - digit_h;   // altura disponible
+
+        // Barras a la MITAD de la altura disponible
+        const uint16_t bar_max_h  = (bar_region_h / 2) + 10;
+        const uint16_t bar_base_y = bar_region_y + bar_region_h - 1;       // base común
+
+        const uint16_t rw         = SCREEN_W / 2 - 1;
         const uint16_t bar_spacing = BAR_SPACING;
-        const uint16_t bar_width   =
-            (region_w - (BAR_COUNT + 1)*bar_spacing) / BAR_COUNT;
+        const uint16_t bar_width   = (rw - (BAR_COUNT + 1) * bar_spacing) / BAR_COUNT;
 
         for (uint8_t i = 0; i < BAR_COUNT; i++) {
             uint16_t v  = adcAvg[i] > 4000 ? 4000 : adcAvg[i];
-            uint16_t h  = (uint32_t)v * region_h / 4000;
-            uint16_t x0 = region_x + bar_spacing + i*(bar_width + bar_spacing);
-            uint16_t y0 = region_y + (region_h - h);
-            SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
+            uint16_t h  = (uint32_t)v * bar_max_h / 4000;
+            uint16_t x0 = SCREEN_W/2 + bar_spacing + i * (bar_width + bar_spacing);
+            uint16_t y0 = bar_base_y - h + 1;
+            if (h > 0)
+                SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
 
-            // dígito bajo la barra
-            uint16_t tx = x0 + (bar_width - Font_5x7.FontWidth)/2;
-            uint16_t ty = region_y + region_h + ((Font_5x7.FontHeight + 2 - Font_5x7.FontHeight)/2);
-            SSD1306_DrawDigit5x7(i+1, tx, ty);
+            // Dígito 1–8 centrado bajo cada barra
+            uint16_t tx = x0 + (bar_width > Font_5x7.FontWidth
+                                 ? (bar_width - Font_5x7.FontWidth) / 2 : 0);
+            uint16_t ty = bar_base_y + 2;
+            SSD1306_DrawDigit5x7(i + 1, tx, ty);
         }
     }
 
     SSD1306_RequestUpdate();
 }
-
 
 
 /* USER CODE END 0 */
