@@ -147,7 +147,7 @@ static uint8_t waitingForTCPClient = 0;
 static uint16_t lastIPDlen = 0;  // guarda la longitud del +IPD
 
 //static uint8_t tcpServerStarted = 0;
-static uint8_t configUDPObtenida = 0;
+//static uint8_t configUDPObtenida = 0; // Unused
 static uint8_t udpIniciado = 0;
 static uint32_t lastAliveTick = 0;
 
