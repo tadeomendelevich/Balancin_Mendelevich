@@ -77,7 +77,13 @@
 
 // Complementary Filter
 #define ALPHA 0.98f
-#define DT 0.002f
+#define DT 0.002f   // DT Nominal (fallback)
+
+// Filtering & Control Constants
+#define BETA_G 0.15f       // Gyro LPF (0.1 - 0.2 at 500Hz)
+#define BETA_A 0.1f        // Accel LPF (0.05 - 0.15)
+#define GYRO_SIGN 1.0f     // 1.0f or -1.0f to flip gyro effect
+#define I_MAX 100.0f       // Integral term clamp
 
 // LOGGING MACROS
 #define LOG_ENABLE 1
@@ -126,6 +132,10 @@ uint8_t mpu_initialized = 0;
 static float roll_deg = 0.0f;	// Ángulo de balanceo (eje Y, usado para el equilibrio)
 static float pitch_deg = 0.0f;	// Ángulo de inclinación (eje X)
 
+// Control Loop Statics
+static uint32_t last_ctrl_us = 0;
+static float gyro_f = 0.0f;         // Filtered Gyro Y (deg/s)
+static float accel_roll_f = 0.0f;   // Filtered Accel Roll (deg)
 
 uint16_t adcValues[8];
 static uint32_t adcSum[BAR_COUNT] = {0};	// Sumas acumuladas de las últimas ADC_AVERAGE_SIZE muestras
@@ -984,37 +994,84 @@ int main(void)
 			  // ... (toda la lógica de control se ejecuta aquí)
 
 			  // --- Complementary Filter & PID Control ---
+
+			  // 1. Real DT Calculation
+			  uint32_t now_us = micros();
+			  if (last_ctrl_us == 0) last_ctrl_us = now_us; // Init on first run
+			  uint32_t dt_ctrl_us = now_us - last_ctrl_us;
+			  last_ctrl_us = now_us;
+			  float dt = dt_ctrl_us * 1e-6f;
+
+			  // Limit dt to safe range (0.5ms - 10ms)
+			  if (dt < 0.0005f) { dt = 0.0005f; dt_ctrl_us = 500; }
+			  if (dt > 0.01f)   { dt = 0.01f;   dt_ctrl_us = 10000; }
+
+			  // 2. Filtering
+			  // Gyro: Raw -> dps -> LPF
+			  float gyro_y_dps = (float)gy / 131.0f;
+			  gyro_f += BETA_G * (gyro_y_dps - gyro_f);
+
+			  // Accel: Raw -> Angle -> LPF
 			  float accel_roll_deg = atan2f(ay, az) * (180.0f / M_PI);
-			  float gyro_y_dps = (float)gy / 131.0f; // Sensibilidad del giróscopo a ±250dps
-			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_y_dps * DT) + (1.0f - ALPHA) * accel_roll_deg;
+			  accel_roll_f += BETA_A * (accel_roll_deg - accel_roll_f);
+
+			  // 3. Complementary Filter (with real dt)
+			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt) + (1.0f - ALPHA) * accel_roll_f;
+
+			  // 4. PID Control
 			  float error = SETPOINT_ANGLE - filtered_roll_deg;
 
-			  // Término Integral con Anti-Windup
-			  integral += error * DT;
-			  if (integral > 100.0f) integral = 100.0f;       // Limitar para evitar sobreimpulso
-			  else if (integral < -100.0f) integral = -100.0f;
-
-			  // Término Derivativo
-			  float derivative = (error - previous_error) / DT;
-
-			  // Salida PID
+			  // Proportional
 			  float p_term = KP_value * error;
-			  float i_term = KI_value * integral;
-			  float d_term = KD_value * derivative;
-			  float output = p_term + i_term + d_term;
-			  previous_error = error;
 
+			  // Derivative on Measurement (opposes motion)
+			  float d_term = -KD_value * gyro_f * GYRO_SIGN;
+
+			  // Integral (Calculated before integration to check saturation)
+			  float i_term = KI_value * integral;
+
+			  // Calculate Output (Pre-saturation)
+			  float output = p_term + i_term + d_term;
 			  float pwm_cmd = output * MOTOR_GAIN;
+
+			  // Check Saturation
 			  float pwm_sat = pwm_cmd;
 			  uint8_t sat_flag = 0;
-
-			  if (pwm_sat > 100.0f)  { pwm_sat = 100.0f; sat_flag = 1; }
+			  if (pwm_sat > 100.0f)  { pwm_sat = 100.0f;  sat_flag = 1; }
 			  if (pwm_sat < -100.0f) { pwm_sat = -100.0f; sat_flag = 1; }
 
+			  // Smart Anti-Windup (Conditional Integration)
+			  // Integrate if NOT saturated, OR if integration helps desaturate
+			  if (sat_flag == 0) {
+				  integral += error * dt;
+			  } else {
+				  if (pwm_cmd > 100.0f && error < 0) {
+					  integral += error * dt; // Reduce positive saturation
+				  }
+				  else if (pwm_cmd < -100.0f && error > 0) {
+					  integral += error * dt; // Reduce negative saturation
+				  }
+			  }
+
+			  // Clamp Integral Term
+			  if (integral > I_MAX)  integral = I_MAX;
+			  if (integral < -I_MAX) integral = -I_MAX;
+
+			  // Update i_term for logging (optional, but good for consistency next frame)
+			  i_term = KI_value * integral;
+
+			  // 5. Motor Output & Steering
+			  // Apply steering to the SATURATED base PWM
 			  motorRightVelocity = (int16_t)(pwm_sat + steering_adjustment);
 			  motorLeftVelocity  = (int16_t)(pwm_sat - steering_adjustment);
 
-			  // Actualizar variables para reporte
+			  // 6. Individual Motor Saturation (Crucial!)
+			  if (motorRightVelocity > 100)  motorRightVelocity = 100;
+			  if (motorRightVelocity < -100) motorRightVelocity = -100;
+			  if (motorLeftVelocity > 100)   motorLeftVelocity  = 100;
+			  if (motorLeftVelocity < -100)  motorLeftVelocity  = -100;
+
+			  // Update reporting variables
 			  roll_deg = filtered_roll_deg;
 
 			  // --- LOGGING ---
@@ -1027,7 +1084,7 @@ int main(void)
 
                   // 1. USB CSV Logging
                   if (!log_header_sent) {
-                      char *header = "t_ms,dt_us,accel_roll,gyro_y,roll_filt,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n";
+                      char *header = "t_ms,dt_us,accel_roll,gyro_y,roll_filt,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz,dt_ctrl_us,gyro_f,accel_roll_f\r\n";
                       usb_enqueue_tx((uint8_t*)header, strlen(header));
                       log_header_sent = 1;
                   }
@@ -1055,14 +1112,19 @@ int main(void)
                   int32_t pwm_sat_c  = (int32_t)(pwm_sat * 100.0f);
                   int32_t pitch_mdeg = (int32_t)(accel_pitch_deg * 1000.0f);
 
+                  // New Filtered Values for Logging
+                  int32_t gyro_f_m       = (int32_t)(gyro_f * 1000.0f);
+                  int32_t accel_roll_f_m = (int32_t)(accel_roll_f * 1000.0f);
+
                   int len = snprintf(line, sizeof(line),
-                      "%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%d,%ld,%d,%d,%d,%d,%d,%d\r\n",
+                      "%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%d,%ld,%d,%d,%d,%d,%d,%d,%lu,%ld,%ld\r\n",
                       t_ms, dt_log_us,
                       accel_mdeg, gyro_mdps, roll_mdeg, error_mdeg,
                       p_m, i_m, d_m, out_m,
                       pwm_cmd_c, pwm_sat_c, sat_flag,
                       motorRightVelocity, motorLeftVelocity,
-					  pitch_mdeg, ax, ay, az, gx, gy, gz
+					  pitch_mdeg, ax, ay, az, gx, gy, gz,
+					  dt_ctrl_us, gyro_f_m, accel_roll_f_m
                   );
 
                   if (len > 0) {
