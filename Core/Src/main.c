@@ -153,17 +153,17 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 //const char *wifiPassword = "fcalconcordia.06-2019";
 //const char *wifiIp = "172.23.205.98";
 
-//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-//const char *wifiPassword = "djg19dlk";
-//const char *wifiIp 		 = "192.168.100.5";
+const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+const char *wifiPassword = "djg19dlk";
+const char *wifiIp 		 = "192.168.100.5";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
 //const char *wifiIp = "192.168.1.39";
 
-const char *wifiSSID     = "Wifi Habitaciones";
-const char *wifiPassword = "toyotakia";
-const char *wifiIp = "192.168.1.52";
+//const char *wifiSSID     = "Wifi Habitaciones";
+//const char *wifiPassword = "toyotakia";
+//const char *wifiIp = "192.168.1.52";
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
@@ -184,7 +184,7 @@ uint8_t f_resetMassCenter = 0; // Resetea el centro de gravedad en el cual el au
 static uint32_t log_counter = 0;
 static uint32_t last_log_us = 0;
 static uint8_t  log_header_sent = 0;
-uint8_t f_log = 1;
+uint8_t f_send_csv_log = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -910,7 +910,7 @@ int main(void)
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
   UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value);
   UNER_RegisterSteering(&steering_adjustment);
-  UNER_RegisterFlags(&f_balancing, &f_resetMassCenter);
+  UNER_RegisterFlags(&f_balancing, &f_resetMassCenter, &f_send_csv_log);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();
@@ -1019,7 +1019,7 @@ int main(void)
 
 			  // --- LOGGING ---
               log_counter++;
-              if (LOG_ENABLE && f_log && (log_counter % LOG_DECIM == 0)) {
+              if (LOG_ENABLE && f_send_csv_log && (log_counter % LOG_DECIM == 0)) {
                   uint32_t now_us = micros();
                   uint32_t dt_log_us = now_us - last_log_us;
                   last_log_us = now_us;

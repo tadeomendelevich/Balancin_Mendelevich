@@ -51,7 +51,7 @@ typedef struct {
     uint8_t indexR;
     uint8_t indexW;
     uint8_t mask;
-    uint8_t chk;
+    uint8_t chk;	// EL CHECKSUM SE AGREGA SOLO COMO SUMA LUEGO DEL CALCULO DEL PAYLOAD
 } _sTx;
 
 // Enums para el estado de parsing
@@ -108,6 +108,7 @@ typedef enum{
     MODIFYSTEERING = 0xB6,
 	RESETMASSCENTER = 0xB7,
 	CMD_LOG_DATA    = 0xB8,
+	ACTIVATE_CSV_LOG = 0xB9,
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -172,7 +173,7 @@ void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr);
 
 void UNER_RegisterSteering(float *steeringPtr);
 
-void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2);
+void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3);
 
 void UNER_SendLogData(LogData_t *data);
 
