@@ -79,6 +79,13 @@
 #define ALPHA 0.98f
 #define DT 0.002f
 
+// New Filter Parameters
+#define BETA_G 0.15f
+#define BETA_A 0.10f
+#define I_MAX 100.0f
+#define MIN_DT 0.0005f
+#define MAX_DT 0.01f
+
 // LOGGING MACROS
 #define LOG_ENABLE 1
 #define LOG_DECIM  5
@@ -172,6 +179,12 @@ static float previous_error = 0.0f;
 static float integral = 0.0f;
 static float steering_adjustment = 0.0f;
 static float filtered_roll_deg = 0.0f;
+
+// New Filter Variables
+static float gyro_f = 0.0f;
+static float accel_roll_f = 0.0f;
+static uint32_t last_ctrl_us = 0;
+static uint32_t dt_ctrl_us = 0; // For logging
 
 float KP_value;
 float KD_value;
@@ -984,35 +997,89 @@ int main(void)
 			  // ... (toda la lógica de control se ejecuta aquí)
 
 			  // --- Complementary Filter & PID Control ---
+			  // 1. Calculate Real dt
+			  uint32_t now_us = micros();
+			  float dt = (now_us - last_ctrl_us) * 1e-6f;
+			  dt_ctrl_us = now_us - last_ctrl_us; // Store for logging
+			  last_ctrl_us = now_us;
+
+			  // Clamp dt
+			  if (dt < MIN_DT) dt = MIN_DT;
+			  if (dt > MAX_DT) dt = MAX_DT;
+
 			  float accel_roll_deg = atan2f(ay, az) * (180.0f / M_PI);
 			  float gyro_y_dps = (float)gy / 131.0f; // Sensibilidad del giróscopo a ±250dps
-			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_y_dps * DT) + (1.0f - ALPHA) * accel_roll_deg;
+
+			  // 2. Filters
+			  // Gyro Low Pass Filter
+			  gyro_f += BETA_G * (gyro_y_dps - gyro_f);
+
+			  // Accel Low Pass Filter
+			  accel_roll_f += BETA_A * (accel_roll_deg - accel_roll_f);
+
+			  // 3. Complementary Filter (using real dt and filtered inputs)
+			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt) + (1.0f - ALPHA) * accel_roll_f;
 			  float error = SETPOINT_ANGLE - filtered_roll_deg;
 
-			  // Término Integral con Anti-Windup
-			  integral += error * DT;
-			  if (integral > 100.0f) integral = 100.0f;       // Limitar para evitar sobreimpulso
-			  else if (integral < -100.0f) integral = -100.0f;
-
-			  // Término Derivativo
-			  float derivative = (error - previous_error) / DT;
-
-			  // Salida PID
+			  // PID Calculation
+			  // P Term
 			  float p_term = KP_value * error;
-			  float i_term = KI_value * integral;
-			  float d_term = KD_value * derivative;
-			  float output = p_term + i_term + d_term;
-			  previous_error = error;
 
+			  // D Term (Derivative on Measurement)
+			  float d_term = -KD_value * gyro_f;
+
+			  // I Term (use accumulated integral)
+			  float i_term = KI_value * integral;
+
+			  // Output Calculation
+			  float output = p_term + i_term + d_term;
 			  float pwm_cmd = output * MOTOR_GAIN;
+
+			  // Saturation
 			  float pwm_sat = pwm_cmd;
 			  uint8_t sat_flag = 0;
 
-			  if (pwm_sat > 100.0f)  { pwm_sat = 100.0f; sat_flag = 1; }
-			  if (pwm_sat < -100.0f) { pwm_sat = -100.0f; sat_flag = 1; }
+			  if (pwm_sat > 100.0f) {
+				  pwm_sat = 100.0f;
+				  sat_flag = 1;
+			  } else if (pwm_sat < -100.0f) {
+				  pwm_sat = -100.0f;
+				  sat_flag = 1;
+			  }
 
-			  motorRightVelocity = (int16_t)(pwm_sat + steering_adjustment);
-			  motorLeftVelocity  = (int16_t)(pwm_sat - steering_adjustment);
+			  // Anti-windup (Conditional Integration)
+			  uint8_t allow_integration = 0;
+			  if (sat_flag == 0) {
+				  allow_integration = 1;
+			  } else {
+				  // If saturated positive, only allow if error is negative (trying to reduce output)
+				  if (pwm_cmd > 100.0f && error < 0.0f) allow_integration = 1;
+				  // If saturated negative, only allow if error is positive (trying to increase output)
+				  else if (pwm_cmd < -100.0f && error > 0.0f) allow_integration = 1;
+			  }
+
+			  if (allow_integration) {
+				  integral += error * dt;
+			  }
+
+			  // Hard Clamp on Integral
+			  if (integral > I_MAX) integral = I_MAX;
+			  else if (integral < -I_MAX) integral = -I_MAX;
+
+			  previous_error = error;
+
+			  // Final Motor Output Saturation
+			  float mR = pwm_sat + steering_adjustment;
+			  float mL = pwm_sat - steering_adjustment;
+
+			  if (mR > 100.0f) mR = 100.0f;
+			  if (mR < -100.0f) mR = -100.0f;
+
+			  if (mL > 100.0f) mL = 100.0f;
+			  if (mL < -100.0f) mL = -100.0f;
+
+			  motorRightVelocity = (int16_t)mR;
+			  motorLeftVelocity  = (int16_t)mL;
 
 			  // Actualizar variables para reporte
 			  roll_deg = filtered_roll_deg;
@@ -1027,7 +1094,7 @@ int main(void)
 
                   // 1. USB CSV Logging
                   if (!log_header_sent) {
-                      char *header = "t_ms,dt_us,accel_roll,gyro_y,roll_filt,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n";
+                      char *header = "t_ms,dt_us,accel_roll,gyro_y,roll_filt,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz,dt_ctrl_us,gyro_f,accel_roll_f\r\n";
                       usb_enqueue_tx((uint8_t*)header, strlen(header));
                       log_header_sent = 1;
                   }
@@ -1054,15 +1121,18 @@ int main(void)
                   int32_t pwm_cmd_c  = (int32_t)(pwm_cmd * 100.0f);
                   int32_t pwm_sat_c  = (int32_t)(pwm_sat * 100.0f);
                   int32_t pitch_mdeg = (int32_t)(accel_pitch_deg * 1000.0f);
+                  int32_t gyro_f_mdps = (int32_t)(gyro_f * 1000.0f);
+                  int32_t accel_f_mdeg = (int32_t)(accel_roll_f * 1000.0f);
 
                   int len = snprintf(line, sizeof(line),
-                      "%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%d,%ld,%d,%d,%d,%d,%d,%d\r\n",
+                      "%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%d,%ld,%d,%d,%d,%d,%d,%d,%lu,%ld,%ld\r\n",
                       t_ms, dt_log_us,
                       accel_mdeg, gyro_mdps, roll_mdeg, error_mdeg,
                       p_m, i_m, d_m, out_m,
                       pwm_cmd_c, pwm_sat_c, sat_flag,
                       motorRightVelocity, motorLeftVelocity,
-					  pitch_mdeg, ax, ay, az, gx, gy, gz
+					  pitch_mdeg, ax, ay, az, gx, gy, gz,
+                      dt_ctrl_us, gyro_f_mdps, accel_f_mdeg
                   );
 
                   if (len > 0) {

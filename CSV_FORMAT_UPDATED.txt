@@ -1,0 +1,39 @@
+CSV LOGGING FORMAT - UPDATED
+============================
+
+The system streams CSV data over USB CDC (Virtual COM Port).
+Header is sent once on startup.
+Each line represents one log sample (decimated by LOG_DECIM).
+
+Columns:
+1.  t_ms          : System time in milliseconds (HAL_GetTick)
+2.  dt_us         : Time elapsed since last LOG sample in microseconds.
+3.  accel_roll    : Raw Accelerometer Roll Angle (atan2(ay, az)) [milli-degrees] (x1000)
+4.  gyro_y        : Raw Gyroscope Y Rate [milli-dps] (x1000)
+5.  roll_filt     : Complementary Filtered Roll Angle (theta) [milli-degrees] (x1000)
+6.  error         : PID Error (Setpoint - theta) [milli-degrees] (x1000)
+7.  p             : PID Proportional Term [x1000]
+8.  i             : PID Integral Term [x1000]
+9.  d             : PID Derivative Term [x1000]
+10. output        : PID Output Sum (before gain) [x1000]
+11. pwm_cmd       : Commanded PWM (Output * Gain) [x100] (Duty Cycle %)
+12. pwm_sat       : Saturated PWM (Clamped to [-100, 100]) [x100]
+13. sat           : Saturation Flag (0 = No Saturation, 1 = Saturated)
+14. mR            : Final Motor Right Command (after steering and clamping) [-100 to 100]
+15. mL            : Final Motor Left Command (after steering and clamping) [-100 to 100]
+16. pitch         : Pitch Angle (calculated from accel) [milli-degrees] (x1000)
+17. ax            : Raw Accelerometer X [LSB]
+18. ay            : Raw Accelerometer Y [LSB]
+19. az            : Raw Accelerometer Z [LSB]
+20. gx            : Raw Gyroscope X [LSB]
+21. gy            : Raw Gyroscope Y [LSB]
+22. gz            : Raw Gyroscope Z [LSB]
+23. dt_ctrl_us    : Real Control Loop DT [microseconds] (Time since last control iteration)
+24. gyro_f        : Low-Pass Filtered Gyro Y Rate [milli-dps] (x1000)
+25. accel_roll_f  : Low-Pass Filtered Accel Roll Angle [milli-degrees] (x1000)
+
+Notes:
+- "milli-degrees" means Degrees * 1000.
+- "milli-dps" means Degrees Per Second * 1000.
+- "x100" means Value * 100.
+- All values are integers to minimize bandwidth and CPU usage.
