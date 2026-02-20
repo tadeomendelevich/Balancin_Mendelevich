@@ -81,7 +81,7 @@
 
 // LOGGING MACROS
 #define LOG_ENABLE 1
-#define LOG_DECIM  5
+#define LOG_DECIM  5		// FRECUENCIA DE ENVIO
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
