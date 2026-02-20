@@ -49,7 +49,7 @@
 
 #define UDP_RX_SIZE  	 	512
 #define UDP_RX_MASK   		(UDP_RX_SIZE - 1)
-#define USB_TX_BUF_SIZE 	256
+#define USB_TX_BUF_SIZE 	512
 #define USB_TX_BUF_MASK 	(USB_TX_BUF_SIZE-1)
 
 #define MPU_AVERAGE_SIZE 	10
@@ -1027,12 +1027,18 @@ int main(void)
 
                   // 1. USB CSV Logging
                   if (!log_header_sent) {
-                      char *header = "t_ms,dt_us,accel_roll,gyro_y,roll_filt,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL\r\n";
+                      char *header = "t_ms,dt_us,accel_roll,gyro_y,roll_filt,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n";
                       usb_enqueue_tx((uint8_t*)header, strlen(header));
                       log_header_sent = 1;
                   }
 
-                  char line[160];
+                  // Calculate pitch for logging (using same math as calculate_tilt)
+                  float ay_f = (float)ay;
+                  float az_f = (float)az;
+                  float denom = sqrtf(ay_f*ay_f + az_f*az_f);
+                  float accel_pitch_deg = atan2f(-ax, denom) * (180.0f / M_PI);
+
+                  char line[256];
                   // Scale floats to integers for lightweight formatting
                   // Angles/Error: x1000 (milli-degrees)
                   // PID/Output: x1000
@@ -1047,14 +1053,16 @@ int main(void)
                   int32_t out_m      = (int32_t)(output * 1000.0f);
                   int32_t pwm_cmd_c  = (int32_t)(pwm_cmd * 100.0f);
                   int32_t pwm_sat_c  = (int32_t)(pwm_sat * 100.0f);
+                  int32_t pitch_mdeg = (int32_t)(accel_pitch_deg * 1000.0f);
 
                   int len = snprintf(line, sizeof(line),
-                      "%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%d\r\n",
+                      "%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%d,%ld,%d,%d,%d,%d,%d,%d\r\n",
                       t_ms, dt_log_us,
                       accel_mdeg, gyro_mdps, roll_mdeg, error_mdeg,
                       p_m, i_m, d_m, out_m,
                       pwm_cmd_c, pwm_sat_c, sat_flag,
-                      motorRightVelocity, motorLeftVelocity
+                      motorRightVelocity, motorLeftVelocity,
+					  pitch_mdeg, ax, ay, az, gx, gy, gz
                   );
 
                   if (len > 0) {

@@ -1,0 +1,35 @@
+CSV Data Format Description
+---------------------------
+
+The CSV data sent via USB contains the following columns in order.
+Values are generally scaled integers to avoid floating point overhead during transmission.
+
+| Column | Name        | Unit / Scale                 | Description |
+|--------|-------------|------------------------------|-------------|
+| 1      | t_ms        | ms                           | System timestamp in milliseconds (HAL_GetTick). |
+| 2      | dt_us       | µs                           | Time elapsed since the last log packet. |
+| 3      | accel_roll  | milli-degrees (deg * 1000)   | Roll angle calculated purely from accelerometer data. |
+| 4      | gyro_y      | milli-dps (deg/s * 1000)     | Angular velocity around Y-axis (pitching rate). |
+| 5      | roll_filt   | milli-degrees (deg * 1000)   | Filtered roll angle (Complementary Filter output). Main control variable. |
+| 6      | error       | milli-degrees (deg * 1000)   | PID Error (Setpoint - Current Angle). |
+| 7      | p           | x1000                        | Proportional term of PID controller. |
+| 8      | i           | x1000                        | Integral term of PID controller. |
+| 9      | d           | x1000                        | Derivative term of PID controller. |
+| 10     | output      | x1000                        | Total PID output (sum of P, I, D). |
+| 11     | pwm_cmd     | x100                         | Calculated PWM command before saturation. |
+| 12     | pwm_sat     | x100                         | PWM command after saturation limits (-100 to 100). |
+| 13     | sat         | 0 or 1                       | Saturation flag (1 if output was clamped). |
+| 14     | mR          | int (-100 to 100)            | Final command sent to Right Motor. |
+| 15     | mL          | int (-100 to 100)            | Final command sent to Left Motor. |
+| 16     | pitch       | milli-degrees (deg * 1000)   | Pitch angle calculated from accelerometer (atan2(-ax, sqrt(ay^2 + az^2))). |
+| 17     | ax          | m/s² * 100                   | Accelerometer X-axis. 981 = 9.81 m/s². |
+| 18     | ay          | m/s² * 100                   | Accelerometer Y-axis. |
+| 19     | az          | m/s² * 100                   | Accelerometer Z-axis. |
+| 20     | gx          | deg/s * 100                  | Gyroscope X-axis. 100 = 1.00 deg/s. |
+| 21     | gy          | deg/s * 100                  | Gyroscope Y-axis. |
+| 22     | gz          | deg/s * 100                  | Gyroscope Z-axis. |
+
+Notes:
+- "milli-degrees" means the value 12345 represents 12.345 degrees.
+- "x100" means the value 981 represents 9.81.
+- "x1000" means the value 1000 represents 1.0.
