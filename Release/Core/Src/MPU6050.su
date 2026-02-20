@@ -1,9 +1,0 @@
-../Core/Src/MPU6050.c:22:6:MPU6050_RegisterPlatform	0	static
-../Core/Src/MPU6050.c:51:5:MPU6050_Init	40	static
-../Core/Src/MPU6050.c:77:6:MPU6050_StartRead_DMA	16	static
-../Core/Src/MPU6050.c:82:9:MPU6050_IsDataReady	0	static
-../Core/Src/MPU6050.c:86:6:MPU6050_ClearDataReady	0	static
-../Core/Src/MPU6050.c:90:6:MPU6050_GetAccel	0	static
-../Core/Src/MPU6050.c:96:6:MPU6050_GetGyro	0	static
-../Core/Src/MPU6050.c:102:6:MPU6050_ProcessDMA	24	static
-../Core/Src/MPU6050.c:171:6:MPU6050_Calibrate	64	static
