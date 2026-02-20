@@ -56,8 +56,8 @@ static float *p_pitch = NULL;
 static float *p_steering = NULL;
 
 static uint8_t *p_balance_flag = NULL;	// Bandera para activar o desctivar el balance del auto, si esta apagada, los motores estan desabilitados
-
-static uint8_t *p_resetMassCenter_flag = NULL;
+static uint8_t *p_resetMassCenter_flag = NULL;	// Bandera para resetear el centro de gravedad del auto, realizando la medicion de la mpu nuevamente
+static uint8_t *p_send_csv_log_flag = NULL;	//
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
@@ -244,7 +244,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         	USB_Debug("\n ALIVE RECIBIDO!\n");
             putHeaderOnTx(dataTx, ALIVE, 2);
             putByteOnTx(dataTx, ACK);
-            putByteOnTx(dataTx, dataTx->chk);
+            putByteOnTx(dataTx, dataTx->chk);	// EL CHECKSUM SE AGREGA SOLO COMO SUMA LUEGO DEL CALCULO DEL PAYLOAD
         break;
         case FIRMWARE:
             putHeaderOnTx(dataTx, FIRMWARE, 12);
@@ -488,7 +488,16 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 				*p_resetMassCenter_flag = !(*p_resetMassCenter_flag);
 				putHeaderOnTx(dataTx, RESETMASSCENTER, 2);
 				putByteOnTx(dataTx, ACK);
-				putByteOnTx(dataTx, dataTx->chk);
+				putByteOnTx(dataTx, dataTx->chk);	// EL CHECKSUM SE AGREGA SOLO COMO SUMA LUEGO DEL CALCULO DEL PAYLOAD
+			}
+		break;
+
+        case ACTIVATE_CSV_LOG:
+			if (p_send_csv_log_flag!= NULL) {
+				*p_send_csv_log_flag = !(*p_send_csv_log_flag);
+				putHeaderOnTx(dataTx, ACTIVATE_CSV_LOG, 2);
+				putByteOnTx(dataTx, ACK);
+				putByteOnTx(dataTx, dataTx->chk);	// EL CHECKSUM SE AGREGA SOLO COMO SUMA LUEGO DEL CALCULO DEL PAYLOAD
 			}
 		break;
 
@@ -706,9 +715,10 @@ void UNER_RegisterSteering(float *steeringPtr) {
     p_steering = steeringPtr;
 }
 
-void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2) {
+void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3) {
     p_balance_flag = flagPtr1;
     p_resetMassCenter_flag = flagPtr2;
+    p_send_csv_log_flag = flagPtr3;
 }
 
 

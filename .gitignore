@@ -1,6 +1,11 @@
+Release/
 Debug/
-Release/Release/
-Debug/
+
 *.o
+*.a
 *.su
 *.cyclo
+*.d
+*.elf
+*.map
+*.list
