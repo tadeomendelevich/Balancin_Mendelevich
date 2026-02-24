@@ -58,6 +58,7 @@ static float *p_steering = NULL;
 static uint8_t *p_balance_flag = NULL;	// Bandera para activar o desctivar el balance del auto, si esta apagada, los motores estan desabilitados
 static uint8_t *p_resetMassCenter_flag = NULL;	// Bandera para resetear el centro de gravedad del auto, realizando la medicion de la mpu nuevamente
 static uint8_t *p_send_csv_log_flag = NULL;	//
+static uint8_t *p_send_wifi_log_flag = NULL;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
@@ -501,6 +502,15 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			}
 		break;
 
+        case ACTIVATE_WIFI_LOG:
+            if (p_send_wifi_log_flag != NULL) {
+                *p_send_wifi_log_flag = !(*p_send_wifi_log_flag);
+                putHeaderOnTx(dataTx, ACTIVATE_WIFI_LOG, 2);
+                putByteOnTx(dataTx, ACK);
+                putByteOnTx(dataTx, dataTx->chk);
+            }
+        break;
+
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
@@ -715,10 +725,11 @@ void UNER_RegisterSteering(float *steeringPtr) {
     p_steering = steeringPtr;
 }
 
-void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3) {
+void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4) {
     p_balance_flag = flagPtr1;
     p_resetMassCenter_flag = flagPtr2;
     p_send_csv_log_flag = flagPtr3;
+    p_send_wifi_log_flag = flagPtr4;
 }
 
 
@@ -769,6 +780,50 @@ void UNER_SendLogData(LogData_t *data) {
 
     // CMD
     buf[idx] = CMD_LOG_DATA; chk ^= buf[idx]; idx++;
+
+    // Payload
+    uint8_t *p = (uint8_t*)data;
+    for(int i=0; i<payloadLen; i++) {
+        buf[idx] = p[i];
+        chk ^= buf[idx];
+        idx++;
+    }
+
+    // Checksum
+    buf[idx++] = chk;
+
+    // Send via ESP01 bypassing UNER ring buffer to avoid USB
+    ESP01_Send(buf, 0, idx, 0xFFFF);
+}
+
+void UNER_SendWifiLogData(WifiLogData_t *data) {
+    if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending()) {
+        return;
+    }
+
+    uint8_t buf[128];
+    uint16_t idx = 0;
+    uint8_t chk = 0;
+    uint8_t payloadLen = sizeof(WifiLogData_t);
+    uint8_t lenByte = payloadLen + 1; // +1 for CMD byte
+
+    // U
+    buf[idx] = 'U'; chk ^= buf[idx]; idx++;
+    // N
+    buf[idx] = 'N'; chk ^= buf[idx]; idx++;
+    // E
+    buf[idx] = 'E'; chk ^= buf[idx]; idx++;
+    // R
+    buf[idx] = 'R'; chk ^= buf[idx]; idx++;
+
+    // Length
+    buf[idx] = lenByte; chk ^= buf[idx]; idx++;
+
+    // :
+    buf[idx] = ':'; chk ^= buf[idx]; idx++;
+
+    // CMD
+    buf[idx] = CMD_WIFI_LOG_DATA; chk ^= buf[idx]; idx++;
 
     // Payload
     uint8_t *p = (uint8_t*)data;

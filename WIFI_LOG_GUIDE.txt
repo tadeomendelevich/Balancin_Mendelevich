@@ -1,0 +1,114 @@
+Guía para leer el log de datos WiFi en Qt (C++)
+================================================
+
+Este archivo describe cómo recibir y decodificar los datos de telemetría enviados por el robot a través de WiFi mediante el protocolo UDP.
+
+1. Estructura de Datos (Binary)
+-------------------------------
+El robot envía una estructura binaria compacta (`WifiLogData_t`) encapsulada en el protocolo UNER.
+
+**Estructura C en el microcontrolador (packed):**
+
+```c
+typedef struct __attribute__((packed)) {
+    uint32_t t_ms;        // Tiempo en ms desde el inicio
+    float    roll_filt;   // Ángulo de inclinación filtrado (grados)
+    float    output;      // Salida del PID (antes de ganancia motor)
+    float    p_term;      // Término Proporcional
+    float    i_term;      // Término Integral
+    float    d_term;      // Término Derivativo
+    int16_t  mR;          // Velocidad Motor Derecho (-100 a 100)
+    int16_t  mL;          // Velocidad Motor Izquierdo (-100 a 100)
+} WifiLogData_t;
+```
+
+**Tamaño del Payload:** 28 bytes.
+
+2. Protocolo de Trama UNER
+--------------------------
+La trama UDP completa tiene el siguiente formato:
+
+| Byte | Valor / Significado          |
+|------|------------------------------|
+| 0    | 'U'                          |
+| 1    | 'N'                          |
+| 2    | 'E'                          |
+| 3    | 'R'                          |
+| 4    | Longitud (Payload + 1) = 29  |
+| 5    | ':'                          |
+| 6    | CMD = 0xBB (CMD_WIFI_LOG_DATA)|
+| 7..34| Payload (WifiLogData_t)      |
+| 35   | Checksum (XOR)               |
+
+3. Configuración en Qt
+----------------------
+Para recibir estos datos, necesitas un `QUdpSocket` escuchando en el puerto local configurado (por defecto 30000).
+
+**Pasos:**
+1. Agregar `network` al archivo `.pro`: `QT += network`
+2. Crear un socket UDP y enlazarlo al puerto.
+3. Procesar los datagramas entrantes.
+
+**Código de Ejemplo (MainWindow.cpp):**
+
+```cpp
+#include <QUdpSocket>
+#include <QDataStream>
+
+// Estructura equivalente en Qt
+#pragma pack(push, 1)
+struct WifiLogData {
+    quint32 t_ms;
+    float   roll_filt;
+    float   output;
+    float   p_term;
+    float   i_term;
+    float   d_term;
+    qint16  mR;
+    qint16  mL;
+};
+#pragma pack(pop)
+
+// En tu clase (header):
+// QUdpSocket *udpSocket;
+// void processPendingDatagrams();
+
+// En la inicialización (constructor):
+udpSocket = new QUdpSocket(this);
+udpSocket->bind(QHostAddress::Any, 30000); // Escuchar en puerto 30000
+connect(udpSocket, &QUdpSocket::readyRead, this, &MainWindow::processPendingDatagrams);
+
+// Implementación del slot:
+void MainWindow::processPendingDatagrams()
+{
+    while (udpSocket->hasPendingDatagrams()) {
+        QNetworkDatagram datagram = udpSocket->receiveDatagram();
+        QByteArray data = datagram.data();
+
+        // Validar cabecera básica "UNER"
+        if (data.size() < 36 || !data.startsWith("UNER")) continue;
+
+        // Verificar comando (Byte 6)
+        if ((quint8)data[6] != 0xBB) continue;
+
+        // Extraer payload (Bytes 7 a 34)
+        WifiLogData log;
+        memcpy(&log, data.constData() + 7, sizeof(WifiLogData));
+
+        // --- Usar los datos ---
+        qDebug() << "Time:" << log.t_ms
+                 << "Roll:" << log.roll_filt
+                 << "PID:" << log.output
+                 << "Motores:" << log.mR << log.mL;
+
+        // Aquí puedes actualizar gráficas (QCustomPlot) o etiquetas.
+    }
+}
+```
+
+4. Activación
+-------------
+El envío de datos WiFi está desactivado por defecto. Para activarlo, debes enviar el comando `ACTIVATE_WIFI_LOG` (0xBA) al robot.
+Formato de envío: `U` `N` `E` `R` `0x01` `:` `0xBA` `CHECKSUM`
+
+O simplemente pulsar el botón correspondiente si ya tienes implementada la interfaz de comandos.

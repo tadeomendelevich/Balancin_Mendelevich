@@ -109,6 +109,8 @@ typedef enum{
 	RESETMASSCENTER = 0xB7,
 	CMD_LOG_DATA    = 0xB8,
 	ACTIVATE_CSV_LOG = 0xB9,
+    ACTIVATE_WIFI_LOG = 0xBA,
+    CMD_WIFI_LOG_DATA = 0xBB,
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -130,6 +132,17 @@ typedef struct __attribute__((packed)) {
     int16_t mR;
     int16_t mL;
 } LogData_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t t_ms;
+    float roll_filt;
+    float output;
+    float p_term;
+    float i_term;
+    float d_term;
+    int16_t mR;
+    int16_t mL;
+} WifiLogData_t;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr);
 
@@ -173,9 +186,11 @@ void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr);
 
 void UNER_RegisterSteering(float *steeringPtr);
 
-void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3);
+void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4);
 
 void UNER_SendLogData(LogData_t *data);
+
+void UNER_SendWifiLogData(WifiLogData_t *data);
 
 void UNER_SendData(void);
 
