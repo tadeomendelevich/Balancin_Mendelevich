@@ -82,6 +82,7 @@
 // LOGGING MACROS
 #define LOG_ENABLE 1
 #define LOG_DECIM  5		// FRECUENCIA DE ENVIO
+#define LOG_WIFI_DECIM 10
 
 // New Control Parameters
 #define BETA_G 0.15f        // LPF for Gyro
@@ -196,6 +197,7 @@ static uint32_t log_counter = 0;
 static uint32_t last_log_us = 0;
 static uint8_t  log_header_sent = 0;
 uint8_t f_send_csv_log = 0;
+uint8_t f_send_wifi_log = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -928,7 +930,7 @@ int main(void)
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
   UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value);
   UNER_RegisterSteering(&steering_adjustment);
-  UNER_RegisterFlags(&f_balancing, &f_resetMassCenter, &f_send_csv_log);
+  UNER_RegisterFlags(&f_balancing, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();
@@ -1078,6 +1080,22 @@ int main(void)
 
 			  // --- LOGGING ---
               log_counter++;
+
+              // --- WIFI LOGGING ---
+              if (f_send_wifi_log && (log_counter % LOG_WIFI_DECIM == 0)) {
+                  WifiLogData_t wlog;
+                  wlog.t_ms = HAL_GetTick();
+                  wlog.roll_filt = filtered_roll_deg;
+                  wlog.output = output;
+                  wlog.p_term = p_term;
+                  wlog.i_term = i_term;
+                  wlog.d_term = d_term;
+                  wlog.mR = motorRightVelocity;
+                  wlog.mL = motorLeftVelocity;
+
+                  UNER_SendWifiLogData(&wlog);
+              }
+
               if (LOG_ENABLE && f_send_csv_log && (log_counter % LOG_DECIM == 0)) {
                   // Reuse now_us from control loop for consistency or take new one?
                   // Original took new micros(). Let's stick to that but we can log dt of control.
