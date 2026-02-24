@@ -49,13 +49,18 @@ Para recibir estos datos, necesitas un `QUdpSocket` escuchando en el puerto loca
 2. Crear un socket UDP y enlazarlo al puerto.
 3. Procesar los datagramas entrantes.
 
-**Código de Ejemplo (MainWindow.cpp):**
+**Clase Completa `UdpTelemetryReceiver` (Ejemplo):**
 
 ```cpp
-#include <QUdpSocket>
-#include <QDataStream>
+// UdpTelemetryReceiver.h
+#ifndef UDPTELEMETRYRECEIVER_H
+#define UDPTELEMETRYRECEIVER_H
 
-// Estructura equivalente en Qt
+#include <QObject>
+#include <QUdpSocket>
+#include <QNetworkDatagram>
+
+// Estructura equivalente en Qt (debe coincidir con la del microcontrolador)
 #pragma pack(push, 1)
 struct WifiLogData {
     quint32 t_ms;
@@ -69,46 +74,110 @@ struct WifiLogData {
 };
 #pragma pack(pop)
 
-// En tu clase (header):
-// QUdpSocket *udpSocket;
-// void processPendingDatagrams();
+class UdpTelemetryReceiver : public QObject
+{
+    Q_OBJECT
+public:
+    explicit UdpTelemetryReceiver(QObject *parent = nullptr);
+    void startListening(quint16 port = 30000);
+    void sendStartLogCommand(const QString &robotIp, quint16 robotPort = 30010);
 
-// En la inicialización (constructor):
-udpSocket = new QUdpSocket(this);
-udpSocket->bind(QHostAddress::Any, 30000); // Escuchar en puerto 30000
-connect(udpSocket, &QUdpSocket::readyRead, this, &MainWindow::processPendingDatagrams);
+signals:
+    void newDataReceived(WifiLogData data);
 
-// Implementación del slot:
-void MainWindow::processPendingDatagrams()
+private slots:
+    void processPendingDatagrams();
+
+private:
+    QUdpSocket *udpSocket;
+};
+
+#endif // UDPTELEMETRYRECEIVER_H
+```
+
+```cpp
+// UdpTelemetryReceiver.cpp
+#include "UdpTelemetryReceiver.h"
+#include <QDebug>
+
+UdpTelemetryReceiver::UdpTelemetryReceiver(QObject *parent) : QObject(parent)
+{
+    udpSocket = new QUdpSocket(this);
+    connect(udpSocket, &QUdpSocket::readyRead, this, &UdpTelemetryReceiver::processPendingDatagrams);
+}
+
+void UdpTelemetryReceiver::startListening(quint16 port)
+{
+    if (udpSocket->bind(QHostAddress::Any, port)) {
+        qDebug() << "Escuchando telemetría UDP en el puerto" << port;
+    } else {
+        qDebug() << "Error al abrir puerto UDP:" << udpSocket->errorString();
+    }
+}
+
+void UdpTelemetryReceiver::sendStartLogCommand(const QString &robotIp, quint16 robotPort)
+{
+    // Trama para activar el log: UNER + len + : + CMD (0xBA) + Checksum
+    // CMD_ACTIVATE_WIFI_LOG = 0xBA
+    // Len = 1 (CMD) + 1 (Payload vacío, opcional) = 2? No, len es payload+1. Payload es 0. Len=1.
+    // Revisando UNER.c: len es length (payload) + 1. Si payload es 0, len=1.
+
+    QByteArray packet;
+    packet.append("UNER");
+    packet.append((char)0x01); // Len = 1 (Solo CMD)
+    packet.append(':');
+    packet.append((char)0xBA); // CMD_ACTIVATE_WIFI_LOG
+
+    // Checksum: 'U'^'N'^'E'^'R'^len^':'^cmd
+    char chk = 'U' ^ 'N' ^ 'E' ^ 'R' ^ 0x01 ^ ':' ^ 0xBA;
+    packet.append(chk);
+
+    udpSocket->writeDatagram(packet, QHostAddress(robotIp), robotPort);
+    qDebug() << "Comando de inicio enviado a" << robotIp;
+}
+
+void UdpTelemetryReceiver::processPendingDatagrams()
 {
     while (udpSocket->hasPendingDatagrams()) {
         QNetworkDatagram datagram = udpSocket->receiveDatagram();
         QByteArray data = datagram.data();
 
-        // Validar cabecera básica "UNER"
+        // Validar cabecera básica "UNER" y tamaño mínimo (Header 7 + Payload 28 + Chk 1 = 36)
         if (data.size() < 36 || !data.startsWith("UNER")) continue;
 
-        // Verificar comando (Byte 6)
+        // Verificar comando (Byte 6) -> 0xBB (CMD_WIFI_LOG_DATA)
         if ((quint8)data[6] != 0xBB) continue;
 
         // Extraer payload (Bytes 7 a 34)
         WifiLogData log;
+        // Copiar de forma segura
         memcpy(&log, data.constData() + 7, sizeof(WifiLogData));
 
-        // --- Usar los datos ---
-        qDebug() << "Time:" << log.t_ms
-                 << "Roll:" << log.roll_filt
-                 << "PID:" << log.output
-                 << "Motores:" << log.mR << log.mL;
-
-        // Aquí puedes actualizar gráficas (QCustomPlot) o etiquetas.
+        // Emitir señal con los datos decodificados
+        emit newDataReceived(log);
     }
 }
 ```
 
-4. Activación
--------------
-El envío de datos WiFi está desactivado por defecto. Para activarlo, debes enviar el comando `ACTIVATE_WIFI_LOG` (0xBA) al robot.
-Formato de envío: `U` `N` `E` `R` `0x01` `:` `0xBA` `CHECKSUM`
+4. Integración en MainWindow
+---------------------------
+En tu `MainWindow.cpp`:
 
-O simplemente pulsar el botón correspondiente si ya tienes implementada la interfaz de comandos.
+```cpp
+// 1. Instanciar
+receiver = new UdpTelemetryReceiver(this);
+
+// 2. Conectar señal a tu slot de actualización de GUI/Gráficos
+connect(receiver, &UdpTelemetryReceiver::newDataReceived, this, [](WifiLogData data){
+    qDebug() << "Roll:" << data.roll_filt << " PID:" << data.output;
+    // ui->plot->addData(data.t_ms, data.roll_filt);
+});
+
+// 3. Iniciar escucha
+receiver->startListening(30000);
+
+// 4. En algún botón "Conectar/Iniciar Log":
+receiver->sendStartLogCommand("192.168.1.XX", 30010);
+```
+
+Recuerda reemplazar `"192.168.1.XX"` con la IP real de tu robot (la que configuraste en `main.c`).
