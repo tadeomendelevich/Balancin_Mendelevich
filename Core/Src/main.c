@@ -68,7 +68,7 @@
 
 // PID
 #define KP 10.0f
-#define KD 0.12f
+#define KD 0.0f	// 0.12 antes
 #define KI 0.0f
 
 #define MOTOR_GAIN 3.0f
@@ -156,13 +156,13 @@ static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrant
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
 
-//const char *wifiSSID     = "FCAL";
-//const char *wifiPassword = "fcalconcordia.06-2019";
-//const char *wifiIp = "172.23.205.98";
+const char *wifiSSID     = "FCAL";
+const char *wifiPassword = "fcalconcordia.06-2019";
+const char *wifiIp = "172.23.205.98";
 
-const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-const char *wifiPassword = "djg19dlk";
-const char *wifiIp 		 = "192.168.100.5";
+//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+//const char *wifiPassword = "djg19dlk";
+//const char *wifiIp 		 = "192.168.100.5";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
@@ -1013,19 +1013,19 @@ int main(void)
 			  if (dt < DT_MIN) dt = DT_MIN;
 			  if (dt > DT_MAX) dt = DT_MAX;
 
-			  // 2. Filter Gyro (Low Pass Filter)  ->  GX
-			  float gyro_x_dps = (float)gx / 131.0f;
-			  gyro_f += BETA_G * (gyro_x_dps - gyro_f);
+			  // Signo consistente para TODO (probá +1.0f o -1.0f)
+			  const float ANG_SIGN = +1.0f;
 
-			  // 3. Filter Accel -> roll (ay, az)
-			  float accel_roll_deg = atan2f(ay, az) * (180.0f / M_PI);
-			  accel_roll_f += BETA_A * (accel_roll_deg - accel_roll_f);
+			  // 2) Gyro (mismo eje que tu "roll" de accel)
+			  float gyro_rate_dps = ANG_SIGN * ((float)gx / 131.0f);
+			  gyro_f += BETA_G * (gyro_rate_dps - gyro_f);
+
+			  // 3) Accel angle (roll)
+			  float accel_ang_deg = ANG_SIGN * (atan2f(ay, az) * (180.0f / M_PI));
+			  accel_roll_f += BETA_A * (accel_ang_deg - accel_roll_f);
 
 			  // 4. Complementary Filter
 			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt) + (1.0f - ALPHA) * accel_roll_f;
-
-			  // INVERTIR SIGNO DEL ÁNGULO
-			  filtered_roll_deg = -filtered_roll_deg;
 
 			  // PID Calculations
 			  float error = SETPOINT_ANGLE - filtered_roll_deg;
@@ -1036,7 +1036,7 @@ int main(void)
 			  float d_term = -KD_value * gyro_f;        // Derivative on Measurement
 
 			  float output = p_term + i_term + d_term;
-
+			  // 2. Filter Gyro (Low Pass Filter)  ->  GX
 			  // Motor Command & Saturation
 			  float pwm_cmd = output * MOTOR_GAIN;
 			  float pwm_sat = pwm_cmd;
@@ -1107,9 +1107,9 @@ int main(void)
                   // Angles/Error: x1000 (milli-degrees)
                   // PID/Output: x1000
                   // PWM: x100
-                  int32_t accel_mdeg   = (int32_t)(accel_roll_deg * 1000.0f);
+                  int32_t accel_mdeg   = (int32_t)(accel_ang_deg * 1000.0f);
                   int32_t accel_f_mdeg = (int32_t)(accel_roll_f * 1000.0f);
-                  int32_t gyro_mdps    = (int32_t)(gyro_x_dps * 1000.0f);
+                  int32_t gyro_mdps    = (int32_t)(gyro_rate_dps * 1000.0f);
                   int32_t gyro_f_mdps  = (int32_t)(gyro_f * 1000.0f);
                   int32_t roll_mdeg    = (int32_t)(filtered_roll_deg * 1000.0f);
                   int32_t error_mdeg   = (int32_t)(error * 1000.0f);

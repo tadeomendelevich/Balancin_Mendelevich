@@ -15,7 +15,8 @@
 
 extern void USB_Debug(const char *fmt, ...);
 
-#define SERVER_IP    		"192.168.100.5"	// Cambiar IP correspondiente al wifi
+//#define SERVER_IP    		"192.168.100.5"	// Wifi Depto
+#define SERVER_IP    		"172.23.205.98"	// Wifi Facultad
 #define SERVER_PORT  		30010
 #define LOCAL_PORT   		30000
 #define ALIVE_INTERVAL_FAST_MS 	5000
