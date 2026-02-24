@@ -67,7 +67,7 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 1.0f
+#define KP 10.0f
 #define KD 0.12f
 #define KI 0.0f
 
@@ -175,7 +175,6 @@ const char *wifiIp 		 = "192.168.100.5";
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
 
-static float previous_error = 0.0f;
 static float integral = 0.0f;
 static float steering_adjustment = 0.0f;
 static float filtered_roll_deg = 0.0f;
@@ -1014,16 +1013,19 @@ int main(void)
 			  if (dt < DT_MIN) dt = DT_MIN;
 			  if (dt > DT_MAX) dt = DT_MAX;
 
-			  // 2. Filter Gyro (Low Pass Filter)
-			  float gyro_y_dps = (float)gy / 131.0f; // Sensibilidad del giróscopo a ±250dps
-			  gyro_f += BETA_G * (gyro_y_dps - gyro_f);
+			  // 2. Filter Gyro (Low Pass Filter)  ->  GX
+			  float gyro_x_dps = (float)gx / 131.0f;
+			  gyro_f += BETA_G * (gyro_x_dps - gyro_f);
 
-			  // 3. Filter Accel (Low Pass Filter)
+			  // 3. Filter Accel -> roll (ay, az)
 			  float accel_roll_deg = atan2f(ay, az) * (180.0f / M_PI);
 			  accel_roll_f += BETA_A * (accel_roll_deg - accel_roll_f);
 
-			  // 4. Complementary Filter with Real DT
+			  // 4. Complementary Filter
 			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt) + (1.0f - ALPHA) * accel_roll_f;
+
+			  // INVERTIR SIGNO DEL ÁNGULO
+			  filtered_roll_deg = -filtered_roll_deg;
 
 			  // PID Calculations
 			  float error = SETPOINT_ANGLE - filtered_roll_deg;
@@ -1068,8 +1070,8 @@ int main(void)
 			  if (mL > 100.0f) mL = 100.0f;
 			  if (mL < -100.0f) mL = -100.0f;
 
-			  motorRightVelocity = (int16_t)mR;
-			  motorLeftVelocity  = (int16_t)mL;
+			  motorRightVelocity = -(int16_t)mR;
+			  motorLeftVelocity  = -(int16_t)mL;
 
 			  // Actualizar variables para reporte
 			  roll_deg = filtered_roll_deg;
@@ -1107,7 +1109,7 @@ int main(void)
                   // PWM: x100
                   int32_t accel_mdeg   = (int32_t)(accel_roll_deg * 1000.0f);
                   int32_t accel_f_mdeg = (int32_t)(accel_roll_f * 1000.0f);
-                  int32_t gyro_mdps    = (int32_t)(gyro_y_dps * 1000.0f);
+                  int32_t gyro_mdps    = (int32_t)(gyro_x_dps * 1000.0f);
                   int32_t gyro_f_mdps  = (int32_t)(gyro_f * 1000.0f);
                   int32_t roll_mdeg    = (int32_t)(filtered_roll_deg * 1000.0f);
                   int32_t error_mdeg   = (int32_t)(error * 1000.0f);
@@ -1190,7 +1192,6 @@ int main(void)
 	  }
 
 	  UNER_Task(); 		// Procesa tramas UNER recibidas
-
 	  usb_service_tx();
 	  SSD1306_UpdateScreen();
 
