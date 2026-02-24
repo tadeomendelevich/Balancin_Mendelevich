@@ -351,6 +351,13 @@ void SSD1306_ResetUpdateState(void);
  */
 void SSD1306_DrawDigit5x7(uint8_t digit, uint16_t x, uint16_t y);
 
+/**
+ * @brief  Dibuja un caracter usando la fuente 5×7
+ * @param  x: valor del caracter
+ * @param  x, y: coordenadas de la esquina superior izquierda
+ */
+void SSD1306_DrawChar5x7(char c, uint16_t x, uint16_t y);
+
 /* C++ detection */
 #ifdef __cplusplus
 }

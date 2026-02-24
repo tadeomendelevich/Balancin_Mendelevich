@@ -772,3 +772,20 @@ void SSD1306_DrawDigit5x7(uint8_t digit, uint16_t x, uint16_t y) {
         }
     }
 }
+
+void SSD1306_DrawChar5x7(char c, uint16_t x, uint16_t y) {
+    uint8_t idx;
+    if      (c >= '0' && c <= '9') idx = c - '0';
+    else if (c >= 'A' && c <= 'Z') idx = 10 + (c - 'A');
+    else return;
+
+    const uint8_t *pat = &Font5x7[idx * Font_5x7.FontWidth];
+    for (uint8_t col = 0; col < Font_5x7.FontWidth; col++) {
+        uint8_t bits = pat[col];
+        for (uint8_t row = 0; row < Font_5x7.FontHeight; row++) {
+            if (bits & (1 << row)) {
+                SSD1306_DrawPixel(x + col, y + row, SSD1306_COLOR_WHITE);
+            }
+        }
+    }
+}

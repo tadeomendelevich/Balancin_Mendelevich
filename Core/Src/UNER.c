@@ -752,92 +752,51 @@ void UNER_SendData(void) {
     unerTx->indexR = (unerTx->indexR + len) & unerTx->mask;
 }
 
-void UNER_SendLogData(LogData_t *data) {
-    if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending()) {
-        return;
-    }
-
-    uint8_t buf[128];
-    uint16_t idx = 0;
-    uint8_t chk = 0;
-    uint8_t payloadLen = sizeof(LogData_t);
-    uint8_t lenByte = payloadLen + 1; // +1 for CMD byte
-
-    // U
-    buf[idx] = 'U'; chk ^= buf[idx]; idx++;
-    // N
-    buf[idx] = 'N'; chk ^= buf[idx]; idx++;
-    // E
-    buf[idx] = 'E'; chk ^= buf[idx]; idx++;
-    // R
-    buf[idx] = 'R'; chk ^= buf[idx]; idx++;
-
-    // Length
-    buf[idx] = lenByte; chk ^= buf[idx]; idx++;
-
-    // :
-    buf[idx] = ':'; chk ^= buf[idx]; idx++;
-
-    // CMD
-    buf[idx] = CMD_LOG_DATA; chk ^= buf[idx]; idx++;
-
-    // Payload
-    uint8_t *p = (uint8_t*)data;
-    for(int i=0; i<payloadLen; i++) {
-        buf[idx] = p[i];
-        chk ^= buf[idx];
-        idx++;
-    }
-
-    // Checksum
-    buf[idx++] = chk;
-
-    // Send via ESP01 bypassing UNER ring buffer to avoid USB
-    ESP01_Send(buf, 0, idx, 0xFFFF);
-}
-
 void UNER_SendWifiLogData(WifiLogData_t *data) {
     if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending()) {
         return;
     }
 
-    uint8_t buf[128];
-    uint16_t idx = 0;
-    uint8_t chk = 0;
+    // sizeof(WifiLogData_t) bytes de payload + 1 byte CMD
     uint8_t payloadLen = sizeof(WifiLogData_t);
-    uint8_t lenByte = payloadLen + 1; // +1 for CMD byte
 
-    // U
-    buf[idx] = 'U'; chk ^= buf[idx]; idx++;
-    // N
-    buf[idx] = 'N'; chk ^= buf[idx]; idx++;
-    // E
-    buf[idx] = 'E'; chk ^= buf[idx]; idx++;
-    // R
-    buf[idx] = 'R'; chk ^= buf[idx]; idx++;
+    unerTx->indexW = 0;
+    unerTx->indexR = 0;
+    unerTx->chk    = 0;
 
-    // Length
-    buf[idx] = lenByte; chk ^= buf[idx]; idx++;
+    putHeaderOnTx(unerTx, CMD_WIFI_LOG_DATA, 29);
 
-    // :
-    buf[idx] = ':'; chk ^= buf[idx]; idx++;
-
-    // CMD
-    buf[idx] = CMD_WIFI_LOG_DATA; chk ^= buf[idx]; idx++;
-
-    // Payload
     uint8_t *p = (uint8_t*)data;
-    for(int i=0; i<payloadLen; i++) {
-        buf[idx] = p[i];
-        chk ^= buf[idx];
-        idx++;
+    for (uint8_t i = 0; i < payloadLen; i++) {
+        putByteOnTx(unerTx, p[i]);
     }
 
-    // Checksum
-    buf[idx++] = chk;
+    putByteOnTx(unerTx, unerTx->chk);
 
-    // Send via ESP01 bypassing UNER ring buffer to avoid USB
-    ESP01_Send(buf, 0, idx, 0xFFFF);
+    UNER_SendData();
+}
+
+void UNER_SendLogData(LogData_t *data) {
+    if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending()) {
+        return;
+    }
+
+    uint8_t payloadLen = sizeof(LogData_t);
+
+    unerTx->indexW = 0;
+    unerTx->indexR = 0;
+    unerTx->chk    = 0;
+
+    putHeaderOnTx(unerTx, CMD_LOG_DATA, payloadLen);
+
+    uint8_t *p = (uint8_t*)data;
+    for (uint8_t i = 0; i < payloadLen; i++) {
+        putByteOnTx(unerTx, p[i]);
+    }
+
+    putByteOnTx(unerTx, unerTx->chk);
+
+    UNER_SendData();
 }
 
 /* END Private Functions*/

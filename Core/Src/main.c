@@ -198,6 +198,9 @@ static uint32_t last_log_us = 0;
 static uint8_t  log_header_sent = 0;
 uint8_t f_send_csv_log = 0;
 uint8_t f_send_wifi_log = 0;
+
+static uint8_t dotPhase = 0;	// Variable estática para la animación de puntos
+static uint8_t f_wifi_connected = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -730,70 +733,146 @@ static void esp01_chpd(uint8_t val) {
 
 void appOnESP01ChangeState(_eESP01STATUS state) {
     if (state == ESP01_WIFI_NEW_IP) {
-        // Ahora que ya tenemos IP propia, arrancamos el socket UDP
-        ESP01_StartUDP(wifiIp, 30010, 30000);
+        ESP01_StartUDP(wifiIp, 30010, 30000);  // Ttenemos IP propia, arrancamos el socket UDP
+        f_wifi_connected = 1;
     }
-    // Si más adelante quieres TCP, aquí gestionas ESP01_UDPTCP_CONNECTED, etc.
+
+    // Capturamos TODOS los estados que implican pérdida de conexión
+	if (state == ESP01_UDPTCP_DISCONNECTED  ||
+		state == ESP01_WIFI_DISCONNECTED    ||
+		state == ESP01_WIFI_RECONNECTING    ||
+		state == ESP01_NOT_INIT             ||
+		state == ESP01_WIFI_NOT_SETED) {
+		f_wifi_connected = 0;
+	}
 }
 
 void updateDisplay(void) {
-    // 1) Limpia todo el buffer
     SSD1306_Fill(SSD1306_COLOR_BLACK);
 
-    // 2) Línea divisoria vertical en medio
+    // Línea divisoria vertical
     SSD1306_DrawLine(
         SCREEN_W/2, 0,
         SCREEN_W/2, SCREEN_H - 1,
         SSD1306_COLOR_WHITE
     );
 
-    // 3) MPU6050 – valores en la mitad izquierda (sin cambios)
+    // -------------------------------------------------------
+    // Zona superior izquierda: puntos animados + ícono WiFi
+    // -------------------------------------------------------
+    {
+        // --- 3 puntos animados (heartbeat) en x=2, y=1 ---
+        uint16_t px = 2;
+        uint16_t py = 1;
+        uint8_t count = (dotPhase % 3) + 1;
+        for (uint8_t d = 0; d < 3; d++) {
+            if (d < count) {
+                SSD1306_DrawPixel(px,     py,     SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(px + 1, py,     SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(px,     py + 1, SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(px + 1, py + 1, SSD1306_COLOR_WHITE);
+            }
+            px += 5;
+        }
+        dotPhase++;
+        if (dotPhase >= 3) dotPhase = 0;
+
+        // --- Ícono WiFi o Cruz centrado en la zona superior ---
+        const uint16_t ix = 40;   // ajustá este valor para mover horizontalmente
+        const uint16_t iy = 1;
+
+        if (f_wifi_connected) {
+            // Punto central (antena)
+            SSD1306_DrawPixel(ix + 3, iy + 6, SSD1306_COLOR_WHITE);
+            // Arco pequeño
+            SSD1306_DrawPixel(ix + 2, iy + 5, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 4, iy + 5, SSD1306_COLOR_WHITE);
+            // Arco mediano
+            SSD1306_DrawPixel(ix + 1, iy + 3, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 2, iy + 2, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 4, iy + 2, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 5, iy + 3, SSD1306_COLOR_WHITE);
+            // Arco grande
+            SSD1306_DrawPixel(ix + 0, iy + 1, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 1, iy + 0, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 5, iy + 0, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 6, iy + 1, SSD1306_COLOR_WHITE);
+        } else {
+            // Cruz (X) de 7x7 píxeles
+            SSD1306_DrawPixel(ix + 0, iy + 0, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 1, iy + 1, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 2, iy + 2, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 3, iy + 3, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 4, iy + 4, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 5, iy + 5, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 6, iy + 6, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 6, iy + 0, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 5, iy + 1, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 4, iy + 2, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 3, iy + 3, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 2, iy + 4, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 1, iy + 5, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 0, iy + 6, SSD1306_COLOR_WHITE);
+        }
+    }
+
+    // -------------------------------------------------------
+    // MPU6050: 6 filas pegadas al fondo, izquierda
+    // -------------------------------------------------------
     {
         const char* labels[6] = { "AX:", "AY:", "AZ:", "GX:", "GY:", "GZ:" };
-        int16_t    values[6];
+        int16_t     values[6];
         MPU6050_GetAccel(&values[0], &values[1], &values[2]);
         MPU6050_GetGyro (&values[3], &values[4], &values[5]);
 
-        char buf[7];
+        char buf[8];
+        const uint16_t y_start = SCREEN_H - 6 * 10 + 2;
 
         for (int i = 0; i < 6; i++) {
-            uint16_t y = 2 + i * 10;
-            SSD1306_GotoXY(2, y);
-            SSD1306_Puts(labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
+            uint16_t y = y_start + i * 10;
+            uint16_t x = 2;
+
+            // Etiqueta con SSD1306_DrawChar5x7
+            for (const char *p = labels[i]; *p; p++) {
+                if (*p == ':') {
+                    SSD1306_DrawPixel(x + 1, y + 1, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(x + 1, y + 4, SSD1306_COLOR_WHITE);
+                    x += 4;
+                } else {
+                    SSD1306_DrawChar5x7(*p, x, y);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
+
+            // Valor numérico
             itoa(values[i], buf, 10);
-            uint16_t x = 2 + strlen(labels[i]) * Font_7x10.FontWidth;
             for (char *p = buf; *p; p++) {
                 if (*p == '-') {
-                    SSD1306_DrawLine(x, y + 3, x + 4, y + 3, SSD1306_COLOR_WHITE);
-                    x += 6;
+                    SSD1306_DrawLine(x, y + 3, x + 3, y + 3, SSD1306_COLOR_WHITE);
+                    x += 5;
                 } else {
-                    SSD1306_DrawDigit5x7(*p - '0', x, y);
+                    SSD1306_DrawChar5x7(*p, x, y);
                     x += Font_5x7.FontWidth + 1;
                 }
             }
         }
     }
 
-    // 4) Mitad derecha: KP/KD/KI arriba + barras ADC (mitad de altura) abajo
+    // -------------------------------------------------------
+    // Mitad derecha: PID + barras ADC
+    // -------------------------------------------------------
     {
-        // Font_7x10: 7px de ancho por caracter.
-        // Zona derecha: 64px de ancho total.
-        // Etiqueta "P:" = 2 chars = 14px. Valor "0.20" = 4 chars = 28px. Total = 42px. OK.
-        // Si el valor es negativo "-0.20" = 5 chars = 35px + 14px = 49px. OK.
-
-        const uint16_t rx = SCREEN_W / 2 + 2;   // margen izquierdo de 2px
+        const uint16_t rx = SCREEN_W / 2 + 2;
 
         const char *pid_labels[3] = { "P:", "D:", "I:" };
         float       pid_vals[3]   = { KP_value, KD_value, KI_value };
 
         for (uint8_t i = 0; i < 3; i++) {
-            uint16_t y = 1 + i * 10;   // y = 1, 11, 21
+            uint16_t y = 1 + i * 10;
 
-            // Etiqueta
             SSD1306_GotoXY(rx, y);
             SSD1306_Puts(pid_labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
 
-            // Valor float con 2 decimales, formateado manualmente
             char fbuf[8];
             float v = pid_vals[i];
             uint8_t neg = (v < 0);
@@ -807,25 +886,20 @@ void updateDisplay(void) {
                 snprintf(fbuf, sizeof(fbuf), "%lu.%02lu",
                          (unsigned long)int_part, (unsigned long)frac_part);
 
-            // Posiciona tras los 2 chars de la etiqueta
             SSD1306_GotoXY(rx + 2 * Font_7x10.FontWidth, y);
             SSD1306_Puts(fbuf, &Font_7x10, SSD1306_COLOR_WHITE);
         }
 
-        // Línea separadora tras los 3 PID (y = 3*10 + 2 = 32)
         uint16_t sep_y = 32;
         SSD1306_DrawLine(SCREEN_W/2, sep_y, SCREEN_W - 1, sep_y, SSD1306_COLOR_WHITE);
 
-        // --- Barras ADC ---
-        const uint16_t bar_region_y = sep_y + 2;                            // 34
-        const uint16_t digit_h      = Font_5x7.FontHeight + 2;              // espacio para dígito
-        const uint16_t bar_region_h = SCREEN_H - bar_region_y - digit_h;   // altura disponible
+        const uint16_t bar_region_y = sep_y + 2;
+        const uint16_t digit_h      = Font_5x7.FontHeight + 2;
+        const uint16_t bar_region_h = SCREEN_H - bar_region_y - digit_h;
+        const uint16_t bar_max_h    = (bar_region_h / 2) + 10;
+        const uint16_t bar_base_y   = bar_region_y + bar_region_h - 1;
 
-        // Barras a la MITAD de la altura disponible
-        const uint16_t bar_max_h  = (bar_region_h / 2) + 10;
-        const uint16_t bar_base_y = bar_region_y + bar_region_h - 1;       // base común
-
-        const uint16_t rw         = SCREEN_W / 2 - 1;
+        const uint16_t rw          = SCREEN_W / 2 - 1;
         const uint16_t bar_spacing = BAR_SPACING;
         const uint16_t bar_width   = (rw - (BAR_COUNT + 1) * bar_spacing) / BAR_COUNT;
 
@@ -837,17 +911,15 @@ void updateDisplay(void) {
             if (h > 0)
                 SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
 
-            // Dígito 1–8 centrado bajo cada barra
             uint16_t tx = x0 + (bar_width > Font_5x7.FontWidth
                                  ? (bar_width - Font_5x7.FontWidth) / 2 : 0);
             uint16_t ty = bar_base_y + 2;
-            SSD1306_DrawDigit5x7(i + 1, tx, ty);
+            SSD1306_DrawChar5x7('1' + i, tx, ty);   // dígitos 1-8 bajo cada barra
         }
     }
 
     SSD1306_RequestUpdate();
 }
-
 
 /* USER CODE END 0 */
 
@@ -1001,8 +1073,6 @@ int main(void)
 			  MPU6050_GetGyro(&gx, &gy, &gz);
 
 			  // EMA, filtro complementario, control PD...
-			  // ... (toda la lógica de control se ejecuta aquí)
-
 			  // --- Complementary Filter & PID Control ---
 
 			  // 1. Calculate Real DT
