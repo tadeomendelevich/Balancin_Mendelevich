@@ -149,13 +149,13 @@ static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrant
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
 
-const char *wifiSSID     = "FCAL";
-const char *wifiPassword = "fcalconcordia.06-2019";
-const char *wifiIp = "172.23.205.98";
+//const char *wifiSSID     = "FCAL";
+//const char *wifiPassword = "fcalconcordia.06-2019";
+//const char *wifiIp = "172.23.205.98";
 
-//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-//const char *wifiPassword = "djg19dlk";
-//const char *wifiIp 		 = "192.168.100.5";
+const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+const char *wifiPassword = "djg19dlk";
+const char *wifiIp 		 = "192.168.100.5";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
@@ -459,10 +459,6 @@ static int uart_send_byte(uint8_t byte) {
 
 void PWM_init(void)
 {
-    // Bases (no hace falta IT si solo usás PWM)
-    HAL_TIM_Base_Start(&htim3);
-    HAL_TIM_Base_Start(&htim4);
-
     // TIM3 → PB4 (CH1), PB5 (CH2)
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
@@ -482,44 +478,55 @@ void PWM_init(void)
 // Motor izquierdo: TIM4 -> PB6 (CH1 = reversa), PB7 (CH2 = avance)
 void MotorControl(int16_t setMotorRight, int16_t setMotorLeft)
 {
+    // Si ambos son cero, apagar completamente los canales PWM
+    if (setMotorRight == 0 && setMotorLeft == 0) {
+        HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1); // PB4
+        HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_2); // PB5
+        HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_1); // PB6
+        HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_2); // PB7
+        return;
+    }
+
+    // Asegurarse que los canales estén activos antes de escribir duty
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);
+
     // Limitar a [-100, 100]
     if (setMotorRight > 100)  setMotorRight = 100;
     if (setMotorRight < -100) setMotorRight = -100;
     if (setMotorLeft > 100)   setMotorLeft  = 100;
     if (setMotorLeft < -100)  setMotorLeft  = -100;
 
-    // ARR actuales de cada timer (evita hardcodear 999, etc.)
-    uint32_t arr3 = __HAL_TIM_GET_AUTORELOAD(&htim3); // derecho
-    uint32_t arr4 = __HAL_TIM_GET_AUTORELOAD(&htim4); // izquierdo
+    uint32_t arr3 = __HAL_TIM_GET_AUTORELOAD(&htim3);
+    uint32_t arr4 = __HAL_TIM_GET_AUTORELOAD(&htim4);
 
-    // |duty| en %
     uint32_t dutyR = (setMotorRight >= 0) ? (uint32_t)setMotorRight : (uint32_t)(-setMotorRight);
     uint32_t dutyL = (setMotorLeft  >= 0) ? (uint32_t)setMotorLeft  : (uint32_t)(-setMotorLeft);
 
-    // % -> CCR (en 32 bits para evitar overflow)
-    uint32_t ccrR = (arr3 * dutyR) / 100U;
-    uint32_t ccrL = (arr4 * dutyL) / 100U;
+    uint32_t ccrR = ((arr3 + 1) * dutyR) / 100U;
+    uint32_t ccrL = ((arr4 + 1) * dutyL) / 100U;
+
+    if (ccrR > arr3) ccrR = arr3;
+    if (ccrL > arr4) ccrL = arr4;
 
     // ----- Motor derecho (TIM3) -----
     if (setMotorRight >= 0) {
-        // Avance: CH1 activo, CH2 apagado
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, ccrR);   // PB4
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);      // PB5
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, ccrR);
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
     } else {
-        // Reversa: CH2 activo, CH1 apagado
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);      // PB4
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, ccrR);   // PB5
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
+        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, ccrR);
     }
 
     // ----- Motor izquierdo (TIM4) -----
     if (setMotorLeft >= 0) {
-        // Avance: CH2 activo, CH1 apagado
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);      // PB6
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, ccrL);   // PB7
+        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);
+        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, ccrL);
     } else {
-        // Reversa: CH1 activo, CH2 apagado
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, ccrL);   // PB6
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 0);      // PB7
+        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, ccrL);
+        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 0);
     }
 }
 
@@ -1457,7 +1464,6 @@ static void MX_TIM3_Init(void)
 
   /* USER CODE END TIM3_Init 0 */
 
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
@@ -1465,20 +1471,11 @@ static void MX_TIM3_Init(void)
 
   /* USER CODE END TIM3_Init 1 */
   htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 95;
+  htim3.Init.Prescaler = 0;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 999;
+  htim3.Init.Period = 959;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
   if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
   {
     Error_Handler();
@@ -1527,9 +1524,9 @@ static void MX_TIM4_Init(void)
 
   /* USER CODE END TIM4_Init 1 */
   htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 95;
+  htim4.Init.Prescaler = 0;
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 999;
+  htim4.Init.Period = 959;
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
