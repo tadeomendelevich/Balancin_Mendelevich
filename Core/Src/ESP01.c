@@ -310,6 +310,7 @@ _eESP01STATUS ESP01_Send(uint8_t *buf, uint16_t irRingBuf, uint16_t length, uint
 
 		esp01Flags.bit.TXCIPSEND = 1;
 		esp01Flags.bit.SENDINGDATA = 1;
+		esp01TimeoutSending = 500; // 5 segundos de timeout
 
 		if(aDbgStr != NULL){
 			aDbgStr("+&DBGSENDING DATA ");
@@ -462,6 +463,7 @@ static void ESP01ATDecode(){
 					if(value == '>'){
 						esp01Flags.bit.WAITINGSYMBOL = 0;
 						esp01TimeoutTxSymbol = 0;
+						if(aDbgStr) aDbgStr(">>> DEBUG: > received, sending payload\r\n");
 					}
 				}
 			}
@@ -529,6 +531,7 @@ static void ESP01ATDecode(){
 		            break;
 
 				case 3://ERROR
+					if(aDbgStr) aDbgStr(">>> DEBUG: ERROR received\r\n");
 					if(esp01Flags.bit.SENDINGDATA){
 						esp01Flags.bit.SENDINGDATA = 0;
 						esp01Flags.bit.UDPTCPCONNECTED = 0;
@@ -558,6 +561,7 @@ static void ESP01ATDecode(){
 					esp01Flags.bit.UDPTCPCONNECTED = 0;
 					break;
 				case 9://SEND OK
+					if(aDbgStr) aDbgStr(">>> DEBUG: SEND OK received\r\n");
 					esp01Flags.bit.SENDINGDATA = 0;
 					ESP01_NotifyStateChange(ESP01_SEND_OK);
 					break;
@@ -575,6 +579,7 @@ static void ESP01ATDecode(){
 					esp01Flags.bit.UDPTCPCONNECTED = 0;
 					break;
 				case 13://busy
+					if(aDbgStr) aDbgStr(">>> DEBUG: BUSY received\r\n");
 					esp01Flags.bit.UDPTCPCONNECTED = 0;
 					esp01Flags.bit.WIFICONNECTED = 0;
 					break;
@@ -1019,7 +1024,8 @@ static void ESP01SENDData(){
 				if(esp01TXATBuf[esp01irTX] == '>'){
 					esp01Flags.bit.TXCIPSEND = 0;
 					esp01Flags.bit.WAITINGSYMBOL = 1;
-					esp01TimeoutTxSymbol = 5;
+					esp01TimeoutTxSymbol = 20; // 200 ms
+					if(aDbgStr) aDbgStr(">>> DEBUG: CIPSEND sent, waiting for >\r\n");
 					// Si encontramos el fin de comando, incrementamos y salimos
 					// para respetar el WAITINGSYMBOL
 					esp01irTX++;
