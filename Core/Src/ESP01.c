@@ -22,6 +22,7 @@ extern void USB_Debug(const char *fmt, ...);
 #define ALIVE_INTERVAL_FAST_MS 	5000
 #define ALIVE_INTERVAL_SLOW_MS 	10000
 #define ALIVE_FAST_COUNT 		20
+#define ESP01_BURST_LIMIT       32
 
 static uint8_t alive_counter = 0;
 
@@ -995,6 +996,7 @@ static void ESP01DOConnection(){
 
 static void ESP01SENDData(){
 	uint8_t value;
+	uint8_t count = 0;
 
 	if(esp01Flags.bit.WAITINGSYMBOL){
 		if(!esp01TimeoutTxSymbol){
@@ -1005,7 +1007,8 @@ static void ESP01SENDData(){
 		}
 		return;
 	}
-	if(esp01irTX != esp01iwTX){
+
+	while ((esp01irTX != esp01iwTX) && (count < ESP01_BURST_LIMIT)) {
 		value = esp01TXATBuf[esp01irTX];
 		if(esp01Flags.bit.TXCIPSEND){
 			if(value == '>')
@@ -1017,11 +1020,22 @@ static void ESP01SENDData(){
 					esp01Flags.bit.TXCIPSEND = 0;
 					esp01Flags.bit.WAITINGSYMBOL = 1;
 					esp01TimeoutTxSymbol = 5;
+					// Si encontramos el fin de comando, incrementamos y salimos
+					// para respetar el WAITINGSYMBOL
+					esp01irTX++;
+					if(esp01irTX == ESP01TXBUFAT)
+						esp01irTX = 0;
+					return;
 				}
 			}
 			esp01irTX++;
 			if(esp01irTX == ESP01TXBUFAT)
 				esp01irTX = 0;
+
+			count++;
+		} else {
+			// UART ocupada
+			break;
 		}
 	}
 }

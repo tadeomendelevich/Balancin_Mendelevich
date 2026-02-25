@@ -1055,6 +1055,10 @@ int main(void)
     /* USER CODE BEGIN 3 */
 	  if(is2ms) {
 		  is2ms = 0;
+	  }
+
+	  if(is10ms) {
+		  is10ms = 0;
 
 		  // Iniciar lectura del sensor MPU6050
 		  if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
@@ -1077,13 +1081,13 @@ int main(void)
 
 			  // 1. Calculate Real DT
 			  uint32_t now_us = micros();
-			  if (last_ctrl_us == 0) last_ctrl_us = now_us - 2000; // Init safe value
+			  if (last_ctrl_us == 0) last_ctrl_us = now_us - 10000; // Init safe value (10ms)
 			  float dt = (float)(now_us - last_ctrl_us) * 1e-6f;
 			  last_ctrl_us = now_us;
 
 			  // Clamp DT to safe range
 			  if (dt < DT_MIN) dt = DT_MIN;
-			  if (dt > DT_MAX) dt = DT_MAX;
+			  if (dt > 0.02f) dt = 0.02f;
 
 			  // Signo consistente para TODO (probá +1.0f o -1.0f)
 			  const float ANG_SIGN = +1.0f;
@@ -1230,10 +1234,6 @@ int main(void)
 		  } else {
 			  MotorControl(0, 0);	// Apago motores
 		  }
-	  }
-
-	  if(is10ms) {
-		  is10ms = 0;
 
 		  ESP01_Timeout10ms();  	// Requerido por la librería ESP01
 		  ESP01_Task(); 	// Procesa tramas ESP01 recibidas
