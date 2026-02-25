@@ -157,13 +157,13 @@ static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrant
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
 
-const char *wifiSSID     = "FCAL";
-const char *wifiPassword = "fcalconcordia.06-2019";
-const char *wifiIp = "172.23.205.98";
+//const char *wifiSSID     = "FCAL";
+//const char *wifiPassword = "fcalconcordia.06-2019";
+//const char *wifiIp = "172.23.205.98";
 
-//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-//const char *wifiPassword = "djg19dlk";
-//const char *wifiIp 		 = "192.168.100.5";
+const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+const char *wifiPassword = "djg19dlk";
+const char *wifiIp 		 = "192.168.100.5";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
@@ -778,25 +778,34 @@ void updateDisplay(void) {
         if (dotPhase >= 3) dotPhase = 0;
 
         // --- Ícono WiFi o Cruz centrado en la zona superior ---
-        const uint16_t ix = 40;   // ajustá este valor para mover horizontalmente
-        const uint16_t iy = 1;
+        const uint16_t ix = 45;   // ajustá este valor para mover horizontalmente
+        const uint16_t iy = 2;
 
         if (f_wifi_connected) {
-            // Punto central (antena)
+
+            // Antena (centro)
             SSD1306_DrawPixel(ix + 3, iy + 6, SSD1306_COLOR_WHITE);
+
             // Arco pequeño
             SSD1306_DrawPixel(ix + 2, iy + 5, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 3, iy + 5, SSD1306_COLOR_WHITE);
             SSD1306_DrawPixel(ix + 4, iy + 5, SSD1306_COLOR_WHITE);
+
             // Arco mediano
-            SSD1306_DrawPixel(ix + 1, iy + 3, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 2, iy + 2, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 4, iy + 2, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 5, iy + 3, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 1, iy + 4, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 2, iy + 3, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 3, iy + 3, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 4, iy + 3, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 5, iy + 4, SSD1306_COLOR_WHITE);
+
             // Arco grande
-            SSD1306_DrawPixel(ix + 0, iy + 1, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 1, iy + 0, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 5, iy + 0, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 6, iy + 1, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 0, iy + 2, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 1, iy + 1, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 2, iy + 1, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 3, iy + 1, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 4, iy + 1, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 5, iy + 1, SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(ix + 6, iy + 2, SSD1306_COLOR_WHITE);
         } else {
             // Cruz (X) de 7x7 píxeles
             SSD1306_DrawPixel(ix + 0, iy + 0, SSD1306_COLOR_WHITE);

@@ -22,25 +22,7 @@ typedef struct __attribute__((packed)) {
 } WifiLogData_t;
 ```
 
-**Tamaño del Payload:** 28 bytes.
-
-2. Protocolo de Trama UNER
---------------------------
-La trama UDP completa tiene el siguiente formato:
-
-| Byte | Valor / Significado          |
-|------|------------------------------|
-| 0    | 'U'                          |
-| 1    | 'N'                          |
-| 2    | 'E'                          |
-| 3    | 'R'                          |
-| 4    | Longitud (Payload + 1) = 29  |
-| 5    | ':'                          |
-| 6    | CMD = 0xBB (CMD_WIFI_LOG_DATA)|
-| 7..34| Payload (WifiLogData_t)      |
-| 35   | Checksum (XOR)               |
-
-3. Configuración en Qt
+2. Configuración en Qt
 ----------------------
 Para recibir estos datos, necesitas un `QUdpSocket` escuchando en el puerto local configurado (por defecto 30000).
 
