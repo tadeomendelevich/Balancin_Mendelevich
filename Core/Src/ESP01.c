@@ -297,7 +297,7 @@ _eESP01STATUS ESP01_Send(uint8_t *buf, uint16_t irRingBuf, uint16_t length, uint
 
 		ESP01StrToBufTX(ATCIPSEND);
 		ESP01StrToBufTX(strInt);
-		ESP01StrToBufTX("\r\n");
+		ESP01StrToBufTX("\r>");
 
 
 		for(uint16_t i=0; i<length; i++){
