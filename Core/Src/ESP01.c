@@ -22,7 +22,7 @@ extern void USB_Debug(const char *fmt, ...);
 #define ALIVE_INTERVAL_FAST_MS 	5000
 #define ALIVE_INTERVAL_SLOW_MS 	10000
 #define ALIVE_FAST_COUNT 		20
-#define ESP01_BURST_LIMIT       32
+#define ESP01_BURST_LIMIT       8
 
 static uint8_t alive_counter = 0;
 
