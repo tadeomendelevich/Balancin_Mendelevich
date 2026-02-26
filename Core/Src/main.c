@@ -67,8 +67,8 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 10.0f
-#define KD 0.0f	// 0.12 antes
+#define KP 3.7f
+#define KD 0.15f
 #define KI 0.0f
 
 #define MOTOR_GAIN 3.0f
@@ -81,15 +81,19 @@
 
 // LOGGING MACROS
 #define LOG_ENABLE 1
-#define LOG_DECIM  5		// FRECUENCIA DE ENVIO
-#define LOG_WIFI_DECIM 10
+#define LOG_DECIM  5		// Frecuencia de envio de log csv mediante USB
+#define LOG_WIFI_DECIM 10	// Frecuencia de envio de log binario mediante WIFI
 
 // New Control Parameters
-#define BETA_G 0.15f        // LPF for Gyro
-#define BETA_A 0.1f         // LPF for Accel
+#define BETA_G 0.45f        // LPF for Gyro
+#define BETA_A 0.08f        // LPF for Accel
 #define I_MAX  100.0f       // Max Integral Term
 #define DT_MIN 0.0005f      // Min valid DT (0.5ms)
 #define DT_MAX 0.01f        // Max valid DT (10ms)
+
+// Fall detection (hysteresis)
+#define FALL_ANGLE      40.0f   // grados: detecta caída
+#define RECOVER_ANGLE   10.0f   // grados: condición para volver a balancear
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -188,6 +192,8 @@ static float accel_roll_f = 0.0f;
 float KP_value;
 float KD_value;
 float KI_value;
+float BETA_G_value;
+float BETA_A_value;
 
 uint8_t f_balancing = 0;	// En 0 (cero) desactiva los motores del PID y en 1 ativa los motores con el PID
 uint8_t f_resetMassCenter = 0; // Resetea el centro de gravedad en el cual el auto hace balance
@@ -201,6 +207,7 @@ uint8_t f_send_wifi_log = 0;
 
 static uint8_t dotPhase = 0;	// Variable estática para la animación de puntos
 static uint8_t f_wifi_connected = 0;
+static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -777,27 +784,23 @@ void updateDisplay(void) {
         dotPhase++;
         if (dotPhase >= 3) dotPhase = 0;
 
-        // --- Ícono WiFi o Cruz centrado en la zona superior ---
-        const uint16_t ix = 45;   // ajustá este valor para mover horizontalmente
+        // --- Ícono WiFi o Cruz ---
+        const uint16_t ix = 45;
         const uint16_t iy = 2;
 
         if (f_wifi_connected) {
-
             // Antena (centro)
             SSD1306_DrawPixel(ix + 3, iy + 6, SSD1306_COLOR_WHITE);
-
             // Arco pequeño
             SSD1306_DrawPixel(ix + 2, iy + 5, SSD1306_COLOR_WHITE);
             SSD1306_DrawPixel(ix + 3, iy + 5, SSD1306_COLOR_WHITE);
             SSD1306_DrawPixel(ix + 4, iy + 5, SSD1306_COLOR_WHITE);
-
             // Arco mediano
             SSD1306_DrawPixel(ix + 1, iy + 4, SSD1306_COLOR_WHITE);
             SSD1306_DrawPixel(ix + 2, iy + 3, SSD1306_COLOR_WHITE);
             SSD1306_DrawPixel(ix + 3, iy + 3, SSD1306_COLOR_WHITE);
             SSD1306_DrawPixel(ix + 4, iy + 3, SSD1306_COLOR_WHITE);
             SSD1306_DrawPixel(ix + 5, iy + 4, SSD1306_COLOR_WHITE);
-
             // Arco grande
             SSD1306_DrawPixel(ix + 0, iy + 2, SSD1306_COLOR_WHITE);
             SSD1306_DrawPixel(ix + 1, iy + 1, SSD1306_COLOR_WHITE);
@@ -841,7 +844,7 @@ void updateDisplay(void) {
             uint16_t y = y_start + i * 10;
             uint16_t x = 2;
 
-            // Etiqueta con SSD1306_DrawChar5x7
+            // Etiqueta
             for (const char *p = labels[i]; *p; p++) {
                 if (*p == ':') {
                     SSD1306_DrawPixel(x + 1, y + 1, SSD1306_COLOR_WHITE);
@@ -868,22 +871,24 @@ void updateDisplay(void) {
     }
 
     // -------------------------------------------------------
-    // Mitad derecha: PID + barras ADC
+    // Mitad derecha: P, D, I, BETA_G, BETA_A + barras ADC
     // -------------------------------------------------------
     {
         const uint16_t rx = SCREEN_W / 2 + 2;
 
-        const char *pid_labels[3] = { "P:", "D:", "I:" };
-        float       pid_vals[3]   = { KP_value, KD_value, KI_value };
+        // --- 5 filas de parámetros con Font_7x10 (cada fila ~10px) ---
+        const char *param_labels[5] = { "P:", "D:", "I:", "BG:", "BA:" };
+        float       param_vals[5]   = { KP_value, KD_value, KI_value,
+                                        BETA_G_value, BETA_A_value };
 
-        for (uint8_t i = 0; i < 3; i++) {
+        for (uint8_t i = 0; i < 5; i++) {
             uint16_t y = 1 + i * 10;
 
             SSD1306_GotoXY(rx, y);
-            SSD1306_Puts(pid_labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
+            SSD1306_Puts(param_labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
 
             char fbuf[8];
-            float v = pid_vals[i];
+            float v = param_vals[i];
             uint8_t neg = (v < 0);
             if (neg) v = -v;
             uint32_t int_part  = (uint32_t)v;
@@ -895,21 +900,27 @@ void updateDisplay(void) {
                 snprintf(fbuf, sizeof(fbuf), "%lu.%02lu",
                          (unsigned long)int_part, (unsigned long)frac_part);
 
-            SSD1306_GotoXY(rx + 2 * Font_7x10.FontWidth, y);
+            // P: y D: tienen 2 chars, BG: y BA: tienen 3 chars → offset dinámico
+            uint16_t label_w = (i < 2) ? 2 * Font_7x10.FontWidth   // "P:" "D:" "I:"
+                                        : 3 * Font_7x10.FontWidth;  // "BG:" "BA:"
+            SSD1306_GotoXY(rx + label_w, y);
             SSD1306_Puts(fbuf, &Font_7x10, SSD1306_COLOR_WHITE);
         }
 
-        uint16_t sep_y = 32;
+        // --- Línea separadora después de las 5 filas (y=52) ---
+        uint16_t sep_y = 52;
         SSD1306_DrawLine(SCREEN_W/2, sep_y, SCREEN_W - 1, sep_y, SSD1306_COLOR_WHITE);
 
+        // --- Barras ADC en el espacio restante ---
+        // Disponible: 64 - 52 - 1(sep) - 7(digit) = ~4px de altura máxima de barra
         const uint16_t bar_region_y = sep_y + 2;
-        const uint16_t digit_h      = Font_5x7.FontHeight + 2;
-        const uint16_t bar_region_h = SCREEN_H - bar_region_y - digit_h;
-        const uint16_t bar_max_h    = (bar_region_h / 2) + 10;
+        const uint16_t digit_h      = Font_5x7.FontHeight;           // 7px
+        const uint16_t bar_region_h = SCREEN_H - bar_region_y - digit_h; // ~3-4px
+        const uint16_t bar_max_h    = (bar_region_h > 0) ? bar_region_h : 1;
         const uint16_t bar_base_y   = bar_region_y + bar_region_h - 1;
 
         const uint16_t rw          = SCREEN_W / 2 - 1;
-        const uint16_t bar_spacing = BAR_SPACING;
+        const uint16_t bar_spacing = 1;
         const uint16_t bar_width   = (rw - (BAR_COUNT + 1) * bar_spacing) / BAR_COUNT;
 
         for (uint8_t i = 0; i < BAR_COUNT; i++) {
@@ -920,10 +931,11 @@ void updateDisplay(void) {
             if (h > 0)
                 SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
 
+            // Número debajo de cada barra
             uint16_t tx = x0 + (bar_width > Font_5x7.FontWidth
                                  ? (bar_width - Font_5x7.FontWidth) / 2 : 0);
             uint16_t ty = bar_base_y + 2;
-            SSD1306_DrawChar5x7('1' + i, tx, ty);   // dígitos 1-8 bajo cada barra
+            SSD1306_DrawChar5x7('1' + i, tx, ty);
         }
     }
 
@@ -1009,7 +1021,7 @@ int main(void)
   UNER_RegisterADCBuffer(adcAvg, 8);  // array adcValues[8]
   UNER_RegisterMotorSpeed(&motorRightVelocity, &motorLeftVelocity);
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
-  UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value);
+  UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &BETA_G_value, &BETA_A_value);
   UNER_RegisterSteering(&steering_adjustment);
   UNER_RegisterFlags(&f_balancing, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log);
 
@@ -1045,6 +1057,8 @@ int main(void)
   KP_value = KP;
   KD_value = KD;
   KI_value = KI;
+  BETA_G_value = BETA_G;
+  BETA_A_value = BETA_A;
 
   // Initialize DWT for micros()
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -1063,217 +1077,223 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 	  if(is2ms) {
-		  is2ms = 0;
+	      is2ms = 0;
+
+	      if (MPU6050_IsDataReady()) {
+	          MPU6050_ClearDataReady();
+
+	          MPU6050_GetAccel(&ax, &ay, &az);
+	          MPU6050_GetGyro(&gx, &gy, &gz);
+
+	          // 1. Calculate Real DT
+	          uint32_t now_us = micros();
+	          if (last_ctrl_us == 0) last_ctrl_us = now_us - 2000;
+	          float dt = (float)(now_us - last_ctrl_us) * 1e-6f;
+	          last_ctrl_us = now_us;
+
+	          if (dt < DT_MIN) dt = DT_MIN;
+	          if (dt > 0.005f) dt = 0.005f;
+
+	          const float ANG_SIGN = +1.0f;
+
+	          // 2) Gyro LPF
+	          float gyro_rate_dps = ANG_SIGN * ((float)gx / 131.0f);
+	          gyro_f += BETA_G_value * (gyro_rate_dps - gyro_f);
+
+	          // 3) Accel angle (roll) LPF
+	          float accel_ang_deg = ANG_SIGN * (atan2f(ay, az) * (180.0f / M_PI));
+	          accel_roll_f += BETA_A_value * (accel_ang_deg - accel_roll_f);
+
+	          // 4. Complementary Filter
+	          filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt) + (1.0f - ALPHA) * accel_roll_f;
+
+	          // -------------------------------------------------------
+	          // FALL DETECTION - Hysteresis
+	          // -------------------------------------------------------
+	          float abs_roll = fabsf(filtered_roll_deg);
+
+	          if (!f_fallen) {
+	              if (abs_roll > FALL_ANGLE) {
+	                  f_fallen = 1;
+	                  integral = 0.0f;
+	              }
+	          } else {
+	              if (abs_roll < RECOVER_ANGLE) {
+	                  f_fallen = 0;
+	              }
+	          }
+
+	          // Declarar todas las variables de PID ANTES del if
+	          float error   = SETPOINT_ANGLE - filtered_roll_deg;
+	          float p_term  = 0.0f;
+	          float i_term  = 0.0f;
+	          float d_term  = 0.0f;
+	          float output  = 0.0f;
+	          float pwm_cmd = 0.0f;
+	          float pwm_sat = 0.0f;
+	          uint8_t sat_flag = 0;
+
+	          // PID (solo si no está caído)
+	          if (!f_fallen) {
+	              p_term = KP_value * error;
+	              i_term = KI_value * integral;
+	              d_term = -KD_value * gyro_f;
+	              output = p_term + i_term + d_term;
+
+	              pwm_cmd = output * MOTOR_GAIN;
+	              pwm_sat = pwm_cmd;
+
+	              if (pwm_sat >  100.0f) { pwm_sat =  100.0f; sat_flag = 1; }
+	              if (pwm_sat < -100.0f) { pwm_sat = -100.0f; sat_flag = 1; }
+
+	              // Smart Anti-Windup
+	              if (sat_flag == 0) {
+	                  integral += error * dt;
+	              } else {
+	                  if (pwm_cmd >  100.0f && error < 0) integral += error * dt;
+	                  else if (pwm_cmd < -100.0f && error > 0) integral += error * dt;
+	              }
+
+	              if (integral >  I_MAX) integral =  I_MAX;
+	              if (integral < -I_MAX) integral = -I_MAX;
+
+	              float mR = pwm_sat + steering_adjustment;
+	              float mL = pwm_sat - steering_adjustment;
+
+	              if (mR >  100.0f) mR =  100.0f;
+	              if (mR < -100.0f) mR = -100.0f;
+	              if (mL >  100.0f) mL =  100.0f;
+	              if (mL < -100.0f) mL = -100.0f;
+
+	              motorRightVelocity = -(int16_t)mR;
+	              motorLeftVelocity  = -(int16_t)mL;
+	          } else {
+	              motorRightVelocity = 0;
+	              motorLeftVelocity  = 0;
+	          }
+
+	          roll_deg = filtered_roll_deg;
+
+	          // --- LOGGING ---
+	          log_counter++;
+
+	          // --- WIFI LOGGING ---
+	          if (f_send_wifi_log && (log_counter % LOG_WIFI_DECIM == 0)) {
+	              WifiLogData_t wlog;
+	              wlog.t_ms       = HAL_GetTick();
+	              wlog.roll_filt  = filtered_roll_deg;
+	              wlog.output     = output;
+	              wlog.p_term     = p_term;
+	              wlog.i_term     = i_term;
+	              wlog.d_term     = d_term;
+	              wlog.mR         = motorRightVelocity;
+	              wlog.mL         = motorLeftVelocity;
+	              wlog.dt_ctrl_us = (uint32_t)(dt * 1000000.0f);
+	              UNER_SendWifiLogData(&wlog);
+	          }
+
+	          // --- CSV LOGGING ---
+	          if (LOG_ENABLE && f_send_csv_log && (log_counter % LOG_DECIM == 0)) {
+	              uint32_t dt_ctrl_us = (uint32_t)(dt * 1000000.0f);
+	              uint32_t t_now_log  = micros();
+	              uint32_t dt_log_us  = t_now_log - last_log_us;
+	              last_log_us = t_now_log;
+	              uint32_t t_ms = HAL_GetTick();
+
+	              if (!log_header_sent) {
+	                  char *header = "t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n";
+	                  usb_enqueue_tx((uint8_t*)header, strlen(header));
+	                  log_header_sent = 1;
+	              }
+
+	              float ay_f_log = (float)ay;
+	              float az_f_log = (float)az;
+	              float denom = sqrtf(ay_f_log*ay_f_log + az_f_log*az_f_log);
+	              float accel_pitch_deg = atan2f(-ax, denom) * (180.0f / M_PI);
+
+	              char line[256];
+	              int32_t accel_mdeg   = (int32_t)(accel_ang_deg  * 1000.0f);
+	              int32_t accel_f_mdeg = (int32_t)(accel_roll_f   * 1000.0f);
+	              int32_t gyro_mdps    = (int32_t)(gyro_rate_dps  * 1000.0f);
+	              int32_t gyro_f_mdps  = (int32_t)(gyro_f         * 1000.0f);
+	              int32_t roll_mdeg    = (int32_t)(filtered_roll_deg * 1000.0f);
+	              int32_t error_mdeg   = (int32_t)(error           * 1000.0f);
+	              int32_t p_m          = (int32_t)(p_term          * 1000.0f);
+	              int32_t i_m          = (int32_t)(i_term          * 1000.0f);
+	              int32_t d_m          = (int32_t)(d_term          * 1000.0f);
+	              int32_t out_m        = (int32_t)(output          * 1000.0f);
+	              int32_t pwm_cmd_c    = (int32_t)(pwm_cmd         * 100.0f);
+	              int32_t pwm_sat_c    = (int32_t)(pwm_sat         * 100.0f);
+	              int32_t pitch_mdeg   = (int32_t)(accel_pitch_deg * 1000.0f);
+
+	              int len = snprintf(line, sizeof(line),
+	                  "%lu,%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%d,%ld,%d,%d,%d,%d,%d,%d\r\n",
+	                  t_ms, dt_log_us, dt_ctrl_us,
+	                  accel_mdeg, accel_f_mdeg, gyro_mdps, gyro_f_mdps, roll_mdeg, error_mdeg,
+	                  p_m, i_m, d_m, out_m,
+	                  pwm_cmd_c, pwm_sat_c, sat_flag,
+	                  motorRightVelocity, motorLeftVelocity,
+	                  pitch_mdeg, ax, ay, az, gx, gy, gz
+	              );
+	              if (len > 0) usb_enqueue_tx((uint8_t*)line, len);
+	          }
+
+	          // Lanzar próxima lectura DMA al final del procesamiento
+	          if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
+	              MPU6050_StartRead_DMA();
+	          }
+
+	      } else {
+	          // Primer tick o dato no listo: lanzar DMA
+	          if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
+	              MPU6050_StartRead_DMA();
+	          }
+	      }
+
+	      // Motores: apagar si caído O si f_balancing desactivado
+	      if (f_balancing && !f_fallen) {
+	          MotorControl(motorRightVelocity, motorLeftVelocity);
+	      } else {
+	          MotorControl(0, 0);
+	      }
 	  }
 
 	  if(is10ms) {
-		  is10ms = 0;
+	      is10ms = 0;
 
-		  // Iniciar lectura del sensor MPU6050
-		  if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
-			  MPU6050_StartRead_DMA();
-		  }
+	      // -------------------------------------------------------
+	      // BLOQUE 10ms: Comunicaciones, display, ADC, tareas lentas
+	      // -------------------------------------------------------
 
-		  // Comprobar si hay datos listos
-		  if (MPU6050_IsDataReady()) {
-			  MPU6050_ClearDataReady();
-			  mpuDataReady = 1;
-		  }
+	      ESP01_Timeout10ms();
+	      ESP01_Task();
 
-		  if (mpuDataReady) {
-			  mpuDataReady = 0;
-			  MPU6050_GetAccel(&ax, &ay, &az);
-			  MPU6050_GetGyro(&gx, &gy, &gz);
+	      tmo100ms--;
+	      if (tmo100ms == 0) {
+	          tmo100ms = 10;
+	          HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+	          HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_10);
+	      }
 
-			  // EMA, filtro complementario, control PD...
-			  // --- Complementary Filter & PID Control ---
+	      sendModulesCounter++;
+	      if (sendModulesCounter >= 20) {
+	          sendModulesCounter = 0;
+	          if (UNER_ShouldSendAllSensors()) {
+	              UNER_SendAllSensors();
+	          }
+	      }
 
-			  // 1. Calculate Real DT
-			  uint32_t now_us = micros();
-			  if (last_ctrl_us == 0) last_ctrl_us = now_us - 10000; // Init safe value (10ms)
-			  float dt = (float)(now_us - last_ctrl_us) * 1e-6f;
-			  last_ctrl_us = now_us;
+	      UpdateADC_MovingAverage();
+	      if (SSD1306_IsUpdateDone()) {
+	          updateDisplay();
+	      }
 
-			  // Clamp DT to safe range
-			  if (dt < DT_MIN) dt = DT_MIN;
-			  if (dt > 0.02f) dt = 0.02f;
-
-			  // Signo consistente para TODO (probá +1.0f o -1.0f)
-			  const float ANG_SIGN = +1.0f;
-
-			  // 2) Gyro (mismo eje que tu "roll" de accel)
-			  float gyro_rate_dps = ANG_SIGN * ((float)gx / 131.0f);
-			  gyro_f += BETA_G * (gyro_rate_dps - gyro_f);
-
-			  // 3) Accel angle (roll)
-			  float accel_ang_deg = ANG_SIGN * (atan2f(ay, az) * (180.0f / M_PI));
-			  accel_roll_f += BETA_A * (accel_ang_deg - accel_roll_f);
-
-			  // 4. Complementary Filter
-			  filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt) + (1.0f - ALPHA) * accel_roll_f;
-
-			  // PID Calculations
-			  float error = SETPOINT_ANGLE - filtered_roll_deg;
-
-			  // Terms Calculation
-			  float p_term = KP_value * error;
-			  float i_term = KI_value * integral;       // Use accumulated integral
-			  float d_term = -KD_value * gyro_f;        // Derivative on Measurement
-
-			  float output = p_term + i_term + d_term;
-			  // 2. Filter Gyro (Low Pass Filter)  ->  GX
-			  // Motor Command & Saturation
-			  float pwm_cmd = output * MOTOR_GAIN;
-			  float pwm_sat = pwm_cmd;
-			  uint8_t sat_flag = 0;
-
-			  if (pwm_sat > 100.0f)  { pwm_sat = 100.0f; sat_flag = 1; }
-			  if (pwm_sat < -100.0f) { pwm_sat = -100.0f; sat_flag = 1; }
-
-			  // Smart Anti-Windup (Conditional Integration)
-			  if (sat_flag == 0) {
-				  integral += error * dt;
-			  } else {
-				  // Only integrate if it helps desaturate
-				  if (pwm_cmd > 100.0f && error < 0) {
-					  integral += error * dt;
-				  } else if (pwm_cmd < -100.0f && error > 0) {
-					  integral += error * dt;
-				  }
-			  }
-
-			  // Final Integral Clamp
-			  if (integral > I_MAX) integral = I_MAX;
-			  else if (integral < -I_MAX) integral = -I_MAX;
-
-			  // Apply Steering & Final Motor Saturation
-			  float mR = pwm_sat + steering_adjustment;
-			  float mL = pwm_sat - steering_adjustment;
-
-			  if (mR > 100.0f) mR = 100.0f;
-			  if (mR < -100.0f) mR = -100.0f;
-			  if (mL > 100.0f) mL = 100.0f;
-			  if (mL < -100.0f) mL = -100.0f;
-
-			  motorRightVelocity = -(int16_t)mR;
-			  motorLeftVelocity  = -(int16_t)mL;
-
-			  // Actualizar variables para reporte
-			  roll_deg = filtered_roll_deg;
-
-			  // --- LOGGING ---
-              log_counter++;
-
-              // --- WIFI LOGGING ---
-              if (f_send_wifi_log && (log_counter % LOG_WIFI_DECIM == 0)) {
-                  WifiLogData_t wlog;
-                  wlog.t_ms = HAL_GetTick();
-                  wlog.roll_filt = filtered_roll_deg;
-                  wlog.output = output;
-                  wlog.p_term = p_term;
-                  wlog.i_term = i_term;
-                  wlog.d_term = d_term;
-                  wlog.mR = motorRightVelocity;
-                  wlog.mL = motorLeftVelocity;
-
-                  UNER_SendWifiLogData(&wlog);
-              }
-
-              if (LOG_ENABLE && f_send_csv_log && (log_counter % LOG_DECIM == 0)) {
-                  // Reuse now_us from control loop for consistency or take new one?
-                  // Original took new micros(). Let's stick to that but we can log dt of control.
-                  // dt_ctrl_us is the dt used in control loop
-                  uint32_t dt_ctrl_us = (uint32_t)(dt * 1000000.0f);
-
-                  uint32_t t_now_log = micros();
-                  uint32_t dt_log_us = t_now_log - last_log_us;
-                  last_log_us = t_now_log;
-                  uint32_t t_ms = HAL_GetTick();
-
-                  // 1. USB CSV Logging
-                  if (!log_header_sent) {
-                      char *header = "t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n";
-                      usb_enqueue_tx((uint8_t*)header, strlen(header));
-                      log_header_sent = 1;
-                  }
-
-                  // Calculate pitch for logging (using same math as calculate_tilt)
-                  float ay_f_log = (float)ay;
-                  float az_f_log = (float)az;
-                  float denom = sqrtf(ay_f_log*ay_f_log + az_f_log*az_f_log);
-                  float accel_pitch_deg = atan2f(-ax, denom) * (180.0f / M_PI);
-
-                  char line[256];
-                  // Scale floats to integers for lightweight formatting
-                  // Angles/Error: x1000 (milli-degrees)
-                  // PID/Output: x1000
-                  // PWM: x100
-                  int32_t accel_mdeg   = (int32_t)(accel_ang_deg * 1000.0f);
-                  int32_t accel_f_mdeg = (int32_t)(accel_roll_f * 1000.0f);
-                  int32_t gyro_mdps    = (int32_t)(gyro_rate_dps * 1000.0f);
-                  int32_t gyro_f_mdps  = (int32_t)(gyro_f * 1000.0f);
-                  int32_t roll_mdeg    = (int32_t)(filtered_roll_deg * 1000.0f);
-                  int32_t error_mdeg   = (int32_t)(error * 1000.0f);
-                  int32_t p_m          = (int32_t)(p_term * 1000.0f);
-                  int32_t i_m          = (int32_t)(i_term * 1000.0f);
-                  int32_t d_m          = (int32_t)(d_term * 1000.0f);
-                  int32_t out_m        = (int32_t)(output * 1000.0f);
-                  int32_t pwm_cmd_c    = (int32_t)(pwm_cmd * 100.0f);
-                  int32_t pwm_sat_c    = (int32_t)(pwm_sat * 100.0f);
-                  int32_t pitch_mdeg   = (int32_t)(accel_pitch_deg * 1000.0f);
-
-                  int len = snprintf(line, sizeof(line),
-                      "%lu,%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%d,%ld,%d,%d,%d,%d,%d,%d\r\n",
-                      t_ms, dt_log_us, dt_ctrl_us,
-                      accel_mdeg, accel_f_mdeg, gyro_mdps, gyro_f_mdps, roll_mdeg, error_mdeg,
-                      p_m, i_m, d_m, out_m,
-                      pwm_cmd_c, pwm_sat_c, sat_flag,
-                      motorRightVelocity, motorLeftVelocity,
-					  pitch_mdeg, ax, ay, az, gx, gy, gz
-                  );
-
-                  if (len > 0) {
-                      usb_enqueue_tx((uint8_t*)line, len);
-                  }
-              }
-		  }
-
-		  if(f_balancing) { // Si estoy en modo balanceo
-			  MotorControl(motorRightVelocity, motorLeftVelocity);	// Actualizo motores con valores de PID
-		  } else {
-			  MotorControl(0, 0);	// Apago motores
-		  }
-
-		  ESP01_Timeout10ms();  	// Requerido por la librería ESP01
-		  ESP01_Task(); 	// Procesa tramas ESP01 recibidas
-
-		  tmo100ms--;
-		  if (tmo100ms == 0) {
-			  tmo100ms = 10;
-			  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin); // Blink LED
-			  HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_10);     // Blink LED PB10
-		  }
-
-		  sendModulesCounter++;
-		  if (sendModulesCounter >= 20) {
-			  sendModulesCounter = 0;
-			  if (UNER_ShouldSendAllSensors()) {
-				  UNER_SendAllSensors();
-			  }
-		  }
-
-		  // La lógica de ADC y Display se queda aquí para no sobrecargar el bucle rápido
-		  UpdateADC_MovingAverage();
-		  if (SSD1306_IsUpdateDone()) {
-			  updateDisplay();
-		  }
-
-		  if (f_resetMassCenter) {
-			  if (!i2c1_tx_busy) {
-				  MPU6050_Calibrate();		// Calibración del mpu para restablecer el centro de gravedad y balance del auto
-				  f_resetMassCenter = 0;
-			  }
-		  }
+	      if (f_resetMassCenter) {
+	          if (!i2c1_tx_busy) {
+	              MPU6050_Calibrate();
+	              f_resetMassCenter = 0;
+	          }
+	      }
 	  }
 
 	  while ((esp01IwRx - esp01IrRx) & UDP_RX_MASK) {
@@ -1814,7 +1834,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2|LED_BLINKER_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
@@ -1823,8 +1843,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PB2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  /*Configure GPIO pins : PB2 LED_BLINKER_Pin */
+  GPIO_InitStruct.Pin = GPIO_PIN_2|LED_BLINKER_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;

@@ -49,6 +49,8 @@ static int16_t *p_motorLeftVel  = NULL;
 static float *p_KP = NULL;		// Punteros a las variables de control proporcional en main.c
 static float *p_KD  = NULL;
 static float *p_KI  = NULL;
+static float *p_BETA_G  = NULL;
+static float *p_BETA_A  = NULL;
 
 static float *p_roll  = NULL;	// Punteros a las variables de inclinacion en main.c
 static float *p_pitch = NULL;
@@ -511,6 +513,32 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
             }
         break;
 
+        case MODIFY_BETA_G:
+			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
+			float new_BETA_G = myWord.f32;
+			if (p_BETA_G) *p_BETA_G = new_BETA_G;
+
+			putHeaderOnTx(dataTx, MODIFY_BETA_G, 2);
+			putByteOnTx(dataTx, ACK);
+			putByteOnTx(dataTx, dataTx->chk);
+		break;
+
+        case MODIFY_BETA_A:
+			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
+			float new_BETA_A = myWord.f32;
+			if (p_BETA_A) *p_BETA_A = new_BETA_A;
+
+			putHeaderOnTx(dataTx, MODIFY_BETA_A, 2);
+			putByteOnTx(dataTx, ACK);
+			putByteOnTx(dataTx, dataTx->chk);
+		break;
+
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
@@ -709,10 +737,12 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr) {
     p_motorLeftVel  = leftPtr;
 }
 
-void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr) {
+void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *BETA_G_Ptr, float *BETA_A_Ptr) {
     p_KP  = kpPtr;
     p_KD  = kdPtr;
     p_KI  = kiPtr;
+    p_BETA_G = BETA_G_Ptr;
+	p_BETA_A = BETA_A_Ptr;
 }
 
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr)
@@ -764,7 +794,7 @@ void UNER_SendWifiLogData(WifiLogData_t *data) {
     unerTx->indexR = 0;
     unerTx->chk    = 0;
 
-    putHeaderOnTx(unerTx, CMD_WIFI_LOG_DATA, 29);
+    putHeaderOnTx(unerTx, CMD_WIFI_LOG_DATA, 33);
 
     uint8_t *p = (uint8_t*)data;
     for (uint8_t i = 0; i < payloadLen; i++) {

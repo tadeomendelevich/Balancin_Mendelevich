@@ -59,6 +59,8 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define LED_BLINKER_Pin GPIO_PIN_10
+#define LED_BLINKER_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

@@ -111,6 +111,8 @@ typedef enum{
 	ACTIVATE_CSV_LOG = 0xB9,
     ACTIVATE_WIFI_LOG = 0xBA,
     CMD_WIFI_LOG_DATA = 0xBB,
+	MODIFY_BETA_G = 0xBC,
+	MODIFY_BETA_A = 0xBD,
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -142,6 +144,7 @@ typedef struct __attribute__((packed)) {
     float d_term;
     int16_t mR;
     int16_t mL;
+    uint32_t dt_ctrl_us;
 } WifiLogData_t;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr);
@@ -182,7 +185,7 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr);
 
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr);
 
-void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr);
+void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *BETA_G_Ptr, float *BETA_A_Ptr);
 
 void UNER_RegisterSteering(float *steeringPtr);
 
