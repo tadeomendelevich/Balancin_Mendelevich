@@ -25,6 +25,7 @@ extern void USB_Debug(const char *fmt, ...);
 #define ESP01_BURST_LIMIT       8
 
 static uint8_t alive_counter = 0;
+static uint16_t connection_watchdog = 0;
 
 static enum {
 	ESP01ATIDLE,
@@ -339,6 +340,7 @@ void ESP01_Init(_sESP01Handle *hESP01){
 	esp01irRXAT = 0;
 	esp01iwRXAT = 0;
 	esp01Flags.byte = 0;
+    connection_watchdog = 0;
 }
 
 
@@ -365,6 +367,22 @@ void ESP01_Timeout10ms(){
 }
 
 void ESP01_Task(){
+    // --- Connection Watchdog ---
+    // If we are supposed to be connected (or connecting) but not yet successfully connected, increment watchdog.
+    // We reset it if we are IDLE (no wifi set) or if UDPTCPCONNECTED is true.
+    if (esp01Flags.bit.UDPTCPCONNECTED || esp01ATSate == ESP01ATIDLE) {
+        connection_watchdog = 0;
+    } else {
+        connection_watchdog++;
+        // 2000 ticks * 10ms = 20 seconds
+        if (connection_watchdog > 2000) {
+            if(aDbgStr) aDbgStr(">>> WATCHDOG TIMEOUT: Resetting ESP01...\r\n");
+            connection_watchdog = 0;
+            esp01ATSate = ESP01ATHARDRST0;
+            esp01TimeoutTask = 0;
+            esp01TriesAT = 0;
+        }
+    }
 
 	if(esp01irRXAT != esp01iwRXAT)
 		ESP01ATDecode();

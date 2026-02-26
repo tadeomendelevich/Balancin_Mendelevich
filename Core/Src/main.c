@@ -267,6 +267,44 @@ static inline uint32_t micros(void) {
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static char* fast_cat_int(char* buf, int32_t val) {
+    if (val < 0) {
+        *buf++ = '-';
+        val = -val;
+    }
+    char tmp[12];
+    int i = 0;
+    if (val == 0) {
+        tmp[i++] = '0';
+    } else {
+        while (val > 0) {
+            tmp[i++] = (val % 10) + '0';
+            val /= 10;
+        }
+    }
+    while (i > 0) {
+        *buf++ = tmp[--i];
+    }
+    return buf;
+}
+
+static char* fast_cat_uint(char* buf, uint32_t val) {
+    char tmp[12];
+    int i = 0;
+    if (val == 0) {
+        tmp[i++] = '0';
+    } else {
+        while (val > 0) {
+            tmp[i++] = (val % 10) + '0';
+            val /= 10;
+        }
+    }
+    while (i > 0) {
+        *buf++ = tmp[--i];
+    }
+    return buf;
+}
+
 SSD1306_Ctx_t ssd_ctx = {
   .hi2c      = &hi2c1,
   .busy_flag = &i2c1_tx_busy
@@ -1226,16 +1264,36 @@ int main(void)
 	              int32_t pwm_sat_c    = (int32_t)(pwm_sat         * 100.0f);
 	              int32_t pitch_mdeg   = (int32_t)(accel_pitch_deg * 1000.0f);
 
-	              int len = snprintf(line, sizeof(line),
-	                  "%lu,%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%d,%ld,%d,%d,%d,%d,%d,%d\r\n",
-	                  t_ms, dt_log_us, dt_ctrl_us,
-	                  accel_mdeg, accel_f_mdeg, gyro_mdps, gyro_f_mdps, roll_mdeg, error_mdeg,
-	                  p_m, i_m, d_m, out_m,
-	                  pwm_cmd_c, pwm_sat_c, sat_flag,
-	                  motorRightVelocity, motorLeftVelocity,
-	                  pitch_mdeg, ax, ay, az, gx, gy, gz
-	              );
-	              if (len > 0) usb_enqueue_tx((uint8_t*)line, len);
+	              char *ptr = line;
+	              ptr = fast_cat_uint(ptr, t_ms); *ptr++ = ',';
+	              ptr = fast_cat_uint(ptr, dt_log_us); *ptr++ = ',';
+	              ptr = fast_cat_uint(ptr, dt_ctrl_us); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, accel_mdeg); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, accel_f_mdeg); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, gyro_mdps); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, gyro_f_mdps); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, roll_mdeg); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, error_mdeg); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, p_m); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, i_m); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, d_m); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, out_m); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, pwm_cmd_c); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, pwm_sat_c); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, sat_flag); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, motorRightVelocity); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, motorLeftVelocity); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, pitch_mdeg); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, ax); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, ay); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, az); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, gx); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, gy); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, gz);
+	              *ptr++ = '\r';
+	              *ptr++ = '\n';
+
+	              usb_enqueue_tx((uint8_t*)line, (uint16_t)(ptr - line));
 	          }
 
 	          // Lanzar próxima lectura DMA al final del procesamiento
@@ -1284,8 +1342,14 @@ int main(void)
 	      }
 
 	      UpdateADC_MovingAverage();
-	      if (SSD1306_IsUpdateDone()) {
-	          updateDisplay();
+
+	      static uint8_t display_timer = 0;
+	      display_timer++;
+	      if (display_timer >= 5) { // 50ms (20Hz) refresh rate
+		  display_timer = 0;
+		      if (SSD1306_IsUpdateDone()) {
+		          updateDisplay();
+		      }
 	      }
 
 	      if (f_resetMassCenter) {
