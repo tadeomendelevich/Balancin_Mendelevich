@@ -57,6 +57,8 @@ typedef struct {
 #define ACCEL_XOUT_H_REG     0x3B  // Dirección base de lectura del acelerómetro
 #define GYRO_XOUT_H_REG      0x43  // Dirección base de lectura del giroscopio
 
+#define MPU6050_READ_SIZE    14    // 6 bytes Accel + 2 bytes Temp + 6 bytes Gyro
+
 // ------------------------------------------------------
 // ➤ Offsets digitales para calibración (medidos en reposo)
 // ------------------------------------------------------
@@ -96,7 +98,7 @@ uint8_t MPU6050_WhoAmI(void);
  */
 int MPU6050_Init(void);
 
-// Lanza lectura no bloqueante por DMA
+// Lanza lectura no bloqueante por DMA (lee 14 bytes: Accel, Temp, Gyro)
 void MPU6050_StartRead_DMA(void);
 
 // --------------------------------------------

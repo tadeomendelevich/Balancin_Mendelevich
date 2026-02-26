@@ -23,9 +23,6 @@ void MPU6050_RegisterPlatform(MPU6050_Platform_t *plat) {
     _platform = plat;
 }
 
-// 0 = Acelerómetro, 1 = Giroscopio
-static volatile uint8_t current_read_sensor = 0;
-
 // Variables convertidas a unidades físicas con escala ×100 (2 decimales fijos)
 int16_t ax_real; // Aceleración en X [centésimas de m/s²]
 int16_t ay_real;
@@ -35,12 +32,11 @@ int16_t gx_real; // Velocidad angular en X [centésimas de grados/segundo]
 int16_t gy_real;
 int16_t gz_real;
 
-// Buffers de recepción
-uint8_t accel_buf[6];
-uint8_t gyro_buf[6];
+// Buffer de recepción único (Accel + Temp + Gyro = 14 bytes)
+uint8_t mpu_dma_buffer[MPU6050_READ_SIZE];
 
 // Flags de estado
-uint8_t mpu_gyro_ready  = 0;
+uint8_t mpu_data_ready  = 0;
 
 // Variables RAW leídas directamente del sensor (int16_t = complemento a dos)
 int32_t ax, ay, az, gx, gy, gz;
@@ -75,16 +71,16 @@ int MPU6050_Init(void)
 
 
 void MPU6050_StartRead_DMA(void) {
-    current_read_sensor = 0; // Empezar por el acelerómetro
-    _platform->readRegDMA(_platform->ctx, MPU6050_ADDR, ACCEL_XOUT_H_REG, accel_buf, 6);
+    // Lectura en ráfaga de 14 bytes empezando en ACCEL_XOUT_H (0x3B)
+    _platform->readRegDMA(_platform->ctx, MPU6050_ADDR, ACCEL_XOUT_H_REG, mpu_dma_buffer, MPU6050_READ_SIZE);
 }
 
 uint8_t MPU6050_IsDataReady(void) {
-    return mpu_gyro_ready;
+    return mpu_data_ready;
 }
 
 void MPU6050_ClearDataReady(void) {
-    mpu_gyro_ready = 0;
+    mpu_data_ready = 0;
 }
 
 void MPU6050_GetAccel(int16_t *ax, int16_t *ay, int16_t *az) {
@@ -100,72 +96,71 @@ void MPU6050_GetGyro(int16_t *gx, int16_t *gy, int16_t *gz) {
 }
 
 void MPU6050_ProcessDMA(void) {
-	if (current_read_sensor == 0) { // Acelerómetro
-		// --- Procesar acelerómetro ---
-		int16_t raw_ax = (int16_t)(accel_buf[0] << 8 | accel_buf[1]);
-		int16_t raw_ay = (int16_t)(accel_buf[2] << 8 | accel_buf[3]);
-		int16_t raw_az = (int16_t)(accel_buf[4] << 8 | accel_buf[5]);
+    // --- Procesar Acelerómetro (bytes 0-5) ---
+    int16_t raw_ax = (int16_t)(mpu_dma_buffer[0] << 8 | mpu_dma_buffer[1]);
+    int16_t raw_ay = (int16_t)(mpu_dma_buffer[2] << 8 | mpu_dma_buffer[3]);
+    int16_t raw_az = (int16_t)(mpu_dma_buffer[4] << 8 | mpu_dma_buffer[5]);
 
-		// 1) Compensa bias:
-		raw_ax -= (int16_t)bias_ax;
-		raw_ay -= (int16_t)bias_ay;
-		raw_az -= (int16_t)bias_az;
+    // Temp (bytes 6-7) ignorada por ahora
 
-		// X
-		if (abs(raw_ax) <= OFFSET_AX) {
-			ax_real = 0;
-		} else {
-			ax_real = (raw_ax * ACCEL_SCALE_C) >> 14;
-		}
-		// Y
-		if (abs(raw_ay) <= OFFSET_AY) {
-			ay_real = 0;
-		} else {
-			ay_real = (raw_ay * ACCEL_SCALE_C) >> 14;
-		}
-		// Z
-		if (abs(raw_az) <= OFFSET_AZ) {
-			az_real = ACCEL_SCALE_C;
-		} else {
-			az_real = (raw_az * ACCEL_SCALE_C) >> 14;
-		}
+    // --- Procesar Giroscopio (bytes 8-13) ---
+    int16_t raw_gx = (int16_t)(mpu_dma_buffer[8] << 8 | mpu_dma_buffer[9]);
+    int16_t raw_gy = (int16_t)(mpu_dma_buffer[10] << 8 | mpu_dma_buffer[11]);
+    int16_t raw_gz = (int16_t)(mpu_dma_buffer[12] << 8 | mpu_dma_buffer[13]);
 
-		// Iniciar lectura del giroscopio
-		current_read_sensor = 1;
-		_platform->readRegDMA(_platform->ctx, MPU6050_ADDR, GYRO_XOUT_H_REG, gyro_buf, 6);
+    // ----------------------------
+    // 1) Compensa bias Acelerómetro
+    // ----------------------------
+    raw_ax -= (int16_t)bias_ax;
+    raw_ay -= (int16_t)bias_ay;
+    raw_az -= (int16_t)bias_az;
 
-	} else { // Giroscopio
-		// --- Procesar giroscopio ---
-		int16_t raw_gx = (int16_t)(gyro_buf[0] << 8 | gyro_buf[1]);
-		int16_t raw_gy = (int16_t)(gyro_buf[2] << 8 | gyro_buf[3]);
-		int16_t raw_gz = (int16_t)(gyro_buf[4] << 8 | gyro_buf[5]);
+    // X
+    if (abs(raw_ax) <= OFFSET_AX) {
+        ax_real = 0;
+    } else {
+        ax_real = (raw_ax * ACCEL_SCALE_C) >> 14;
+    }
+    // Y
+    if (abs(raw_ay) <= OFFSET_AY) {
+        ay_real = 0;
+    } else {
+        ay_real = (raw_ay * ACCEL_SCALE_C) >> 14;
+    }
+    // Z
+    if (abs(raw_az) <= OFFSET_AZ) {
+        az_real = ACCEL_SCALE_C;
+    } else {
+        az_real = (raw_az * ACCEL_SCALE_C) >> 14;
+    }
 
-		// Compensa bias de giro:
-		raw_gx -= (int16_t)bias_gx;
-		raw_gy -= (int16_t)bias_gy;
-		raw_gz -= (int16_t)bias_gz;
+    // ----------------------------
+    // 2) Compensa bias Giroscopio
+    // ----------------------------
+    raw_gx -= (int16_t)bias_gx;
+    raw_gy -= (int16_t)bias_gy;
+    raw_gz -= (int16_t)bias_gz;
 
-		// X
-		if (abs(raw_gx) <= OFFSET_GX) {
-			gx_real = 0;
-		} else {
-			gx_real = (raw_gx * GYRO_SCALE_C) / GYRO_SENS;
-		}
-		// Y
-		if (abs(raw_gy) <= OFFSET_GY) {
-			gy_real = 0;
-		} else {
-			gy_real = (raw_gy * GYRO_SCALE_C) / GYRO_SENS;
-		}
-		// Z
-		if (abs(raw_gz) <= OFFSET_GZ) {
-			gz_real = 0;
-		} else {
-			gz_real = (raw_gz * GYRO_SCALE_C) / GYRO_SENS;
-		}
+    // X
+    if (abs(raw_gx) <= OFFSET_GX) {
+        gx_real = 0;
+    } else {
+        gx_real = (raw_gx * GYRO_SCALE_C) / GYRO_SENS;
+    }
+    // Y
+    if (abs(raw_gy) <= OFFSET_GY) {
+        gy_real = 0;
+    } else {
+        gy_real = (raw_gy * GYRO_SCALE_C) / GYRO_SENS;
+    }
+    // Z
+    if (abs(raw_gz) <= OFFSET_GZ) {
+        gz_real = 0;
+    } else {
+        gz_real = (raw_gz * GYRO_SCALE_C) / GYRO_SENS;
+    }
 
-		mpu_gyro_ready = 1; // Ambos datos están listos
-	}
+    mpu_data_ready = 1; // Todos los datos listos
 }
 
 void MPU6050_Calibrate(void) {
@@ -205,6 +200,3 @@ void MPU6050_Calibrate(void) {
     bias_gy = sum_gy / CALIB_SAMPLES;
     bias_gz = sum_gz / CALIB_SAMPLES;
 }
-
-
-
