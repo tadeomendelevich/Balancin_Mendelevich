@@ -204,6 +204,17 @@ float BETA_G_value;
 float BETA_A_value;
 float KV_brake_value;
 
+// Line Follower Variables
+float KP_LINE = 0.5f;
+float KD_LINE = 0.1f;
+float KI_LINE = 0.0f;
+float LINE_THRESHOLD = 3000.0f;
+float LINE_SPEED = 1.0f;  // Base inclination (degrees) for forward movement
+
+uint8_t f_line_following = 0; // Enables line following mode
+static float line_error_prev = 0.0f;
+static float line_integral = 0.0f;
+
 uint8_t f_balancing = 0;	// En 0 (cero) desactiva los motores del PID y en 1 ativa los motores con el PID
 uint8_t f_resetMassCenter = 0; // Resetea el centro de gravedad en el cual el auto hace balance
 
@@ -1125,6 +1136,7 @@ int main(void)
   UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &BETA_G_value, &BETA_A_value, &KV_brake_value);
   UNER_RegisterSteering(&steering_adjustment);
   UNER_RegisterFlags(&f_balancing, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
+  UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_SPEED, &f_line_following);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();
@@ -1240,6 +1252,11 @@ int main(void)
 	          //    → inclinamos el setpoint hacia atrás (negativo) para que el PID frene
 	          dynamic_setpoint = SETPOINT_ANGLE + (velocity_est_f * KV_brake_value);
 
+	          // If line following is active, inject the base forward speed inclination
+	          if (f_line_following) {
+	              dynamic_setpoint += LINE_SPEED;
+	          }
+
 	          // Limitar el setpoint dinámico para que no se vuelva loco
 	          if (dynamic_setpoint >  5.0f) dynamic_setpoint =  5.0f;
 	          if (dynamic_setpoint < -5.0f) dynamic_setpoint = -5.0f;
@@ -1295,6 +1312,60 @@ int main(void)
 
 	              if (integral >  I_MAX) integral =  I_MAX;
 	              if (integral < -I_MAX) integral = -I_MAX;
+
+	              // --- Line Follower PID ---
+	              if (f_line_following) {
+	                  // Determine position of the line using the 4 floor sensors.
+	                  // Sensor 0 is far right, Sensor 3 is far left.
+	                  // Higher values (> LINE_THRESHOLD) mean black tape detected.
+	                  float s0 = adcValues[0];
+	                  float s1 = adcValues[1];
+	                  float s2 = adcValues[2];
+	                  float s3 = adcValues[3];
+
+	                  float sum = s0 + s1 + s2 + s3;
+	                  float line_error = 0.0f;
+
+	                  if (sum > 1000.0f) { // If at least some sensors detect something
+	                      // We filter out sensors that are clearly not on the line
+	                      float w0 = (s0 > LINE_THRESHOLD) ? s0 : 0.0f;
+	                      float w1 = (s1 > LINE_THRESHOLD) ? s1 : 0.0f;
+	                      float w2 = (s2 > LINE_THRESHOLD) ? s2 : 0.0f;
+	                      float w3 = (s3 > LINE_THRESHOLD) ? s3 : 0.0f;
+
+	                      float w_sum = w0 + w1 + w2 + w3;
+	                      if (w_sum > 0) {
+	                          // Weighted average to find line position (-1 to 1)
+	                          // If w0 (far right) is high, error is negative (steer right)
+	                          // If w3 (far left) is high, error is positive (steer left)
+	                          line_error = ((w3 * 1.0f + w2 * 0.33f) - (w0 * 1.0f + w1 * 0.33f)) / w_sum;
+	                      } else {
+	                          // If we lost the line, hold the previous error to keep turning that direction
+	                          line_error = line_error_prev;
+	                      }
+	                  }
+
+	                  float p_line = KP_LINE * line_error;
+	                  line_integral += line_error * dt_fixed;
+
+	                  // Anti-windup for line integral
+	                  if (line_integral > 10.0f) line_integral = 10.0f;
+	                  if (line_integral < -10.0f) line_integral = -10.0f;
+
+	                  float i_line = KI_LINE * line_integral;
+	                  float d_line = KD_LINE * ((line_error - line_error_prev) / dt_fixed);
+	                  line_error_prev = line_error;
+
+	                  steering_adjustment = p_line + i_line + d_line;
+
+	                  // Limit steering authority so it doesn't break balancing
+	                  if (steering_adjustment >  30.0f) steering_adjustment =  30.0f;
+	                  if (steering_adjustment < -30.0f) steering_adjustment = -30.0f;
+	              } else {
+	                  // Clear line integral and reset steering adjustment when line following is disabled
+	                  line_integral = 0.0f;
+	                  steering_adjustment = 0.0f;
+	              }
 
 	              float mR = pwm_sat + steering_adjustment;
 	              float mL = pwm_sat - steering_adjustment;
