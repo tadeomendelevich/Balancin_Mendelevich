@@ -67,13 +67,14 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP 3.7f
-#define KD 0.15f
-#define KI 0.0f
+#define KP     		2.745f
+#define KD     		0.180f	// 0.17 antes
+#define KI    		0.030f
+#define BETA_G 		0.060f		 // LPF for Gyro
+#define BETA_A 		0.020f        // LPF for Accel
 
-#define MOTOR_GAIN 3.0f
-
-#define SETPOINT_ANGLE 0.0
+#define MOTOR_GAIN 		2.5f
+#define SETPOINT_ANGLE 	0.0f
 
 // Complementary Filter
 #define ALPHA 0.98f
@@ -84,16 +85,23 @@
 #define LOG_DECIM  5		// Frecuencia de envio de log csv mediante USB
 #define LOG_WIFI_DECIM 10	// Frecuencia de envio de log binario mediante WIFI
 
-// New Control Parameters
-#define BETA_G 0.45f        // LPF for Gyro
-#define BETA_A 0.08f        // LPF for Accel
+// Filter Control Parameters
 #define I_MAX  100.0f       // Max Integral Term
 #define DT_MIN 0.0005f      // Min valid DT (0.5ms)
 #define DT_MAX 0.01f        // Max valid DT (10ms)
 
 // Fall detection (hysteresis)
-#define FALL_ANGLE      40.0f   // grados: detecta caída
+#define FALL_ANGLE      38.0f   // grados: detecta caída
 #define RECOVER_ANGLE   10.0f   // grados: condición para volver a balancear
+
+// --- DT fijo calibrado ---
+#define DT_WARMUP_SAMPLES	200
+#define BETA_JITTER    0.01f
+
+#define KV_BRAKE         0.08f  // cuánto inclina el setpoint por velocidad estimada
+#define VEL_DECAY        0.998f // decaimiento del estimado (1.0=sin decay, 0.99=decay rápido)
+#define VEL_LPF_BETA     0.15f  // suavizado de la velocidad estimada
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -194,6 +202,7 @@ float KD_value;
 float KI_value;
 float BETA_G_value;
 float BETA_A_value;
+float KV_brake_value;
 
 uint8_t f_balancing = 0;	// En 0 (cero) desactiva los motores del PID y en 1 ativa los motores con el PID
 uint8_t f_resetMassCenter = 0; // Resetea el centro de gravedad en el cual el auto hace balance
@@ -204,10 +213,23 @@ static uint32_t last_log_us = 0;
 static uint8_t  log_header_sent = 0;
 uint8_t f_send_csv_log = 0;
 uint8_t f_send_wifi_log = 0;
+uint8_t f_change_display = 0;
 
-static uint8_t dotPhase = 0;	// Variable estática para la animación de puntos
 static uint8_t f_wifi_connected = 0;
 static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
+
+static float    dt_fixed        = DT;          // arranca con el define como fallback
+static uint8_t  dt_calibrated   = 0;
+static uint32_t dt_warmup_count = 0;
+static double   dt_warmup_sum   = 0.0;
+
+static float dt_real        = 0.0f;		// Monitoreo de jitter
+static float dt_jitter_max  = 0.0f;
+static float dt_jitter_ema  = 0.0f;
+
+static float velocity_est     = 0.0f;  // velocidad lineal estimada (en "unidades gyro integradas")
+static float velocity_est_f   = 0.0f;  // versión filtrada para el setpoint
+static float dynamic_setpoint = 0.0f;  // setpoint variable calculado cada ciclo
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -795,186 +817,227 @@ void appOnESP01ChangeState(_eESP01STATUS state) {
 void updateDisplay(void) {
     SSD1306_Fill(SSD1306_COLOR_BLACK);
 
-    // Línea divisoria vertical
-    SSD1306_DrawLine(
-        SCREEN_W/2, 0,
-        SCREEN_W/2, SCREEN_H - 1,
-        SSD1306_COLOR_WHITE
-    );
+    if (f_change_display == 0) {
+        // -------------------------------------------------------
+        // PANTALLA 0
+        // -------------------------------------------------------
 
-    // -------------------------------------------------------
-    // Zona superior izquierda: puntos animados + ícono WiFi
-    // -------------------------------------------------------
-    {
-        // --- 3 puntos animados (heartbeat) en x=2, y=1 ---
-        uint16_t px = 2;
-        uint16_t py = 1;
-        uint8_t count = (dotPhase % 3) + 1;
-        for (uint8_t d = 0; d < 3; d++) {
-            if (d < count) {
-                SSD1306_DrawPixel(px,     py,     SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(px + 1, py,     SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(px,     py + 1, SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(px + 1, py + 1, SSD1306_COLOR_WHITE);
-            }
-            px += 5;
-        }
-        dotPhase++;
-        if (dotPhase >= 3) dotPhase = 0;
+        // Línea divisoria vertical
+        SSD1306_DrawLine(SCREEN_W/2, 0, SCREEN_W/2, SCREEN_H - 1, SSD1306_COLOR_WHITE);
 
-        // --- Ícono WiFi o Cruz ---
-        const uint16_t ix = 45;
-        const uint16_t iy = 2;
+        // -------------------------------------------------------
+        // MPU6050: 6 filas pegadas al fondo, izquierda
+        // -------------------------------------------------------
+        {
+            const char* labels[6] = { "AX:", "AY:", "AZ:", "GX:", "GY:", "GZ:" };
+            int16_t     values[6];
+            MPU6050_GetAccel(&values[0], &values[1], &values[2]);
+            MPU6050_GetGyro (&values[3], &values[4], &values[5]);
 
-        if (f_wifi_connected) {
-            // Antena (centro)
-            SSD1306_DrawPixel(ix + 3, iy + 6, SSD1306_COLOR_WHITE);
-            // Arco pequeño
-            SSD1306_DrawPixel(ix + 2, iy + 5, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 3, iy + 5, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 4, iy + 5, SSD1306_COLOR_WHITE);
-            // Arco mediano
-            SSD1306_DrawPixel(ix + 1, iy + 4, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 2, iy + 3, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 3, iy + 3, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 4, iy + 3, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 5, iy + 4, SSD1306_COLOR_WHITE);
-            // Arco grande
-            SSD1306_DrawPixel(ix + 0, iy + 2, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 1, iy + 1, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 2, iy + 1, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 3, iy + 1, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 4, iy + 1, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 5, iy + 1, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 6, iy + 2, SSD1306_COLOR_WHITE);
-        } else {
-            // Cruz (X) de 7x7 píxeles
-            SSD1306_DrawPixel(ix + 0, iy + 0, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 1, iy + 1, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 2, iy + 2, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 3, iy + 3, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 4, iy + 4, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 5, iy + 5, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 6, iy + 6, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 6, iy + 0, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 5, iy + 1, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 4, iy + 2, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 3, iy + 3, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 2, iy + 4, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 1, iy + 5, SSD1306_COLOR_WHITE);
-            SSD1306_DrawPixel(ix + 0, iy + 6, SSD1306_COLOR_WHITE);
-        }
-    }
+            char buf[8];
+            const uint16_t y_start = SCREEN_H - 6 * 10 + 2;
 
-    // -------------------------------------------------------
-    // MPU6050: 6 filas pegadas al fondo, izquierda
-    // -------------------------------------------------------
-    {
-        const char* labels[6] = { "AX:", "AY:", "AZ:", "GX:", "GY:", "GZ:" };
-        int16_t     values[6];
-        MPU6050_GetAccel(&values[0], &values[1], &values[2]);
-        MPU6050_GetGyro (&values[3], &values[4], &values[5]);
+            for (int i = 0; i < 6; i++) {
+                uint16_t y = y_start + i * 10;
+                uint16_t x = 2;
 
-        char buf[8];
-        const uint16_t y_start = SCREEN_H - 6 * 10 + 2;
-
-        for (int i = 0; i < 6; i++) {
-            uint16_t y = y_start + i * 10;
-            uint16_t x = 2;
-
-            // Etiqueta
-            for (const char *p = labels[i]; *p; p++) {
-                if (*p == ':') {
-                    SSD1306_DrawPixel(x + 1, y + 1, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(x + 1, y + 4, SSD1306_COLOR_WHITE);
-                    x += 4;
-                } else {
-                    SSD1306_DrawChar5x7(*p, x, y);
-                    x += Font_5x7.FontWidth + 1;
+                for (const char *p = labels[i]; *p; p++) {
+                    if (*p == ':') {
+                        SSD1306_DrawPixel(x + 1, y + 1, SSD1306_COLOR_WHITE);
+                        SSD1306_DrawPixel(x + 1, y + 4, SSD1306_COLOR_WHITE);
+                        x += 4;
+                    } else {
+                        SSD1306_DrawChar5x7(*p, x, y);
+                        x += Font_5x7.FontWidth + 1;
+                    }
                 }
-            }
 
-            // Valor numérico
-            itoa(values[i], buf, 10);
-            for (char *p = buf; *p; p++) {
-                if (*p == '-') {
-                    SSD1306_DrawLine(x, y + 3, x + 3, y + 3, SSD1306_COLOR_WHITE);
-                    x += 5;
-                } else {
-                    SSD1306_DrawChar5x7(*p, x, y);
-                    x += Font_5x7.FontWidth + 1;
+                itoa(values[i], buf, 10);
+                for (char *p = buf; *p; p++) {
+                    if (*p == '-') {
+                        SSD1306_DrawLine(x, y + 3, x + 3, y + 3, SSD1306_COLOR_WHITE);
+                        x += 5;
+                    } else {
+                        SSD1306_DrawChar5x7(*p, x, y);
+                        x += Font_5x7.FontWidth + 1;
+                    }
                 }
             }
         }
-    }
 
-    // -------------------------------------------------------
-    // Mitad derecha: P, D, I, BETA_G, BETA_A + barras ADC
-    // -------------------------------------------------------
-    {
-        const uint16_t rx = SCREEN_W / 2 + 2;
+        // -------------------------------------------------------
+        // Zona superior izquierda: ícono WiFi grande
+        // -------------------------------------------------------
+        {
+            // WiFi o Cruz, centrado en x=15, y=2, tamaño ~20x14px
+        	const uint16_t ix = 40;
+        	const uint16_t iy = 2;
 
-        // --- 5 filas de parámetros con Font_7x10 (cada fila ~10px) ---
-        const char *param_labels[5] = { "P:", "D:", "I:", "BG:", "BA:" };
-        float       param_vals[5]   = { KP_value, KD_value, KI_value,
-                                        BETA_G_value, BETA_A_value };
+            if (f_wifi_connected) {
+                // Punto central (antena) - 3x3
+                for (int dy = 0; dy < 3; dy++)
+                    for (int dx = 0; dx < 3; dx++)
+                        SSD1306_DrawPixel(ix + 9 + dx, iy + 13 + dy, SSD1306_COLOR_WHITE);
 
-        for (uint8_t i = 0; i < 5; i++) {
-            uint16_t y = 1 + i * 10;
+                // Arco pequeño (~radio 4)
+                SSD1306_DrawPixel(ix + 6,  iy + 10, SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 7,  iy + 9,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 8,  iy + 9,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 9,  iy + 9,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 10, iy + 9,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 11, iy + 9,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 12, iy + 10, SSD1306_COLOR_WHITE);
 
-            SSD1306_GotoXY(rx, y);
-            SSD1306_Puts(param_labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
+                // Arco mediano (~radio 7)
+                SSD1306_DrawPixel(ix + 3,  iy + 7,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 4,  iy + 6,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 5,  iy + 5,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 7,  iy + 4,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 8,  iy + 4,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 9,  iy + 4,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 10, iy + 4,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 11, iy + 4,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 13, iy + 5,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 14, iy + 6,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 15, iy + 7,  SSD1306_COLOR_WHITE);
 
-            char fbuf[8];
-            float v = param_vals[i];
-            uint8_t neg = (v < 0);
-            if (neg) v = -v;
-            uint32_t int_part  = (uint32_t)v;
-            uint32_t frac_part = (uint32_t)((v - (float)int_part) * 100.0f + 0.5f);
-            if (neg)
-                snprintf(fbuf, sizeof(fbuf), "-%lu.%02lu",
-                         (unsigned long)int_part, (unsigned long)frac_part);
-            else
-                snprintf(fbuf, sizeof(fbuf), "%lu.%02lu",
-                         (unsigned long)int_part, (unsigned long)frac_part);
+                // Arco grande (~radio 11)
+                SSD1306_DrawPixel(ix + 0,  iy + 6,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 1,  iy + 4,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 2,  iy + 3,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 3,  iy + 2,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 5,  iy + 1,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 6,  iy + 0,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 7,  iy + 0,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 8,  iy + 0,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 9,  iy + 0,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 10, iy + 0,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 11, iy + 0,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 12, iy + 0,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 13, iy + 1,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 15, iy + 2,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 16, iy + 3,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 17, iy + 4,  SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix + 18, iy + 6,  SSD1306_COLOR_WHITE);
 
-            // P: y D: tienen 2 chars, BG: y BA: tienen 3 chars → offset dinámico
-            uint16_t label_w = (i < 2) ? 2 * Font_7x10.FontWidth   // "P:" "D:" "I:"
-                                        : 3 * Font_7x10.FontWidth;  // "BG:" "BA:"
-            SSD1306_GotoXY(rx + label_w, y);
-            SSD1306_Puts(fbuf, &Font_7x10, SSD1306_COLOR_WHITE);
+            } else {
+                // Cruz (X) ~14x14px, líneas de 2px de grosor
+                for (int k = 0; k < 13; k++) {
+                    SSD1306_DrawPixel(ix + k,      iy + k,     SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + k + 1,  iy + k,     SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 12 - k, iy + k,     SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 13 - k, iy + k,     SSD1306_COLOR_WHITE);
+                }
+            }
         }
 
-        // --- Línea separadora después de las 5 filas (y=52) ---
-        uint16_t sep_y = 52;
-        SSD1306_DrawLine(SCREEN_W/2, sep_y, SCREEN_W - 1, sep_y, SSD1306_COLOR_WHITE);
+        // -------------------------------------------------------
+        // Mitad derecha: P, D, I, BG, BA, KV
+        // -------------------------------------------------------
+        {
+            const uint16_t rx = SCREEN_W / 2 + 2;
 
-        // --- Barras ADC en el espacio restante ---
-        // Disponible: 64 - 52 - 1(sep) - 7(digit) = ~4px de altura máxima de barra
-        const uint16_t bar_region_y = sep_y + 2;
-        const uint16_t digit_h      = Font_5x7.FontHeight;           // 7px
-        const uint16_t bar_region_h = SCREEN_H - bar_region_y - digit_h; // ~3-4px
-        const uint16_t bar_max_h    = (bar_region_h > 0) ? bar_region_h : 1;
-        const uint16_t bar_base_y   = bar_region_y + bar_region_h - 1;
+            const char *param_labels[6] = { "P:", "D:", "I:", "BG:", "BA:", "KV:" };
+            float       param_vals[6]   = { KP_value, KD_value, KI_value,
+                                            BETA_G_value, BETA_A_value, KV_BRAKE };
 
-        const uint16_t rw          = SCREEN_W / 2 - 1;
-        const uint16_t bar_spacing = 1;
-        const uint16_t bar_width   = (rw - (BAR_COUNT + 1) * bar_spacing) / BAR_COUNT;
+            for (uint8_t i = 0; i < 6; i++) {
+                uint16_t y = 1 + i * 10;  // sigue siendo 10px por fila, caben 6 en 64px
+
+                SSD1306_GotoXY(rx, y);
+                SSD1306_Puts(param_labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
+
+                char fbuf[10];
+                float v = param_vals[i];
+                uint8_t neg = (v < 0);
+                if (neg) v = -v;
+                uint32_t int_part  = (uint32_t)v;
+                uint32_t frac_part = (uint32_t)((v - (float)int_part) * 1000.0f + 0.5f);
+                if (neg)
+                    snprintf(fbuf, sizeof(fbuf), "-%lu.%03lu",
+                             (unsigned long)int_part, (unsigned long)frac_part);
+                else
+                    snprintf(fbuf, sizeof(fbuf), "%lu.%03lu",
+                             (unsigned long)int_part, (unsigned long)frac_part);
+
+                uint16_t label_w = (i < 3) ? 2 * Font_7x10.FontWidth
+                                            : 3 * Font_7x10.FontWidth;
+                SSD1306_GotoXY(rx + label_w, y);
+                SSD1306_Puts(fbuf, &Font_7x10, SSD1306_COLOR_WHITE);
+            }
+        }
+
+        // -------------------------------------------------------
+        // Animación "spinner" abajo a la derecha (donde antes estaban los ADC)
+        // 4 frames rotando: — / | |
+        // -------------------------------------------------------
+        {
+            // Spinner de 9x9px centrado en x=48, y=54 (esquina inferior izquierda)
+        	const uint16_t sx = 48;   // cerca del borde derecho de la zona izquierda
+        	const uint16_t sy = 56;
+
+            // 8 posiciones del spinner, se muestra solo 3 segmentos activos
+            // Frame avanza cada llamada al display (~50ms → velocidad agradable)
+            static uint8_t spinPhase = 0;
+
+            // Los 8 "radios" del spinner como offsets (dx, dy) desde centro
+            static const int8_t spokes[8][4] = {
+                // dx1,dy1, dx2,dy2  (dos píxeles por radio para grosor)
+                { 0, -4,  0, -3},  // 0: arriba
+                { 3, -3,  2, -2},  // 1: arriba-derecha
+                { 4,  0,  3,  0},  // 2: derecha
+                { 3,  3,  2,  2},  // 3: abajo-derecha
+                { 0,  4,  0,  3},  // 4: abajo
+                {-3,  3, -2,  2},  // 5: abajo-izquierda
+                {-4,  0, -3,  0},  // 6: izquierda
+                {-3, -3, -2, -2},  // 7: arriba-izquierda
+            };
+
+            // Dibuja 3 radios consecutivos a partir de spinPhase (cola)
+            for (uint8_t s = 0; s < 3; s++) {
+                uint8_t idx = (spinPhase + s) % 8;
+                SSD1306_DrawPixel(sx + spokes[idx][0], sy + spokes[idx][1], SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(sx + spokes[idx][2], sy + spokes[idx][3], SSD1306_COLOR_WHITE);
+            }
+            // Radio principal (más brillante = 2 píxeles juntos)
+            uint8_t head = (spinPhase + 3) % 8;
+            SSD1306_DrawPixel(sx + spokes[head][0],     sy + spokes[head][1],     SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(sx + spokes[head][2],     sy + spokes[head][3],     SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(sx + spokes[head][0] + 1, sy + spokes[head][1],     SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(sx + spokes[head][2] + 1, sy + spokes[head][3],     SSD1306_COLOR_WHITE);
+
+            spinPhase = (spinPhase + 1) % 8;
+        }
+
+    } else {
+        // -------------------------------------------------------
+        // PANTALLA 1: Barras ADC pantalla completa
+        // -------------------------------------------------------
+
+        SSD1306_GotoXY(50, 0);
+        SSD1306_Puts("ADC", &Font_7x10, SSD1306_COLOR_WHITE);
+
+        const uint16_t bar_top   = 11;
+        const uint16_t digit_y   = 55;
+        const uint16_t bar_max_h = digit_y - bar_top - 1;
+
+        const uint16_t bar_spacing = 2;
+        const uint16_t bar_width   = (SCREEN_W - (BAR_COUNT + 1) * bar_spacing) / BAR_COUNT;
 
         for (uint8_t i = 0; i < BAR_COUNT; i++) {
-            uint16_t v  = adcAvg[i] > 4000 ? 4000 : adcAvg[i];
-            uint16_t h  = (uint32_t)v * bar_max_h / 4000;
-            uint16_t x0 = SCREEN_W/2 + bar_spacing + i * (bar_width + bar_spacing);
-            uint16_t y0 = bar_base_y - h + 1;
+            uint16_t v  = adcAvg[i] > 4095 ? 4095 : adcAvg[i];
+            uint16_t h  = (uint32_t)v * bar_max_h / 4095;
+            uint16_t x0 = bar_spacing + i * (bar_width + bar_spacing);
+            uint16_t y0 = digit_y - 1 - h;
+
             if (h > 0)
                 SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
 
-            // Número debajo de cada barra
-            uint16_t tx = x0 + (bar_width > Font_5x7.FontWidth
-                                 ? (bar_width - Font_5x7.FontWidth) / 2 : 0);
-            uint16_t ty = bar_base_y + 2;
-            SSD1306_DrawChar5x7('1' + i, tx, ty);
+            uint16_t tx = x0 + (bar_width - Font_5x7.FontWidth) / 2;
+            SSD1306_DrawChar5x7('1' + i, tx, digit_y);
         }
+
+        SSD1306_DrawLine(0, digit_y - 1, SCREEN_W - 1, digit_y - 1, SSD1306_COLOR_WHITE);
     }
 
     SSD1306_RequestUpdate();
@@ -1059,9 +1122,9 @@ int main(void)
   UNER_RegisterADCBuffer(adcAvg, 8);  // array adcValues[8]
   UNER_RegisterMotorSpeed(&motorRightVelocity, &motorLeftVelocity);
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
-  UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &BETA_G_value, &BETA_A_value);
+  UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &BETA_G_value, &BETA_A_value, &KV_brake_value);
   UNER_RegisterSteering(&steering_adjustment);
-  UNER_RegisterFlags(&f_balancing, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log);
+  UNER_RegisterFlags(&f_balancing, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();
@@ -1097,6 +1160,7 @@ int main(void)
   KI_value = KI;
   BETA_G_value = BETA_G;
   BETA_A_value = BETA_A;
+  KV_brake_value = KV_BRAKE;
 
   // Initialize DWT for micros()
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -1123,14 +1187,33 @@ int main(void)
 	          MPU6050_GetAccel(&ax, &ay, &az);
 	          MPU6050_GetGyro(&gx, &gy, &gz);
 
-	          // 1. Calculate Real DT
+	          // 1. Medir DT real siempre
 	          uint32_t now_us = micros();
 	          if (last_ctrl_us == 0) last_ctrl_us = now_us - 2000;
 	          float dt = (float)(now_us - last_ctrl_us) * 1e-6f;
 	          last_ctrl_us = now_us;
 
 	          if (dt < DT_MIN) dt = DT_MIN;
-	          if (dt > 0.005f) dt = 0.005f;
+	          if (dt > DT_MAX) dt = DT_MAX;
+
+	          // Guardar DT real para logging y jitter
+	          dt_real = dt;
+
+	          // Calibración warmup: promedio de las primeras N muestras
+	          if (!dt_calibrated) {
+	              dt_warmup_sum += dt_real;
+	              dt_warmup_count++;
+	              if (dt_warmup_count >= DT_WARMUP_SAMPLES) {
+	                  dt_fixed     = (float)(dt_warmup_sum / dt_warmup_count);
+	                  dt_calibrated = 1;
+	                  USB_Debug("DT_FIXED calibrado: %d us\r\n", (int)(dt_fixed * 1e6f));
+	              }
+	          }
+
+	          // Monitoreo de jitter (siempre, no afecta el control)
+	          float jitter = fabsf(dt_real - dt_fixed);
+	          dt_jitter_ema = dt_jitter_ema + BETA_JITTER * (jitter - dt_jitter_ema);
+	          if (jitter > dt_jitter_max) dt_jitter_max = jitter;
 
 	          const float ANG_SIGN = +1.0f;
 
@@ -1143,12 +1226,28 @@ int main(void)
 	          accel_roll_f += BETA_A_value * (accel_ang_deg - accel_roll_f);
 
 	          // 4. Complementary Filter
-	          filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt) + (1.0f - ALPHA) * accel_roll_f;
+	          filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_fixed) + (1.0f - ALPHA) * accel_roll_f;
+
+	          // 5. Estimación de velocidad lineal por integración del gyro filtrado
+	          //    gyro_f ya está en deg/s filtrado → integrar da desplazamiento angular acumulado
+	          //    que es proporcional a la velocidad de traslación del robot
+	          velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
+
+	          // Filtro LPF sobre la velocidad estimada para suavizar ruido
+	          velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+
+	          // 6. Setpoint dinámico: si velocity_est_f > 0 el robot va hacia adelante
+	          //    → inclinamos el setpoint hacia atrás (negativo) para que el PID frene
+	          dynamic_setpoint = SETPOINT_ANGLE - (velocity_est_f * KV_brake_value);
+
+	          // Limitar el setpoint dinámico para que no se vuelva loco
+	          if (dynamic_setpoint >  5.0f) dynamic_setpoint =  5.0f;
+	          if (dynamic_setpoint < -5.0f) dynamic_setpoint = -5.0f;
 
 	          // -------------------------------------------------------
 	          // FALL DETECTION - Hysteresis
 	          // -------------------------------------------------------
-	          float abs_roll = fabsf(filtered_roll_deg);
+	          float abs_roll = fabsf(accel_roll_f);
 
 	          if (!f_fallen) {
 	              if (abs_roll > FALL_ANGLE) {
@@ -1162,7 +1261,7 @@ int main(void)
 	          }
 
 	          // Declarar todas las variables de PID ANTES del if
-	          float error   = SETPOINT_ANGLE - filtered_roll_deg;
+	          float error = dynamic_setpoint - filtered_roll_deg;
 	          float p_term  = 0.0f;
 	          float i_term  = 0.0f;
 	          float d_term  = 0.0f;
@@ -1186,10 +1285,10 @@ int main(void)
 
 	              // Smart Anti-Windup
 	              if (sat_flag == 0) {
-	                  integral += error * dt;
+	            	  integral += error * dt_fixed;
 	              } else {
-	                  if (pwm_cmd >  100.0f && error < 0) integral += error * dt;
-	                  else if (pwm_cmd < -100.0f && error > 0) integral += error * dt;
+	                  if (pwm_cmd >  100.0f && error < 0) integral += error * dt_fixed;
+	                  else if (pwm_cmd < -100.0f && error > 0) integral += error * dt_fixed;
 	              }
 
 	              if (integral >  I_MAX) integral =  I_MAX;
@@ -1226,6 +1325,7 @@ int main(void)
 	              wlog.d_term     = d_term;
 	              wlog.mR         = motorRightVelocity;
 	              wlog.mL         = motorLeftVelocity;
+	              wlog.dyn_sp     = dynamic_setpoint;   // ← agregar junto a los otros
 	              wlog.dt_ctrl_us = (uint32_t)(dt * 1000000.0f);
 	              UNER_SendWifiLogData(&wlog);
 	          }
@@ -1239,7 +1339,7 @@ int main(void)
 	              uint32_t t_ms = HAL_GetTick();
 
 	              if (!log_header_sent) {
-	                  char *header = "t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n";
+	            	  char *header = "t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,dyn_sp,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n";
 	                  usb_enqueue_tx((uint8_t*)header, strlen(header));
 	                  log_header_sent = 1;
 	              }
@@ -1263,6 +1363,7 @@ int main(void)
 	              int32_t pwm_cmd_c    = (int32_t)(pwm_cmd         * 100.0f);
 	              int32_t pwm_sat_c    = (int32_t)(pwm_sat         * 100.0f);
 	              int32_t pitch_mdeg   = (int32_t)(accel_pitch_deg * 1000.0f);
+	              int32_t dyn_sp_m = (int32_t)(dynamic_setpoint * 1000.0f);
 
 	              char *ptr = line;
 	              ptr = fast_cat_uint(ptr, t_ms); *ptr++ = ',';
@@ -1273,6 +1374,7 @@ int main(void)
 	              ptr = fast_cat_int(ptr, gyro_mdps); *ptr++ = ',';
 	              ptr = fast_cat_int(ptr, gyro_f_mdps); *ptr++ = ',';
 	              ptr = fast_cat_int(ptr, roll_mdeg); *ptr++ = ',';
+	              ptr = fast_cat_int(ptr, dyn_sp_m); *ptr++ = ',';
 	              ptr = fast_cat_int(ptr, error_mdeg); *ptr++ = ',';
 	              ptr = fast_cat_int(ptr, p_m); *ptr++ = ',';
 	              ptr = fast_cat_int(ptr, i_m); *ptr++ = ',';

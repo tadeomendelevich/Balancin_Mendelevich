@@ -51,16 +51,19 @@ static float *p_KD  = NULL;
 static float *p_KI  = NULL;
 static float *p_BETA_G  = NULL;
 static float *p_BETA_A  = NULL;
+static float *p_KV_BRAKE  = NULL;
 
 static float *p_roll  = NULL;	// Punteros a las variables de inclinacion en main.c
 static float *p_pitch = NULL;
 
 static float *p_steering = NULL;
 
+
 static uint8_t *p_balance_flag = NULL;	// Bandera para activar o desctivar el balance del auto, si esta apagada, los motores estan desabilitados
 static uint8_t *p_resetMassCenter_flag = NULL;	// Bandera para resetear el centro de gravedad del auto, realizando la medicion de la mpu nuevamente
 static uint8_t *p_send_csv_log_flag = NULL;	//
 static uint8_t *p_send_wifi_log_flag = NULL;
+static uint8_t *p_change_display = NULL;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
@@ -539,6 +542,15 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
+        case CHANGE_DISPLAY:
+			if (p_change_display != NULL) {
+				*p_change_display = !(*p_change_display);
+				putHeaderOnTx(dataTx, CHANGE_DISPLAY, 2);
+				putByteOnTx(dataTx, ACK);
+				putByteOnTx(dataTx, dataTx->chk);
+			}
+		break;
+
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
@@ -737,12 +749,13 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr) {
     p_motorLeftVel  = leftPtr;
 }
 
-void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *BETA_G_Ptr, float *BETA_A_Ptr) {
+void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *BETA_G_Ptr, float *BETA_A_Ptr, float *KV_BRAKE_Ptr) {
     p_KP  = kpPtr;
     p_KD  = kdPtr;
     p_KI  = kiPtr;
     p_BETA_G = BETA_G_Ptr;
 	p_BETA_A = BETA_A_Ptr;
+	p_KV_BRAKE = KV_BRAKE_Ptr;
 }
 
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr)
@@ -755,11 +768,12 @@ void UNER_RegisterSteering(float *steeringPtr) {
     p_steering = steeringPtr;
 }
 
-void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4) {
+void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4, uint8_t *flagPtr5) {
     p_balance_flag = flagPtr1;
     p_resetMassCenter_flag = flagPtr2;
     p_send_csv_log_flag = flagPtr3;
     p_send_wifi_log_flag = flagPtr4;
+    p_change_display = flagPtr5;
 }
 
 

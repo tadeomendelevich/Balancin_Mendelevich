@@ -113,6 +113,8 @@ typedef enum{
     CMD_WIFI_LOG_DATA = 0xBB,
 	MODIFY_BETA_G = 0xBC,
 	MODIFY_BETA_A = 0xBD,
+	CHANGE_DISPLAY = 0xBE,
+	MODIFY_KV_BRAKE = 0xBF,
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -145,6 +147,7 @@ typedef struct __attribute__((packed)) {
     int16_t mR;
     int16_t mL;
     uint32_t dt_ctrl_us;
+    float dyn_sp;
 } WifiLogData_t;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr);
@@ -185,11 +188,11 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr);
 
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr);
 
-void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *BETA_G_Ptr, float *BETA_A_Ptr);
+void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *BETA_G_Ptr, float *BETA_A_Ptr, float *KV_BRAKE_Ptr);
 
 void UNER_RegisterSteering(float *steeringPtr);
 
-void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4);
+void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4, uint8_t *flagPtr5);
 
 void UNER_SendLogData(LogData_t *data);
 
