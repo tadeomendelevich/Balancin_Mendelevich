@@ -808,7 +808,7 @@ void UNER_SendWifiLogData(WifiLogData_t *data) {
     unerTx->indexR = 0;
     unerTx->chk    = 0;
 
-    putHeaderOnTx(unerTx, CMD_WIFI_LOG_DATA, 33);
+    putHeaderOnTx(unerTx, CMD_WIFI_LOG_DATA, payloadLen + 1);
 
     uint8_t *p = (uint8_t*)data;
     for (uint8_t i = 0; i < payloadLen; i++) {
