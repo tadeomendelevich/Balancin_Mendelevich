@@ -68,7 +68,7 @@
 
 // PID
 #define KP     		2.745f
-#define KD     		0.180f	// 0.17 antes
+#define KD     		0.170f	// 0.17 antes
 #define KI    		0.030f
 #define BETA_G 		0.060f		 // LPF for Gyro
 #define BETA_A 		0.020f        // LPF for Accel
@@ -98,9 +98,9 @@
 #define DT_WARMUP_SAMPLES	200
 #define BETA_JITTER    0.01f
 
-#define KV_BRAKE         0.08f  // cuánto inclina el setpoint por velocidad estimada
-#define VEL_DECAY        0.998f // decaimiento del estimado (1.0=sin decay, 0.99=decay rápido)
-#define VEL_LPF_BETA     0.15f  // suavizado de la velocidad estimada
+#define KV_BRAKE         0.15f  // cuánto inclina el setpoint por velocidad estimada
+#define VEL_DECAY        0.970f // decaimiento del estimado (1.0=sin decay, 0.99=decay rápido)
+#define VEL_LPF_BETA     0.20f  // suavizado de la velocidad estimada
 
 /* USER CODE END PD */
 
@@ -1238,7 +1238,7 @@ int main(void)
 
 	          // 6. Setpoint dinámico: si velocity_est_f > 0 el robot va hacia adelante
 	          //    → inclinamos el setpoint hacia atrás (negativo) para que el PID frene
-	          dynamic_setpoint = SETPOINT_ANGLE - (velocity_est_f * KV_brake_value);
+	          dynamic_setpoint = SETPOINT_ANGLE + (velocity_est_f * KV_brake_value);
 
 	          // Limitar el setpoint dinámico para que no se vuelva loco
 	          if (dynamic_setpoint >  5.0f) dynamic_setpoint =  5.0f;
@@ -1253,6 +1253,8 @@ int main(void)
 	              if (abs_roll > FALL_ANGLE) {
 	                  f_fallen = 1;
 	                  integral = 0.0f;
+	                  velocity_est   = 0.0f;   // Reseteo valores de velocidad para mantener la posicion cuando regrese
+					  velocity_est_f = 0.0f;
 	              }
 	          } else {
 	              if (abs_roll < RECOVER_ANGLE) {

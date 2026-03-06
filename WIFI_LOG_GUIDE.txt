@@ -19,8 +19,13 @@ typedef struct __attribute__((packed)) {
     float    d_term;      // Término Derivativo
     int16_t  mR;          // Velocidad Motor Derecho (-100 a 100)
     int16_t  mL;          // Velocidad Motor Izquierdo (-100 a 100)
+    uint32_t dt_ctrl_us;  // Tiempo de control loop delta (microsegundos)
+    float    dyn_sp;      // Setpoint dinámico calculado (grados)
 } WifiLogData_t;
 ```
+
+**Tamaño total del payload de datos:** 36 bytes.
+*(Nota: El protocolo UNER añade 1 byte de comando, para un payload total de 37 bytes en la trama `putHeaderOnTx`)*.
 
 2. Configuración en Qt
 ----------------------
@@ -48,6 +53,8 @@ struct WifiLogData {
     float   d_term;
     qint16  mR;
     qint16  mL;
+    quint32 dt_ctrl_us;
+    float   dyn_sp;
 };
 #pragma pack(pop)
 
@@ -67,13 +74,13 @@ void MainWindow::processPendingDatagrams()
         QNetworkDatagram datagram = udpSocket->receiveDatagram();
         QByteArray data = datagram.data();
 
-        // Validar cabecera básica "UNER"
-        if (data.size() < 36 || !data.startsWith("UNER")) continue;
-
+        // Validar cabecera básica "UNER" (36 bytes de data + 1 CMD + cabeceras UNER)
+        if (data.size() < 43 || !data.startsWith("UNER")) continue; 
+        
         // Verificar comando (Byte 6)
         if ((quint8)data[6] != 0xBB) continue;
 
-        // Extraer payload (Bytes 7 a 34)
+        // Extraer payload (Bytes 7 a 42)
         WifiLogData log;
         memcpy(&log, data.constData() + 7, sizeof(WifiLogData));
 
@@ -81,7 +88,8 @@ void MainWindow::processPendingDatagrams()
         qDebug() << "Time:" << log.t_ms
                  << "Roll:" << log.roll_filt
                  << "PID:" << log.output
-                 << "Motores:" << log.mR << log.mL;
+                 << "Motores:" << log.mR << log.mL
+                 << "DynSP:" << log.dyn_sp;
 
         // Aquí puedes actualizar gráficas (QCustomPlot) o etiquetas.
     }

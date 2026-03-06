@@ -5,31 +5,32 @@ The CSV stream is sent over USB CDC at a rate defined by LOG_DECIM.
 Each line ends with \r\n.
 
 Header:
-t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz
+t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,dyn_sp,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz
 
-Columns:
+Columns (26 in total):
 1.  t_ms          : System time in milliseconds (uint32).
 2.  dt_us         : Time elapsed since the last log packet in microseconds (uint32).
-3.  dt_ctrl_us    : Real control loop delta time in microseconds (uint32). *NEW*
+3.  dt_ctrl_us    : Real control loop delta time in microseconds (uint32).
 4.  accel_roll    : Raw accelerometer roll angle in millidegrees (int32, x1000).
-5.  accel_roll_f  : Low-pass filtered accelerometer roll angle in millidegrees (int32, x1000). *NEW*
+5.  accel_roll_f  : Low-pass filtered accelerometer roll angle in millidegrees (int32, x1000).
 6.  gyro_y        : Raw gyroscope Y rate in millidegrees/s (int32, x1000).
-7.  gyro_f        : Low-pass filtered gyroscope Y rate in millidegrees/s (int32, x1000). *NEW*
+7.  gyro_f        : Low-pass filtered gyroscope Y rate in millidegrees/s (int32, x1000).
 8.  roll_filt     : Complementary filter output roll angle in millidegrees (int32, x1000).
-9.  error         : Error (Setpoint - roll_filt) in millidegrees (int32, x1000).
-10. p             : Proportional term (int32, x1000).
-11. i             : Integral term (int32, x1000).
-12. d             : Derivative term (int32, x1000).
-13. output        : PID output before motor gain (int32, x1000).
-14. pwm_cmd       : Calculated PWM command (float * MOTOR_GAIN) (int32, x100).
-15. pwm_sat       : Saturated PWM command before steering [-100, 100] (int32, x100).
-16. sat           : Saturation flag (0 = No, 1 = Yes) (uint8).
-17. mR            : Motor Right Velocity (int16, -100 to 100). Final output to motor.
-18. mL            : Motor Left Velocity (int16, -100 to 100). Final output to motor.
-19. pitch         : Pitch angle in millidegrees (int32, x1000).
-20. ax            : Raw Accelerometer X (int16).
-21. ay            : Raw Accelerometer Y (int16).
-22. az            : Raw Accelerometer Z (int16).
-23. gx            : Raw Gyroscope X (int16).
-24. gy            : Raw Gyroscope Y (int16).
-25. gz            : Raw Gyroscope Z (int16).
+9.  dyn_sp        : Dynamic Setpoint in millidegrees (int32, x1000). *NEW*
+10. error         : Error (Setpoint - roll_filt) in millidegrees (int32, x1000).
+11. p             : Proportional term (int32, x1000).
+12. i             : Integral term (int32, x1000).
+13. d             : Derivative term (int32, x1000).
+14. output        : PID output before motor gain (int32, x1000).
+15. pwm_cmd       : Calculated PWM command (float * MOTOR_GAIN) (int32, x100).
+16. pwm_sat       : Saturated PWM command before steering [-100, 100] (int32, x100).
+17. sat           : Saturation flag (0 = No, 1 = Yes) (uint8).
+18. mR            : Motor Right Velocity (int16, -100 to 100). Final output to motor.
+19. mL            : Motor Left Velocity (int16, -100 to 100). Final output to motor.
+20. pitch         : Pitch angle in millidegrees (int32, x1000).
+21. ax            : Raw Accelerometer X (int16).
+22. ay            : Raw Accelerometer Y (int16).
+23. az            : Raw Accelerometer Z (int16).
+24. gx            : Raw Gyroscope X (int16).
+25. gy            : Raw Gyroscope Y (int16).
+26. gz            : Raw Gyroscope Z (int16).
