@@ -65,6 +65,13 @@ static uint8_t *p_send_csv_log_flag = NULL;	//
 static uint8_t *p_send_wifi_log_flag = NULL;
 static uint8_t *p_change_display = NULL;
 
+static float *p_KP_LINE = NULL;
+static float *p_KD_LINE = NULL;
+static float *p_KI_LINE = NULL;
+static float *p_LINE_THRES = NULL;
+static float *p_LINE_SPEED = NULL;
+static uint8_t *p_line_follow_flag = NULL;
+
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
     unerTx = tx;
@@ -551,6 +558,70 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			}
 		break;
 
+        case MODIFY_KP_LINE:
+			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
+			if (p_KP_LINE) *p_KP_LINE = myWord.f32;
+			putHeaderOnTx(dataTx, MODIFY_KP_LINE, 2);
+			putByteOnTx(dataTx, ACK);
+			putByteOnTx(dataTx, dataTx->chk);
+		break;
+
+        case MODIFY_KD_LINE:
+			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
+			if (p_KD_LINE) *p_KD_LINE = myWord.f32;
+			putHeaderOnTx(dataTx, MODIFY_KD_LINE, 2);
+			putByteOnTx(dataTx, ACK);
+			putByteOnTx(dataTx, dataTx->chk);
+		break;
+
+        case MODIFY_KI_LINE:
+			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
+			if (p_KI_LINE) *p_KI_LINE = myWord.f32;
+			putHeaderOnTx(dataTx, MODIFY_KI_LINE, 2);
+			putByteOnTx(dataTx, ACK);
+			putByteOnTx(dataTx, dataTx->chk);
+		break;
+
+        case MODIFY_LINE_THRES:
+			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
+			if (p_LINE_THRES) *p_LINE_THRES = myWord.f32;
+			putHeaderOnTx(dataTx, MODIFY_LINE_THRES, 2);
+			putByteOnTx(dataTx, ACK);
+			putByteOnTx(dataTx, dataTx->chk);
+		break;
+
+        case MODIFY_LINE_SPEED:
+			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
+			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
+			if (p_LINE_SPEED) *p_LINE_SPEED = myWord.f32;
+			putHeaderOnTx(dataTx, MODIFY_LINE_SPEED, 2);
+			putByteOnTx(dataTx, ACK);
+			putByteOnTx(dataTx, dataTx->chk);
+		break;
+
+        case ACTIVATE_LINE_FOLLOWING:
+			if (p_line_follow_flag != NULL) {
+				*p_line_follow_flag = !(*p_line_follow_flag);
+				putHeaderOnTx(dataTx, ACTIVATE_LINE_FOLLOWING, 2);
+				putByteOnTx(dataTx, ACK);
+				putByteOnTx(dataTx, dataTx->chk);
+			}
+		break;
+
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
@@ -776,6 +847,14 @@ void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3,
     p_change_display = flagPtr5;
 }
 
+void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLinePtr, float *thresPtr, float *speedPtr, uint8_t *lineFollowFlagPtr) {
+    p_KP_LINE = kpLinePtr;
+    p_KD_LINE = kdLinePtr;
+    p_KI_LINE = kiLinePtr;
+    p_LINE_THRES = thresPtr;
+    p_LINE_SPEED = speedPtr;
+    p_line_follow_flag = lineFollowFlagPtr;
+}
 
 // Envía el ring-buffer por USB y por UDP
 void UNER_SendData(void) {
