@@ -37,6 +37,13 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+// --- Line Search & Loss Control ---
+typedef enum {
+    LINE_STATE_FOLLOWING = 0,  // Siguiendo línea normalmente
+    LINE_STATE_LOST,           // Línea perdida, frenando y buscando
+    LINE_STATE_SEARCHING,      // Girando suavemente para buscar
+} eLineState;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -67,8 +74,8 @@
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP     		2.745f
-#define KD     		0.170f	// 0.17 antes
+#define KP     		2.900f	// 2.745f antes
+#define KD     		0.180f	// 0.17f antes
 #define KI    		0.030f
 #define BETA_G 		0.060f		 // LPF for Gyro
 #define BETA_A 		0.020f        // LPF for Accel
@@ -92,15 +99,22 @@
 
 // Fall detection (hysteresis)
 #define FALL_ANGLE      38.0f   // grados: detecta caída
-#define RECOVER_ANGLE   10.0f   // grados: condición para volver a balancear
+#define RECOVER_ANGLE   4.0f   // grados: condición para volver a balancear
+#define UPSIDE_DOWN_ANGLE    140.0f   // desde acá ya lo consideramos boca abajo
 
 // --- DT fijo calibrado ---
 #define DT_WARMUP_SAMPLES	200
-#define BETA_JITTER    0.01f
+#define BETA_JITTER    		0.01f
 
-#define KV_BRAKE         0.15f  // cuánto inclina el setpoint por velocidad estimada
+#define KV_BRAKE         0.20f  // cuánto inclina el setpoint por velocidad estimada
 #define VEL_DECAY        0.970f // decaimiento del estimado (1.0=sin decay, 0.99=decay rápido)
 #define VEL_LPF_BETA     0.20f  // suavizado de la velocidad estimada
+#define KV_LINE_BRAKE 	 0.10f
+
+#define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
+#define LINE_SEARCH_STEERING   20.0f // steering suave para buscar (era 30 de máx)
+#define LINE_SEARCH_ANGLE      0.2f  // ángulo mínimo de avance durante búsqueda
+#define LINE_ANGLE_MIN  	   0.05f
 
 /* USER CODE END PD */
 
@@ -153,7 +167,6 @@ static uint16_t adcBuf[BAR_COUNT][ADC_AVERAGE_SIZE] = {{0}};		// Buffers circula
 static uint8_t maIndex = 0;		// Índice circular común para todos los canales
 static uint16_t adcAvg[BAR_COUNT] = {0};
 
-int x = 1;
 uint8_t i2c1_tx_busy = 0;
 
 uint8_t *sendAllSensors;
@@ -197,20 +210,6 @@ static uint32_t last_ctrl_us = 0;
 static float gyro_f = 0.0f;
 static float accel_roll_f = 0.0f;
 
-float KP_value;
-float KD_value;
-float KI_value;
-float BETA_G_value;
-float BETA_A_value;
-float KV_brake_value;
-
-// Line Follower Variables
-float KP_LINE = 0.5f;
-float KD_LINE = 0.1f;
-float KI_LINE = 0.0f;
-float LINE_THRESHOLD = 3000.0f;
-float LINE_SPEED = 1.0f;  // Base inclination (degrees) for forward movement
-
 uint8_t f_line_following = 0; // Enables line following mode
 static float line_error_prev = 0.0f;
 static float line_integral = 0.0f;
@@ -224,7 +223,7 @@ static uint32_t last_log_us = 0;
 static uint8_t  log_header_sent = 0;
 uint8_t f_send_csv_log = 0;
 uint8_t f_send_wifi_log = 0;
-uint8_t f_change_display = 0;
+uint8_t f_change_display = 2;
 
 static uint8_t f_wifi_connected = 0;
 static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
@@ -241,6 +240,32 @@ static float dt_jitter_ema  = 0.0f;
 static float velocity_est     = 0.0f;  // velocidad lineal estimada (en "unidades gyro integradas")
 static float velocity_est_f   = 0.0f;  // versión filtrada para el setpoint
 static float dynamic_setpoint = 0.0f;  // setpoint variable calculado cada ciclo
+static float dynamic_setpoint_f = 0.0f;
+
+float KP_value;
+float KD_value;
+float KI_value;
+float BETA_G_value;
+float BETA_A_value;
+float KV_brake_value;
+
+// Line Follower Variables
+float KP_LINE = 23.0f;
+float KD_LINE = 4.0f;
+float KI_LINE = 0.0f;
+float LINE_THRESHOLD = 3000.0f;
+float LINE_ANGLE = 0.08f;  // Base inclination (degrees) for forward movement
+
+static eLineState line_state       = LINE_STATE_FOLLOWING;
+static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
+static float      line_search_dir  = 1.0f; // dirección de búsqueda (+1 o -1)
+
+static uint8_t upside_down_count = 0;
+static uint8_t upright_count = 0;
+
+
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -880,17 +905,14 @@ void updateDisplay(void) {
         // Zona superior izquierda: ícono WiFi grande
         // -------------------------------------------------------
         {
-            // WiFi o Cruz, centrado en x=15, y=2, tamaño ~20x14px
-        	const uint16_t ix = 40;
-        	const uint16_t iy = 2;
+            const uint16_t ix = 40;
+            const uint16_t iy = 2;
 
             if (f_wifi_connected) {
-                // Punto central (antena) - 3x3
                 for (int dy = 0; dy < 3; dy++)
                     for (int dx = 0; dx < 3; dx++)
                         SSD1306_DrawPixel(ix + 9 + dx, iy + 13 + dy, SSD1306_COLOR_WHITE);
 
-                // Arco pequeño (~radio 4)
                 SSD1306_DrawPixel(ix + 6,  iy + 10, SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(ix + 7,  iy + 9,  SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(ix + 8,  iy + 9,  SSD1306_COLOR_WHITE);
@@ -899,7 +921,6 @@ void updateDisplay(void) {
                 SSD1306_DrawPixel(ix + 11, iy + 9,  SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(ix + 12, iy + 10, SSD1306_COLOR_WHITE);
 
-                // Arco mediano (~radio 7)
                 SSD1306_DrawPixel(ix + 3,  iy + 7,  SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(ix + 4,  iy + 6,  SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(ix + 5,  iy + 5,  SSD1306_COLOR_WHITE);
@@ -912,7 +933,6 @@ void updateDisplay(void) {
                 SSD1306_DrawPixel(ix + 14, iy + 6,  SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(ix + 15, iy + 7,  SSD1306_COLOR_WHITE);
 
-                // Arco grande (~radio 11)
                 SSD1306_DrawPixel(ix + 0,  iy + 6,  SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(ix + 1,  iy + 4,  SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(ix + 2,  iy + 3,  SSD1306_COLOR_WHITE);
@@ -932,7 +952,6 @@ void updateDisplay(void) {
                 SSD1306_DrawPixel(ix + 18, iy + 6,  SSD1306_COLOR_WHITE);
 
             } else {
-                // Cruz (X) ~14x14px, líneas de 2px de grosor
                 for (int k = 0; k < 13; k++) {
                     SSD1306_DrawPixel(ix + k,      iy + k,     SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix + k + 1,  iy + k,     SSD1306_COLOR_WHITE);
@@ -953,7 +972,7 @@ void updateDisplay(void) {
                                             BETA_G_value, BETA_A_value, KV_BRAKE };
 
             for (uint8_t i = 0; i < 6; i++) {
-                uint16_t y = 1 + i * 10;  // sigue siendo 10px por fila, caben 6 en 64px
+                uint16_t y = 1 + i * 10;
 
                 SSD1306_GotoXY(rx, y);
                 SSD1306_Puts(param_labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
@@ -972,45 +991,38 @@ void updateDisplay(void) {
                              (unsigned long)int_part, (unsigned long)frac_part);
 
                 uint16_t label_w = (i < 3) ? 2 * Font_7x10.FontWidth
-                                            : 3 * Font_7x10.FontWidth;
+                                           : 3 * Font_7x10.FontWidth;
                 SSD1306_GotoXY(rx + label_w, y);
                 SSD1306_Puts(fbuf, &Font_7x10, SSD1306_COLOR_WHITE);
             }
         }
 
         // -------------------------------------------------------
-        // Animación "spinner" abajo a la derecha (donde antes estaban los ADC)
-        // 4 frames rotando: — / | |
+        // Spinner
         // -------------------------------------------------------
         {
-            // Spinner de 9x9px centrado en x=48, y=54 (esquina inferior izquierda)
-        	const uint16_t sx = 48;   // cerca del borde derecho de la zona izquierda
-        	const uint16_t sy = 56;
+            const uint16_t sx = 48;
+            const uint16_t sy = 56;
 
-            // 8 posiciones del spinner, se muestra solo 3 segmentos activos
-            // Frame avanza cada llamada al display (~50ms → velocidad agradable)
             static uint8_t spinPhase = 0;
 
-            // Los 8 "radios" del spinner como offsets (dx, dy) desde centro
             static const int8_t spokes[8][4] = {
-                // dx1,dy1, dx2,dy2  (dos píxeles por radio para grosor)
-                { 0, -4,  0, -3},  // 0: arriba
-                { 3, -3,  2, -2},  // 1: arriba-derecha
-                { 4,  0,  3,  0},  // 2: derecha
-                { 3,  3,  2,  2},  // 3: abajo-derecha
-                { 0,  4,  0,  3},  // 4: abajo
-                {-3,  3, -2,  2},  // 5: abajo-izquierda
-                {-4,  0, -3,  0},  // 6: izquierda
-                {-3, -3, -2, -2},  // 7: arriba-izquierda
+                { 0, -4,  0, -3},
+                { 3, -3,  2, -2},
+                { 4,  0,  3,  0},
+                { 3,  3,  2,  2},
+                { 0,  4,  0,  3},
+                {-3,  3, -2,  2},
+                {-4,  0, -3,  0},
+                {-3, -3, -2, -2},
             };
 
-            // Dibuja 3 radios consecutivos a partir de spinPhase (cola)
             for (uint8_t s = 0; s < 3; s++) {
                 uint8_t idx = (spinPhase + s) % 8;
                 SSD1306_DrawPixel(sx + spokes[idx][0], sy + spokes[idx][1], SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(sx + spokes[idx][2], sy + spokes[idx][3], SSD1306_COLOR_WHITE);
             }
-            // Radio principal (más brillante = 2 píxeles juntos)
+
             uint8_t head = (spinPhase + 3) % 8;
             SSD1306_DrawPixel(sx + spokes[head][0],     sy + spokes[head][1],     SSD1306_COLOR_WHITE);
             SSD1306_DrawPixel(sx + spokes[head][2],     sy + spokes[head][3],     SSD1306_COLOR_WHITE);
@@ -1020,9 +1032,9 @@ void updateDisplay(void) {
             spinPhase = (spinPhase + 1) % 8;
         }
 
-    } else {
+    } else if (f_change_display == 1) {
         // -------------------------------------------------------
-        // PANTALLA 1: Barras ADC pantalla completa
+        // PANTALLA 1: Barras ADC pantalla completa (8 canales)
         // -------------------------------------------------------
 
         SSD1306_GotoXY(50, 0);
@@ -1049,8 +1061,184 @@ void updateDisplay(void) {
         }
 
         SSD1306_DrawLine(0, digit_y - 1, SCREEN_W - 1, digit_y - 1, SSD1306_COLOR_WHITE);
-    }
 
+    } else if (f_change_display == 2) {
+        // -------------------------------------------------------
+        // PANTALLA 2: ADC 1..4 barras izquierda | parámetros línea derecha
+        // -------------------------------------------------------
+
+        const uint16_t split_x = 55;
+        SSD1306_DrawLine(split_x, 0, split_x, SCREEN_H - 1, SSD1306_COLOR_WHITE);
+
+        // ----- lado izquierdo: 4 barras ADC en orden invertido -----
+		// izquierda = ADC4, derecha = ADC1
+		{
+			const uint8_t  adc_count  = 4;
+			const uint16_t left_w     = split_x - 1;
+			const uint16_t bar_top    = 2;
+			const uint16_t digit_y    = 55;
+			const uint16_t bar_max_h  = digit_y - bar_top - 1;
+			const uint16_t spacing    = 2;
+			const uint16_t bar_width  = (left_w - (adc_count + 1) * spacing) / adc_count;
+
+			for (uint8_t i = 0; i < adc_count; i++) {
+				uint8_t adc_idx = (adc_count - 1) - i;   // 3,2,1,0
+				uint16_t v = adcAvg[adc_idx] > 4095 ? 4095 : adcAvg[adc_idx];
+				uint16_t h = (uint32_t)v * bar_max_h / 4095;
+				uint16_t x0 = spacing + i * (bar_width + spacing);
+				uint16_t y0 = digit_y - 1 - h;
+
+				if (h > 0)
+					SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
+
+				uint16_t tx = x0 + (bar_width - Font_5x7.FontWidth) / 2;
+				SSD1306_DrawChar5x7('1' + adc_idx, tx, digit_y);   // muestra 4,3,2,1
+			}
+
+			SSD1306_DrawLine(0, digit_y - 1, left_w - 1, digit_y - 1, SSD1306_COLOR_WHITE);
+		}
+
+        // ----- lado derecho: parámetros de línea -----
+        // Formato: "KP=0.000" en Font_5x7, 5 filas × 11px = 55px → caben justo en 64px
+        {
+            const uint16_t rx = split_x + 3;
+
+            const char *labels[5] = { "KP=", "KD=", "KI=", "TH=", "SP=" };
+            float values[5] = { KP_LINE, KD_LINE, KI_LINE, LINE_THRESHOLD, LINE_ANGLE };
+
+            for (uint8_t i = 0; i < 5; i++) {
+                uint16_t y = 1 + i * 11;
+                uint16_t x = rx;
+
+                // Imprimir label (ej: "KP=")
+                for (const char *p = labels[i]; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, y);
+                    x += Font_5x7.FontWidth + 1;
+                }
+
+                // Valor numérico
+                float v = values[i];
+                uint8_t neg = (v < 0.0f);
+                if (neg) v = -v;
+
+                char fbuf[10];
+                if (i == 3) {
+                    // TH: entero sin decimales (valor grande tipo 3000)
+                    snprintf(fbuf, sizeof(fbuf), "%lu", (unsigned long)(uint32_t)v);
+                } else {
+                    // Resto: formato 0.000
+                    uint32_t int_part  = (uint32_t)v;
+                    uint32_t frac_part = (uint32_t)((v - (float)int_part) * 1000.0f + 0.5f);
+                    if (neg)
+                        snprintf(fbuf, sizeof(fbuf), "-%lu.%03lu",
+                                 (unsigned long)int_part, (unsigned long)frac_part);
+                    else
+                        snprintf(fbuf, sizeof(fbuf), "%lu.%03lu",
+                                 (unsigned long)int_part, (unsigned long)frac_part);
+                }
+
+                for (char *p = fbuf; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, y);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
+        }
+
+        // ----- spinner: esquina inferior derecha -----
+        {
+            // Zona derecha: desde split_x+1 hasta SCREEN_W-1 = 72px de ancho
+            // Centrado horizontalmente en esa zona, pegado al fondo
+            const uint16_t sx = split_x + (SCREEN_W - split_x) / 2;  // centro horizontal zona derecha
+            const uint16_t sy = SCREEN_H - 6;                          // lo más abajo posible (radio=4px)
+
+            static uint8_t spinPhase2 = 0;
+
+            static const int8_t spokes[8][4] = {
+                { 0, -4,  0, -3},
+                { 3, -3,  2, -2},
+                { 4,  0,  3,  0},
+                { 3,  3,  2,  2},
+                { 0,  4,  0,  3},
+                {-3,  3, -2,  2},
+                {-4,  0, -3,  0},
+                {-3, -3, -2, -2},
+            };
+
+            for (uint8_t s = 0; s < 3; s++) {
+                uint8_t idx = (spinPhase2 + s) % 8;
+                SSD1306_DrawPixel(sx + spokes[idx][0], sy + spokes[idx][1], SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(sx + spokes[idx][2], sy + spokes[idx][3], SSD1306_COLOR_WHITE);
+            }
+            uint8_t head = (spinPhase2 + 3) % 8;
+            SSD1306_DrawPixel(sx + spokes[head][0],     sy + spokes[head][1],     SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(sx + spokes[head][2],     sy + spokes[head][3],     SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(sx + spokes[head][0] + 1, sy + spokes[head][1],     SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(sx + spokes[head][2] + 1, sy + spokes[head][3],     SSD1306_COLOR_WHITE);
+
+            spinPhase2 = (spinPhase2 + 1) % 8;
+        }
+    } else if (f_change_display == 3) {
+        // -------------------------------------------------------
+        // PANTALLA 3: ADC1..ADC4 numéricos + spinner
+        // -------------------------------------------------------
+
+        {
+            char buf[20];
+
+            snprintf(buf, sizeof(buf), "ADC1=%4u", adcAvg[0]);
+            SSD1306_GotoXY(2, 2);
+            SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+
+            snprintf(buf, sizeof(buf), "ADC2=%4u", adcAvg[1]);
+            SSD1306_GotoXY(2, 16);
+            SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+
+            snprintf(buf, sizeof(buf), "ADC3=%4u", adcAvg[2]);
+            SSD1306_GotoXY(2, 30);
+            SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+
+            snprintf(buf, sizeof(buf), "ADC4=%4u", adcAvg[3]);
+            SSD1306_GotoXY(2, 44);
+            SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+        }
+
+        // ----- spinner abajo a la derecha -----
+        {
+            const uint16_t sx = SCREEN_W - 10;
+            const uint16_t sy = SCREEN_H - 10;
+
+            static uint8_t spinPhase3 = 0;
+
+            static const int8_t spokes[8][4] = {
+                { 0, -4,  0, -3},
+                { 3, -3,  2, -2},
+                { 4,  0,  3,  0},
+                { 3,  3,  2,  2},
+                { 0,  4,  0,  3},
+                {-3,  3, -2,  2},
+                {-4,  0, -3,  0},
+                {-3, -3, -2, -2},
+            };
+
+            for (uint8_t s = 0; s < 3; s++) {
+                uint8_t idx = (spinPhase3 + s) % 8;
+                SSD1306_DrawPixel(sx + spokes[idx][0], sy + spokes[idx][1], SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(sx + spokes[idx][2], sy + spokes[idx][3], SSD1306_COLOR_WHITE);
+            }
+
+            uint8_t head = (spinPhase3 + 3) % 8;
+            SSD1306_DrawPixel(sx + spokes[head][0],     sy + spokes[head][1],     SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(sx + spokes[head][2],     sy + spokes[head][3],     SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(sx + spokes[head][0] + 1, sy + spokes[head][1],     SSD1306_COLOR_WHITE);
+            SSD1306_DrawPixel(sx + spokes[head][2] + 1, sy + spokes[head][3],     SSD1306_COLOR_WHITE);
+
+            spinPhase3 = (spinPhase3 + 1) % 8;
+        }
+
+    } else {
+        SSD1306_GotoXY(30, 25);
+        SSD1306_Puts("DISPLAY?", &Font_7x10, SSD1306_COLOR_WHITE);
+    }
     SSD1306_RequestUpdate();
 }
 
@@ -1136,7 +1324,7 @@ int main(void)
   UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &BETA_G_value, &BETA_A_value, &KV_brake_value);
   UNER_RegisterSteering(&steering_adjustment);
   UNER_RegisterFlags(&f_balancing, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
-  UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_SPEED, &f_line_following);
+  UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_ANGLE, &f_line_following);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();
@@ -1208,21 +1396,18 @@ int main(void)
 	          if (dt < DT_MIN) dt = DT_MIN;
 	          if (dt > DT_MAX) dt = DT_MAX;
 
-	          // Guardar DT real para logging y jitter
 	          dt_real = dt;
 
-	          // Calibración warmup: promedio de las primeras N muestras
 	          if (!dt_calibrated) {
 	              dt_warmup_sum += dt_real;
 	              dt_warmup_count++;
 	              if (dt_warmup_count >= DT_WARMUP_SAMPLES) {
-	                  dt_fixed     = (float)(dt_warmup_sum / dt_warmup_count);
+	                  dt_fixed = (float)(dt_warmup_sum / dt_warmup_count);
 	                  dt_calibrated = 1;
 	                  USB_Debug("DT_FIXED calibrado: %d us\r\n", (int)(dt_fixed * 1e6f));
 	              }
 	          }
 
-	          // Monitoreo de jitter (siempre, no afecta el control)
 	          float jitter = fabsf(dt_real - dt_fixed);
 	          dt_jitter_ema = dt_jitter_ema + BETA_JITTER * (jitter - dt_jitter_ema);
 	          if (jitter > dt_jitter_max) dt_jitter_max = jitter;
@@ -1237,50 +1422,151 @@ int main(void)
 	          float accel_ang_deg = ANG_SIGN * (atan2f(ay, az) * (180.0f / M_PI));
 	          accel_roll_f += BETA_A_value * (accel_ang_deg - accel_roll_f);
 
-	          // 4. Complementary Filter
-	          filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_fixed) + (1.0f - ALPHA) * accel_roll_f;
+	          // 4) Complementary Filter
+	          filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_fixed)
+	                            + (1.0f - ALPHA) * accel_roll_f;
 
-	          // 5. Estimación de velocidad lineal por integración del gyro filtrado
-	          //    gyro_f ya está en deg/s filtrado → integrar da desplazamiento angular acumulado
-	          //    que es proporcional a la velocidad de traslación del robot
-	          velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
+	          // Variables de línea
+	          float line_error = 0.0f;
+	          float line_angle_cmd = LINE_ANGLE;
+	          uint8_t line_detected = 0;
 
-	          // Filtro LPF sobre la velocidad estimada para suavizar ruido
-	          velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
-
-	          // 6. Setpoint dinámico: si velocity_est_f > 0 el robot va hacia adelante
-	          //    → inclinamos el setpoint hacia atrás (negativo) para que el PID frene
-	          dynamic_setpoint = SETPOINT_ANGLE + (velocity_est_f * KV_brake_value);
-
-	          // If line following is active, inject the base forward speed inclination
 	          if (f_line_following) {
-	              dynamic_setpoint += LINE_SPEED;
+	              velocity_est   = 0.0f;
+	              velocity_est_f = 0.0f;
+
+	              float s0 = adcValues[0];
+	              float s1 = adcValues[1];
+	              float s2 = adcValues[2];
+	              float s3 = adcValues[3];
+
+	              float w0 = (s0 > LINE_THRESHOLD) ? s0 : 0.0f;
+	              float w1 = (s1 > LINE_THRESHOLD) ? s1 : 0.0f;
+	              float w2 = (s2 > LINE_THRESHOLD) ? s2 : 0.0f;
+	              float w3 = (s3 > LINE_THRESHOLD) ? s3 : 0.0f;
+	              float w_sum = w0 + w1 + w2 + w3;
+
+	              line_detected = (w_sum > 0.0f);
+
+	              if (line_detected) {
+	                  line_error = ((w0 * 1.0f + w1 * 0.33f) - (w3 * 1.0f + w2 * 0.33f)) / w_sum;
+	              }
+
+	              float abs_line_error = fabsf(line_error);
+	              float forward_factor = abs_line_error / 0.5f;
+
+	              if (forward_factor > 1.0f) forward_factor = 1.0f;
+	              if (forward_factor < 0.0f) forward_factor = 0.0f;
+
+	              line_angle_cmd = LINE_ANGLE_MIN + (LINE_ANGLE - LINE_ANGLE_MIN) * forward_factor;
+
+	              if (line_angle_cmd > LINE_ANGLE) line_angle_cmd = LINE_ANGLE;
+	              if (line_angle_cmd < LINE_ANGLE_MIN) line_angle_cmd = LINE_ANGLE_MIN;
+
+	          } else {
+	              velocity_est    = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
+	              velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
 	          }
 
-	          // Limitar el setpoint dinámico para que no se vuelva loco
+	          static uint8_t prev_line_following = 0;
+	          if (f_line_following && !prev_line_following) {
+	              integral            = 0.0f;
+	              line_integral       = 0.0f;
+	              line_error_prev     = 0.0f;
+	              steering_adjustment = 0.0f;
+	              velocity_est        = 0.0f;
+	              velocity_est_f      = 0.0f;
+	              line_state          = LINE_STATE_FOLLOWING;
+	              dynamic_setpoint    = SETPOINT_ANGLE;
+	              dynamic_setpoint_f  = SETPOINT_ANGLE;
+	          }
+	          prev_line_following = f_line_following;
+
+	          // 6. Setpoint dinámico
+	          if (f_line_following) {
+	              dynamic_setpoint = SETPOINT_ANGLE + line_angle_cmd;
+
+	              if (dynamic_setpoint >  LINE_ANGLE) dynamic_setpoint =  LINE_ANGLE;
+	              if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
+	          } else {
+	              dynamic_setpoint = SETPOINT_ANGLE + (velocity_est_f * KV_brake_value);
+	          }
+
 	          if (dynamic_setpoint >  5.0f) dynamic_setpoint =  5.0f;
 	          if (dynamic_setpoint < -5.0f) dynamic_setpoint = -5.0f;
 
+	          float sp_step_max = 0.0005f;  // Variacion maxima de angulo de avance para seguir linea
+	          float sp_delta = dynamic_setpoint - dynamic_setpoint_f;
+
+	          if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;
+	          if (sp_delta < -sp_step_max) sp_delta = -sp_step_max;
+
+	          dynamic_setpoint_f += sp_delta;
+
 	          // -------------------------------------------------------
-	          // FALL DETECTION - Hysteresis
+	          // FALL DETECTION
 	          // -------------------------------------------------------
-	          float abs_roll = fabsf(accel_roll_f);
+	          float abs_roll_filt = fabsf(filtered_roll_deg);
+	          float abs_roll_raw  = fabsf(accel_ang_deg);
+
+	          uint8_t upright_now     = (abs_roll_raw < RECOVER_ANGLE);
+	          uint8_t upside_down_now = (abs_roll_raw > UPSIDE_DOWN_ANGLE);
+	          uint8_t fall_by_angle   = (abs_roll_filt > FALL_ANGLE);
+
+	          if (upright_now) {
+	              if (upright_count < 20) upright_count++;
+	          } else {
+	              upright_count = 0;
+	          }
+	          uint8_t recover_by_angle = (upright_count >= 5);
+
+	          if (upside_down_now) {
+	              if (upside_down_count < 20) upside_down_count++;
+	          } else {
+	              upside_down_count = 0;
+	          }
+	          uint8_t fall_upside_down = (upside_down_count >= 5);
 
 	          if (!f_fallen) {
-	              if (abs_roll > FALL_ANGLE) {
+	              if (fall_by_angle || fall_upside_down) {
 	                  f_fallen = 1;
-	                  integral = 0.0f;
-	                  velocity_est   = 0.0f;   // Reseteo valores de velocidad para mantener la posicion cuando regrese
-					  velocity_est_f = 0.0f;
+
+	                  integral            = 0.0f;
+	                  velocity_est        = 0.0f;
+	                  velocity_est_f      = 0.0f;
+	                  line_integral       = 0.0f;
+	                  line_error_prev     = 0.0f;
+	                  steering_adjustment = 0.0f;
+
+	                  motorRightVelocity  = 0;
+	                  motorLeftVelocity   = 0;
 	              }
 	          } else {
-	              if (abs_roll < RECOVER_ANGLE) {
+	              if (recover_by_angle && !fall_upside_down) {
 	                  f_fallen = 0;
+
+	                  accel_roll_f      = accel_ang_deg;
+	                  filtered_roll_deg = accel_ang_deg;
+	                  gyro_f            = 0.0f;
+
+	                  integral            = 0.0f;
+	                  velocity_est        = 0.0f;
+	                  velocity_est_f      = 0.0f;
+	                  line_integral       = 0.0f;
+	                  line_error_prev     = 0.0f;
+	                  steering_adjustment = 0.0f;
+	                  dynamic_setpoint    = SETPOINT_ANGLE;
+	                  dynamic_setpoint_f  = SETPOINT_ANGLE;
+
+	                  upright_count       = 0;
+	                  upside_down_count   = 0;
+	              } else {
+	                  motorRightVelocity = 0;
+	                  motorLeftVelocity  = 0;
 	              }
 	          }
 
-	          // Declarar todas las variables de PID ANTES del if
-	          float error = dynamic_setpoint - filtered_roll_deg;
+	          float error   = dynamic_setpoint_f - filtered_roll_deg;
 	          float p_term  = 0.0f;
 	          float i_term  = 0.0f;
 	          float d_term  = 0.0f;
@@ -1289,7 +1575,6 @@ int main(void)
 	          float pwm_sat = 0.0f;
 	          uint8_t sat_flag = 0;
 
-	          // PID (solo si no está caído)
 	          if (!f_fallen) {
 	              p_term = KP_value * error;
 	              i_term = KI_value * integral;
@@ -1302,81 +1587,131 @@ int main(void)
 	              if (pwm_sat >  100.0f) { pwm_sat =  100.0f; sat_flag = 1; }
 	              if (pwm_sat < -100.0f) { pwm_sat = -100.0f; sat_flag = 1; }
 
-	              // Smart Anti-Windup
-	              if (sat_flag == 0) {
-	            	  integral += error * dt_fixed;
-	              } else {
-	                  if (pwm_cmd >  100.0f && error < 0) integral += error * dt_fixed;
-	                  else if (pwm_cmd < -100.0f && error > 0) integral += error * dt_fixed;
+	              if (f_line_following) {
+	                  if (pwm_sat >  40.0f) pwm_sat =  40.0f;
+	                  if (pwm_sat < -40.0f) pwm_sat = -40.0f;
 	              }
+
+	              float pwm_limit = f_line_following ? 40.0f : 100.0f;
+	              if (fabsf(pwm_cmd) <= pwm_limit) {
+	                  integral += error * dt_fixed;
+	              } else {
+	                  if (pwm_cmd >  pwm_limit && error < 0) integral += error * dt_fixed;
+	                  else if (pwm_cmd < -pwm_limit && error > 0) integral += error * dt_fixed;
+	              }
+
+	              sat_flag = (fabsf(pwm_cmd) > pwm_limit) ? 1 : 0;
 
 	              if (integral >  I_MAX) integral =  I_MAX;
 	              if (integral < -I_MAX) integral = -I_MAX;
 
-	              // --- Line Follower PID ---
 	              if (f_line_following) {
-	                  // Determine position of the line using the 4 floor sensors.
-	                  // Sensor 0 is far right, Sensor 3 is far left.
-	                  // Higher values (> LINE_THRESHOLD) mean black tape detected.
-	                  float s0 = adcValues[0];
-	                  float s1 = adcValues[1];
-	                  float s2 = adcValues[2];
-	                  float s3 = adcValues[3];
-
-	                  float sum = s0 + s1 + s2 + s3;
-	                  float line_error = 0.0f;
-
-	                  if (sum > 1000.0f) { // If at least some sensors detect something
-	                      // We filter out sensors that are clearly not on the line
-	                      float w0 = (s0 > LINE_THRESHOLD) ? s0 : 0.0f;
-	                      float w1 = (s1 > LINE_THRESHOLD) ? s1 : 0.0f;
-	                      float w2 = (s2 > LINE_THRESHOLD) ? s2 : 0.0f;
-	                      float w3 = (s3 > LINE_THRESHOLD) ? s3 : 0.0f;
-
-	                      float w_sum = w0 + w1 + w2 + w3;
-	                      if (w_sum > 0) {
-	                          // Weighted average to find line position (-1 to 1)
-	                          // If w0 (far right) is high, error is negative (steer right)
-	                          // If w3 (far left) is high, error is positive (steer left)
-	                          line_error = ((w3 * 1.0f + w2 * 0.33f) - (w0 * 1.0f + w1 * 0.33f)) / w_sum;
-	                      } else {
-	                          // If we lost the line, hold the previous error to keep turning that direction
-	                          line_error = line_error_prev;
-	                      }
-	                  }
-
-	                  float p_line = KP_LINE * line_error;
-	                  line_integral += line_error * dt_fixed;
-
-	                  // Anti-windup for line integral
-	                  if (line_integral > 10.0f) line_integral = 10.0f;
-	                  if (line_integral < -10.0f) line_integral = -10.0f;
-
-	                  float i_line = KI_LINE * line_integral;
-	                  float d_line = KD_LINE * ((line_error - line_error_prev) / dt_fixed);
-	                  line_error_prev = line_error;
-
-	                  steering_adjustment = p_line + i_line + d_line;
-
-	                  // Limit steering authority so it doesn't break balancing
-	                  if (steering_adjustment >  30.0f) steering_adjustment =  30.0f;
-	                  if (steering_adjustment < -30.0f) steering_adjustment = -30.0f;
-	              } else {
-	                  // Clear line integral and reset steering adjustment when line following is disabled
-	                  line_integral = 0.0f;
-	                  steering_adjustment = 0.0f;
+	                  if (integral >  2.0f) integral =  2.0f;
+	                  if (integral < -2.0f) integral = -2.0f;
 	              }
 
-	              float mR = pwm_sat + steering_adjustment;
-	              float mL = pwm_sat - steering_adjustment;
+	              if (f_line_following) {
+	                  uint8_t line_pivot_active = 0;
 
-	              if (mR >  100.0f) mR =  100.0f;
-	              if (mR < -100.0f) mR = -100.0f;
-	              if (mL >  100.0f) mL =  100.0f;
-	              if (mL < -100.0f) mL = -100.0f;
+	                  switch (line_state) {
+	                      case LINE_STATE_FOLLOWING:
+	                          if (line_detected) {
+	                              float p_line = KP_LINE * line_error;
 
-	              motorRightVelocity = -(int16_t)mR;
-	              motorLeftVelocity  = -(int16_t)mL;
+	                              line_integral += line_error * dt_fixed;
+	                              if (line_integral >  5.0f) line_integral =  5.0f;
+	                              if (line_integral < -5.0f) line_integral = -5.0f;
+
+	                              float i_line = KI_LINE * line_integral;
+	                              float d_line = KD_LINE * ((line_error - line_error_prev) / dt_fixed);
+
+	                              line_error_prev = line_error;
+	                              steering_adjustment = p_line + i_line + d_line;
+	                          } else {
+	                              line_lost_ms = HAL_GetTick();
+	                              line_state = LINE_STATE_LOST;
+	                              steering_adjustment *= 0.8f;
+	                              line_integral *= 0.95f;
+	                          }
+
+	                          if (steering_adjustment >  30.0f) steering_adjustment =  30.0f;
+	                          if (steering_adjustment < -30.0f) steering_adjustment = -30.0f;
+	                          break;
+
+	                      case LINE_STATE_LOST:
+	                          if (line_detected) {
+	                              line_integral   = 0.0f;
+	                              line_error_prev = 0.0f;
+	                              line_state      = LINE_STATE_FOLLOWING;
+	                              steering_adjustment = 0.0f;
+	                          } else if ((HAL_GetTick() - line_lost_ms) > LINE_LOST_TIMEOUT_MS) {
+	                              line_state = LINE_STATE_SEARCHING;
+	                          } else {
+	                              steering_adjustment *= 0.85f;
+	                          }
+	                          break;
+
+	                      case LINE_STATE_SEARCHING:
+	                          if (line_detected) {
+	                              line_integral   = 0.0f;
+	                              line_error_prev = 0.0f;
+	                              line_state      = LINE_STATE_FOLLOWING;
+	                              steering_adjustment = 0.0f;
+	                          } else {
+	                              steering_adjustment = 0.0f;
+	                              line_pivot_active = 1;
+
+	                              const int16_t PIVOT_SPEED = 30;
+	                              if (line_search_dir > 0.0f) {
+	                                  motorRightVelocity =  PIVOT_SPEED;
+	                                  motorLeftVelocity  =  0;
+	                              } else {
+	                                  motorRightVelocity =  0;
+	                                  motorLeftVelocity  =  PIVOT_SPEED;
+	                              }
+	                          }
+	                          break;
+	                  }
+
+	                  if (integral >  2.0f) integral =  2.0f;
+	                  if (integral < -2.0f) integral = -2.0f;
+	                  if (pwm_sat >  40.0f) pwm_sat =  40.0f;
+	                  if (pwm_sat < -40.0f) pwm_sat = -40.0f;
+
+	                  if (!line_pivot_active) {
+	                      float half_steer = steering_adjustment * 0.5f;
+
+	                      float mR = pwm_sat - half_steer;
+	                      float mL = pwm_sat + half_steer;
+
+	                      if (mR >  40.0f) mR =  40.0f;
+	                      if (mR < -40.0f) mR = -40.0f;
+	                      if (mL >  40.0f) mL =  40.0f;
+	                      if (mL < -40.0f) mL = -40.0f;
+
+	                      motorRightVelocity = -(int16_t)mL;
+	                      motorLeftVelocity  = -(int16_t)mR;
+	                  }
+
+	              } else {
+	                  line_integral       = 0.0f;
+	                  line_error_prev     = 0.0f;
+	                  steering_adjustment = 0.0f;
+	                  line_state          = LINE_STATE_FOLLOWING;
+
+	                  float steering_scale = 1.0f - (fabsf(steering_adjustment) / 100.0f);
+	                  float mR = pwm_sat * steering_scale + steering_adjustment;
+	                  float mL = pwm_sat * steering_scale - steering_adjustment;
+
+	                  if (mR >  100.0f) mR =  100.0f;
+	                  if (mR < -100.0f) mR = -100.0f;
+	                  if (mL >  100.0f) mL =  100.0f;
+	                  if (mL < -100.0f) mL = -100.0f;
+
+	                  motorRightVelocity = -(int16_t)mL;
+	                  motorLeftVelocity  = -(int16_t)mR;
+	              }
+
 	          } else {
 	              motorRightVelocity = 0;
 	              motorLeftVelocity  = 0;
@@ -1387,7 +1722,6 @@ int main(void)
 	          // --- LOGGING ---
 	          log_counter++;
 
-	          // --- WIFI LOGGING ---
 	          if (f_send_wifi_log && (log_counter % LOG_WIFI_DECIM == 0)) {
 	              WifiLogData_t wlog;
 	              wlog.t_ms       = HAL_GetTick();
@@ -1398,12 +1732,11 @@ int main(void)
 	              wlog.d_term     = d_term;
 	              wlog.mR         = motorRightVelocity;
 	              wlog.mL         = motorLeftVelocity;
-	              wlog.dyn_sp     = dynamic_setpoint;   // ← agregar junto a los otros
+	              wlog.dyn_sp     = dynamic_setpoint_f;
 	              wlog.dt_ctrl_us = (uint32_t)(dt * 1000000.0f);
 	              UNER_SendWifiLogData(&wlog);
 	          }
 
-	          // --- CSV LOGGING ---
 	          if (LOG_ENABLE && f_send_csv_log && (log_counter % LOG_DECIM == 0)) {
 	              uint32_t dt_ctrl_us = (uint32_t)(dt * 1000000.0f);
 	              uint32_t t_now_log  = micros();
@@ -1412,7 +1745,7 @@ int main(void)
 	              uint32_t t_ms = HAL_GetTick();
 
 	              if (!log_header_sent) {
-	            	  char *header = "t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,dyn_sp,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n";
+	                  char *header = "t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,dyn_sp,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n";
 	                  usb_enqueue_tx((uint8_t*)header, strlen(header));
 	                  log_header_sent = 1;
 	              }
@@ -1423,20 +1756,20 @@ int main(void)
 	              float accel_pitch_deg = atan2f(-ax, denom) * (180.0f / M_PI);
 
 	              char line[256];
-	              int32_t accel_mdeg   = (int32_t)(accel_ang_deg  * 1000.0f);
-	              int32_t accel_f_mdeg = (int32_t)(accel_roll_f   * 1000.0f);
-	              int32_t gyro_mdps    = (int32_t)(gyro_rate_dps  * 1000.0f);
-	              int32_t gyro_f_mdps  = (int32_t)(gyro_f         * 1000.0f);
+	              int32_t accel_mdeg   = (int32_t)(accel_ang_deg * 1000.0f);
+	              int32_t accel_f_mdeg = (int32_t)(accel_roll_f * 1000.0f);
+	              int32_t gyro_mdps    = (int32_t)(gyro_rate_dps * 1000.0f);
+	              int32_t gyro_f_mdps  = (int32_t)(gyro_f * 1000.0f);
 	              int32_t roll_mdeg    = (int32_t)(filtered_roll_deg * 1000.0f);
-	              int32_t error_mdeg   = (int32_t)(error           * 1000.0f);
-	              int32_t p_m          = (int32_t)(p_term          * 1000.0f);
-	              int32_t i_m          = (int32_t)(i_term          * 1000.0f);
-	              int32_t d_m          = (int32_t)(d_term          * 1000.0f);
-	              int32_t out_m        = (int32_t)(output          * 1000.0f);
-	              int32_t pwm_cmd_c    = (int32_t)(pwm_cmd         * 100.0f);
-	              int32_t pwm_sat_c    = (int32_t)(pwm_sat         * 100.0f);
+	              int32_t error_mdeg   = (int32_t)(error * 1000.0f);
+	              int32_t p_m          = (int32_t)(p_term * 1000.0f);
+	              int32_t i_m          = (int32_t)(i_term * 1000.0f);
+	              int32_t d_m          = (int32_t)(d_term * 1000.0f);
+	              int32_t out_m        = (int32_t)(output * 1000.0f);
+	              int32_t pwm_cmd_c    = (int32_t)(pwm_cmd * 100.0f);
+	              int32_t pwm_sat_c    = (int32_t)(pwm_sat * 100.0f);
 	              int32_t pitch_mdeg   = (int32_t)(accel_pitch_deg * 1000.0f);
-	              int32_t dyn_sp_m = (int32_t)(dynamic_setpoint * 1000.0f);
+	              int32_t dyn_sp_m     = (int32_t)(dynamic_setpoint_f * 1000.0f);
 
 	              char *ptr = line;
 	              ptr = fast_cat_uint(ptr, t_ms); *ptr++ = ',';
@@ -1471,19 +1804,16 @@ int main(void)
 	              usb_enqueue_tx((uint8_t*)line, (uint16_t)(ptr - line));
 	          }
 
-	          // Lanzar próxima lectura DMA al final del procesamiento
 	          if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
 	              MPU6050_StartRead_DMA();
 	          }
 
 	      } else {
-	          // Primer tick o dato no listo: lanzar DMA
 	          if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
 	              MPU6050_StartRead_DMA();
 	          }
 	      }
 
-	      // Motores: apagar si caído O si f_balancing desactivado
 	      if (f_balancing && !f_fallen) {
 	          MotorControl(motorRightVelocity, motorLeftVelocity);
 	      } else {

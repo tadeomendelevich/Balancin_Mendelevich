@@ -550,13 +550,13 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 		break;
 
         case CHANGE_DISPLAY:
-			if (p_change_display != NULL) {
-				*p_change_display = !(*p_change_display);
-				putHeaderOnTx(dataTx, CHANGE_DISPLAY, 2);
-				putByteOnTx(dataTx, ACK);
-				putByteOnTx(dataTx, dataTx->chk);
-			}
-		break;
+            if (p_change_display != NULL) {
+                *p_change_display = (*p_change_display + 1) % 4;
+                putHeaderOnTx(dataTx, CHANGE_DISPLAY, 2);
+                putByteOnTx(dataTx, ACK);
+                putByteOnTx(dataTx, dataTx->chk);
+            }
+        break;
 
         case MODIFY_KP_LINE:
 			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
