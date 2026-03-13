@@ -112,6 +112,7 @@ typedef enum {
 #define KV_LINE_BRAKE 	 0.10f
 
 #define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
+#define LINE_LOST_STEERING     12.0f // steering suave para cuando recién se pierde la línea
 #define LINE_SEARCH_STEERING   20.0f // steering suave para buscar (era 30 de máx)
 #define LINE_SEARCH_ANGLE      0.2f  // ángulo mínimo de avance durante búsqueda
 #define LINE_ANGLE_MIN  	   0.05f
@@ -259,6 +260,7 @@ float LINE_ANGLE = 0.08f;  // Base inclination (degrees) for forward movement
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
 static float      line_search_dir  = 1.0f; // dirección de búsqueda (+1 o -1)
+static float      last_line_dir    = 1.0f; // última dirección válida de la línea (+1 o -1)
 
 static uint8_t upside_down_count = 0;
 static uint8_t upright_count = 0;
@@ -1450,6 +1452,13 @@ int main(void)
 
 	              if (line_detected) {
 	                  line_error = ((w0 * 1.0f + w1 * 0.33f) - (w3 * 1.0f + w2 * 0.33f)) / w_sum;
+
+	                  // Actualizar memoria de la última dirección válida
+	                  if (line_error > 0.05f) {
+	                      last_line_dir = 1.0f;
+	                  } else if (line_error < -0.05f) {
+	                      last_line_dir = -1.0f;
+	                  }
 	              }
 
 	              float abs_line_error = fabsf(line_error);
@@ -1630,8 +1639,8 @@ int main(void)
 	                          } else {
 	                              line_lost_ms = HAL_GetTick();
 	                              line_state = LINE_STATE_LOST;
-	                              steering_adjustment *= 0.8f;
-	                              line_integral *= 0.95f;
+	                              line_search_dir = last_line_dir;
+	                              line_integral = 0.0f; // Resetear integral para no afectar el control perdido
 	                          }
 
 	                          if (steering_adjustment >  30.0f) steering_adjustment =  30.0f;
@@ -1643,11 +1652,14 @@ int main(void)
 	                              line_integral   = 0.0f;
 	                              line_error_prev = 0.0f;
 	                              line_state      = LINE_STATE_FOLLOWING;
-	                              steering_adjustment = 0.0f;
+	                              // Dejamos que el controlador retome desde donde está para que sea suave
 	                          } else if ((HAL_GetTick() - line_lost_ms) > LINE_LOST_TIMEOUT_MS) {
 	                              line_state = LINE_STATE_SEARCHING;
 	                          } else {
-	                              steering_adjustment *= 0.85f;
+	                              // En vez de decaer, buscar suavemente hacia la dirección recordada
+	                              float target_steering = line_search_dir * LINE_LOST_STEERING;
+	                              // Filtro suave para llegar al valor objetivo
+	                              steering_adjustment += 0.05f * (target_steering - steering_adjustment);
 	                          }
 	                          break;
 
@@ -1656,19 +1668,10 @@ int main(void)
 	                              line_integral   = 0.0f;
 	                              line_error_prev = 0.0f;
 	                              line_state      = LINE_STATE_FOLLOWING;
-	                              steering_adjustment = 0.0f;
 	                          } else {
-	                              steering_adjustment = 0.0f;
-	                              line_pivot_active = 1;
-
-	                              const int16_t PIVOT_SPEED = 30;
-	                              if (line_search_dir > 0.0f) {
-	                                  motorRightVelocity =  PIVOT_SPEED;
-	                                  motorLeftVelocity  =  0;
-	                              } else {
-	                                  motorRightVelocity =  0;
-	                                  motorLeftVelocity  =  PIVOT_SPEED;
-	                              }
+	                              // Búsqueda más agresiva en la misma dirección
+	                              float target_steering = line_search_dir * LINE_SEARCH_STEERING;
+	                              steering_adjustment += 0.05f * (target_steering - steering_adjustment);
 	                          }
 	                          break;
 	                  }
