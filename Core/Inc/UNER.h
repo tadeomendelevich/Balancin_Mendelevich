@@ -154,6 +154,17 @@ typedef struct __attribute__((packed)) {
     int16_t mL;
     uint32_t dt_ctrl_us;
     float dyn_sp;
+
+    // Line Follower Telemetry
+    float line_error;
+    float p_line;
+    float i_line;
+    float d_line;
+    float steering_adjustment;
+    uint16_t adc1;
+    uint16_t adc2;
+    uint16_t adc3;
+    uint16_t adc4;
 } WifiLogData_t;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr);

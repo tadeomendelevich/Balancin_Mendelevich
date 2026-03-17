@@ -21,11 +21,22 @@ typedef struct __attribute__((packed)) {
     int16_t  mL;          // Velocidad Motor Izquierdo (-100 a 100)
     uint32_t dt_ctrl_us;  // Tiempo de control loop delta (microsegundos)
     float    dyn_sp;      // Setpoint dinámico calculado (grados)
+
+    // Telemetría del Seguidor de Línea
+    float    line_error;          // Error posicional de la línea
+    float    p_line;              // Término Proporcional de la línea
+    float    i_line;              // Término Integral de la línea
+    float    d_line;              // Término Derivativo de la línea
+    float    steering_adjustment; // Salida del PID de la línea (ajuste de giro)
+    uint16_t adc1;                // Valor puro ADC 1 (Sensor derecha extremo)
+    uint16_t adc2;                // Valor puro ADC 2 (Sensor derecha centro)
+    uint16_t adc3;                // Valor puro ADC 3 (Sensor izquierda centro)
+    uint16_t adc4;                // Valor puro ADC 4 (Sensor izquierda extremo)
 } WifiLogData_t;
 ```
 
-**Tamaño total del payload de datos:** 36 bytes.
-*(Nota: El protocolo UNER añade 1 byte de comando, para un payload total de 37 bytes en la trama `putHeaderOnTx`)*.
+**Tamaño total del payload de datos:** 64 bytes.
+*(Nota: El protocolo UNER añade 1 byte de comando, para un payload total de 65 bytes en la trama `putHeaderOnTx`)*.
 
 2. Configuración en Qt
 ----------------------
@@ -55,6 +66,17 @@ struct WifiLogData {
     qint16  mL;
     quint32 dt_ctrl_us;
     float   dyn_sp;
+
+    // Telemetría del Seguidor de Línea
+    float   line_error;
+    float   p_line;
+    float   i_line;
+    float   d_line;
+    float   steering_adjustment;
+    quint16 adc1;
+    quint16 adc2;
+    quint16 adc3;
+    quint16 adc4;
 };
 #pragma pack(pop)
 

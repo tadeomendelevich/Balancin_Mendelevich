@@ -1669,6 +1669,11 @@ int main(void)
 	          float pwm_sat = 0.0f;
 	          uint8_t sat_flag = 0;
 
+	          // Line follower variables for logging
+	          float log_p_line = 0.0f;
+	          float log_i_line = 0.0f;
+	          float log_d_line = 0.0f;
+
 	          if (!f_fallen) {
 	              p_term = KP_value * error;
 	              i_term = KI_value * integral;
@@ -1728,6 +1733,10 @@ int main(void)
 
 	                              line_error_prev = line_error;
 	                              steering_adjustment = p_line + i_line + d_line;
+
+	                              log_p_line = p_line;
+	                              log_i_line = i_line;
+	                              log_d_line = d_line;
 
 	                          } else {
 	                              // Sin línea: medir tiempo real sin verla
@@ -1833,6 +1842,17 @@ int main(void)
 	              wlog.mL         = motorLeftVelocity;
 	              wlog.dyn_sp     = dynamic_setpoint_f;
 	              wlog.dt_ctrl_us = (uint32_t)(dt * 1000000.0f);
+
+	              wlog.line_error          = line_error;
+	              wlog.p_line              = log_p_line;
+	              wlog.i_line              = log_i_line;
+	              wlog.d_line              = log_d_line;
+	              wlog.steering_adjustment = steering_adjustment;
+	              wlog.adc1                = adcValues[0];
+	              wlog.adc2                = adcValues[1];
+	              wlog.adc3                = adcValues[2];
+	              wlog.adc4                = adcValues[3];
+
 	              UNER_SendWifiLogData(&wlog);
 	          }
 
