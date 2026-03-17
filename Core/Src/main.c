@@ -249,16 +249,17 @@ float BETA_A_value;
 float KV_brake_value;
 
 // Line Follower Variables
-float KP_LINE = 23.0f;
-float KD_LINE = 0.5f;
+float KP_LINE = 12.0f;
+float KD_LINE = 0.2f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;
-float LINE_ANGLE = 0.05f;  // Base inclination (degrees) for forward movement
+float LINE_ANGLE = 0.5f;  // Base inclination (degrees) for forward movement
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
 static float      line_search_dir  = 1.0f; // dirección de búsqueda (+1 o -1)
 static float      last_line_dir    = 1.0f; // última dirección válida de la línea (+1 o -1)
+static float      line_error_f_d   = 0.0f;
 
 static uint8_t upside_down_count = 0;
 static uint8_t upright_count = 0;
@@ -1564,6 +1565,7 @@ int main(void)
 	              integral            = 0.0f;
 	              line_integral       = 0.0f;
 	              line_error_prev     = 0.0f;
+	              line_error_f_d      = 0.0f;
 	              steering_adjustment = 0.0f;
 	              velocity_est        = 0.0f;
 	              velocity_est_f      = 0.0f;
@@ -1729,10 +1731,30 @@ int main(void)
 	                              if (line_integral < -5.0f) line_integral = -5.0f;
 
 	                              float i_line = KI_LINE * line_integral;
-	                              float d_line = KD_LINE * ((line_error - line_error_prev) / dt_fixed);
 
-	                              line_error_prev = line_error;
-	                              steering_adjustment = p_line + i_line + d_line;
+	                              // LPF sobre line_error para suavizar el D (evita spikes por saltos de ADC)
+	                              static float line_error_f_d = 0.0f;
+	                              line_error_f_d += 0.4f * (line_error - line_error_f_d);
+
+	                              // D: solo calcular si el ciclo fue normal (dt <= 3x el esperado)
+	                              // Si el ciclo tardó más (dt saltó a 10ms), congelar el D en 0
+	                              float d_line = 0.0f;
+	                              if (dt_real <= dt_fixed * 3.0f) {
+	                                  float line_delta = line_error_f_d - line_error_prev;
+	                                  if (line_delta >  0.3f) line_delta =  0.3f;   // clamp delta
+	                                  if (line_delta < -0.3f) line_delta = -0.3f;
+	                                  d_line = KD_LINE * (line_delta / dt_fixed);
+	                              }
+	                              line_error_prev = line_error_f_d;  // siempre actualizar prev
+
+	                              float steering_target = p_line + i_line + d_line;
+
+	                              // Rate limiter: el steering no puede cambiar más de X por ciclo
+	                              float steering_delta = steering_target - steering_adjustment;
+	                              float steering_rate_limit = 8.0f;  // máximo cambio por ciclo (probar entre 4 y 12)
+	                              if (steering_delta >  steering_rate_limit) steering_delta =  steering_rate_limit;
+	                              if (steering_delta < -steering_rate_limit) steering_delta = -steering_rate_limit;
+	                              steering_adjustment += steering_delta;
 
 	                              log_p_line = p_line;
 	                              log_i_line = i_line;
@@ -1750,8 +1772,8 @@ int main(void)
 	                              // Mientras tanto: mantener último steering
 	                          }
 
-	                          if (steering_adjustment >  30.0f) steering_adjustment =  30.0f;
-	                          if (steering_adjustment < -30.0f) steering_adjustment = -30.0f;
+	                          if (steering_adjustment >  20.0f) steering_adjustment =  20.0f;
+	                          if (steering_adjustment < -20.0f) steering_adjustment = -20.0f;
 	                          break;
 	                      }
 
