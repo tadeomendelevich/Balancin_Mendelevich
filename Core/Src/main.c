@@ -113,8 +113,6 @@ typedef enum {
 
 #define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
 #define LINE_LOST_STEERING     12.0f // steering suave para cuando recién se pierde la línea
-#define LINE_SEARCH_STEERING   20.0f // steering suave para buscar (era 30 de máx)
-#define LINE_SEARCH_ANGLE      0.2f  // ángulo mínimo de avance durante búsqueda
 #define LINE_ANGLE_MIN  	   0.05f
 
 /* USER CODE END PD */
@@ -224,7 +222,7 @@ static uint32_t last_log_us = 0;
 static uint8_t  log_header_sent = 0;
 uint8_t f_send_csv_log = 0;
 uint8_t f_send_wifi_log = 0;
-uint8_t f_change_display = 2;
+uint8_t f_change_display = 4;
 
 static uint8_t f_wifi_connected = 0;
 static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
@@ -252,10 +250,10 @@ float KV_brake_value;
 
 // Line Follower Variables
 float KP_LINE = 23.0f;
-float KD_LINE = 4.0f;
+float KD_LINE = 0.5f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;
-float LINE_ANGLE = 0.08f;  // Base inclination (degrees) for forward movement
+float LINE_ANGLE = 0.05f;  // Base inclination (degrees) for forward movement
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
@@ -264,8 +262,6 @@ static float      last_line_dir    = 1.0f; // última dirección válida de la l
 
 static uint8_t upside_down_count = 0;
 static uint8_t upright_count = 0;
-
-
 
 
 /* USER CODE END PV */
@@ -1237,7 +1233,85 @@ void updateDisplay(void) {
             spinPhase3 = (spinPhase3 + 1) % 8;
         }
 
-    } else {
+    } else if (f_change_display == 4) {
+            // -------------------------------------------------------
+            // PANTALLA 4: Estado seguidor de línea + barras ADC 1..4
+            // -------------------------------------------------------
+
+            // ----- 4 barras ADC izquierda -----
+            {
+                const uint8_t  adc_count  = 4;
+                const uint16_t bar_top    = 2;
+                const uint16_t digit_y    = 55;
+                const uint16_t bar_max_h  = digit_y - bar_top - 1;
+                const uint16_t spacing    = 2;
+                const uint16_t left_w     = 55;
+                const uint16_t bar_width  = (left_w - (adc_count + 1) * spacing) / adc_count;
+
+                for (uint8_t i = 0; i < adc_count; i++) {
+                    uint8_t adc_idx = (adc_count - 1) - i;  // orden invertido: 3,2,1,0
+                    uint16_t v = adcAvg[adc_idx] > 4095 ? 4095 : adcAvg[adc_idx];
+                    uint16_t h = (uint32_t)v * bar_max_h / 4095;
+                    uint16_t x0 = spacing + i * (bar_width + spacing);
+                    uint16_t y0 = digit_y - 1 - h;
+
+                    if (h > 0)
+                        SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
+
+                    uint16_t tx = x0 + (bar_width - Font_5x7.FontWidth) / 2;
+                    SSD1306_DrawChar5x7('1' + adc_idx, tx, digit_y);
+                }
+                SSD1306_DrawLine(0, digit_y - 1, left_w - 1, digit_y - 1, SSD1306_COLOR_WHITE);
+            }
+
+            // ----- línea divisoria -----
+            SSD1306_DrawLine(57, 0, 57, SCREEN_H - 1, SSD1306_COLOR_WHITE);
+
+            // ----- estado grande a la derecha -----
+            {
+                const char *state_str;
+                const char *sub_str;
+
+                if (!f_line_following) {
+                    state_str = "OFF";
+                    sub_str   = "line off";
+                } else {
+                    switch (line_state) {
+                        case LINE_STATE_FOLLOWING:
+                            state_str = "FOLL";
+                            sub_str   = "following";
+                            break;
+                        case LINE_STATE_LOST:
+                            state_str = "LOST";
+                            sub_str   = "lost";
+                            break;
+                        case LINE_STATE_SEARCHING:
+                            state_str = "SREACH";
+                            sub_str   = "search";
+                            break;
+                        default:
+                            state_str = "???";
+                            sub_str   = "unknown";
+                            break;
+                    }
+                }
+
+                // Texto grande centrado en la zona derecha (x=58..127 = 70px de ancho)
+                const uint16_t rx = 58 + (70 - 3 * Font_7x10.FontWidth) / 2;
+                SSD1306_GotoXY(rx, 10);
+                SSD1306_Puts(state_str, &Font_7x10, SSD1306_COLOR_WHITE);
+
+                // Subtítulo centrado
+                uint16_t sub_w = strlen(sub_str) * (Font_5x7.FontWidth + 1);
+                uint16_t sub_x = 58 + (70 - sub_w) / 2;
+                SSD1306_GotoXY(sub_x, 28);
+                SSD1306_Puts(sub_str, &Font_5x7, SSD1306_COLOR_WHITE);
+
+                // f_line_following flag abajo
+                SSD1306_GotoXY(63, 44);
+                SSD1306_Puts(f_line_following ? "LF:ON " : "LF:OFF", &Font_5x7, SSD1306_COLOR_WHITE);
+            }
+    	} else {
         SSD1306_GotoXY(30, 25);
         SSD1306_Puts("DISPLAY?", &Font_7x10, SSD1306_COLOR_WHITE);
     }
@@ -1432,21 +1506,29 @@ int main(void)
 	          float line_error = 0.0f;
 	          float line_angle_cmd = LINE_ANGLE;
 	          uint8_t line_detected = 0;
+			  float w_sum = 0.0f;
+			  static float adc_f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+			  const float ADC_BETA = 0.3f;
 
 	          if (f_line_following) {
 	              velocity_est   = 0.0f;
 	              velocity_est_f = 0.0f;
 
-	              float s0 = adcValues[0];
-	              float s1 = adcValues[1];
-	              float s2 = adcValues[2];
-	              float s3 = adcValues[3];
+	              adc_f[0] += ADC_BETA * ((float)adcValues[0] - adc_f[0]);
+	              adc_f[1] += ADC_BETA * ((float)adcValues[1] - adc_f[1]);
+	              adc_f[2] += ADC_BETA * ((float)adcValues[2] - adc_f[2]);
+	              adc_f[3] += ADC_BETA * ((float)adcValues[3] - adc_f[3]);
+
+	              float s0 = adc_f[0];
+	              float s1 = adc_f[1];
+	              float s2 = adc_f[2];
+	              float s3 = adc_f[3];
 
 	              float w0 = (s0 > LINE_THRESHOLD) ? s0 : 0.0f;
 	              float w1 = (s1 > LINE_THRESHOLD) ? s1 : 0.0f;
 	              float w2 = (s2 > LINE_THRESHOLD) ? s2 : 0.0f;
 	              float w3 = (s3 > LINE_THRESHOLD) ? s3 : 0.0f;
-	              float w_sum = w0 + w1 + w2 + w3;
+	              w_sum = w0 + w1 + w2 + w3;
 
 	              line_detected = (w_sum > 0.0f);
 
@@ -1488,15 +1570,18 @@ int main(void)
 	              line_state          = LINE_STATE_FOLLOWING;
 	              dynamic_setpoint    = SETPOINT_ANGLE;
 	              dynamic_setpoint_f  = SETPOINT_ANGLE;
+	              line_lost_ms = HAL_GetTick();
 	          }
 	          prev_line_following = f_line_following;
 
 	          // 6. Setpoint dinámico
 	          if (f_line_following) {
-	              dynamic_setpoint = SETPOINT_ANGLE + line_angle_cmd;
+	        	  if (line_state == LINE_STATE_FOLLOWING && line_detected) {
+					  dynamic_setpoint = SETPOINT_ANGLE + line_angle_cmd;
 
-	              if (dynamic_setpoint >  LINE_ANGLE) dynamic_setpoint =  LINE_ANGLE;
-	              if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
+					  if (dynamic_setpoint >  LINE_ANGLE) dynamic_setpoint =  LINE_ANGLE;
+					  if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
+	        	  }
 	          } else {
 	              dynamic_setpoint = SETPOINT_ANGLE + (velocity_est_f * KV_brake_value);
 	          }
@@ -1624,7 +1709,14 @@ int main(void)
 
 	                  switch (line_state) {
 	                      case LINE_STATE_FOLLOWING:
-	                          if (line_detected) {
+	                      {
+	                          // Detección robusta: requiere peso total mínimo además de w_sum > 0
+	                          uint8_t line_detected_robust = line_detected && (w_sum > LINE_THRESHOLD * 0.5f);
+
+	                          if (line_detected_robust) {
+	                              // Línea vista: reiniciar el timestamp de pérdida
+	                              line_lost_ms = HAL_GetTick();
+
 	                              float p_line = KP_LINE * line_error;
 
 	                              line_integral += line_error * dt_fixed;
@@ -1636,30 +1728,35 @@ int main(void)
 
 	                              line_error_prev = line_error;
 	                              steering_adjustment = p_line + i_line + d_line;
+
 	                          } else {
-	                              line_lost_ms = HAL_GetTick();
-	                              line_state = LINE_STATE_LOST;
-	                              line_search_dir = last_line_dir;
-	                              line_integral = 0.0f; // Resetear integral para no afectar el control perdido
+	                              // Sin línea: medir tiempo real sin verla
+	                              uint32_t ms_sin_linea = HAL_GetTick() - line_lost_ms;
+
+	                              if (ms_sin_linea > 1000) {  // 1000ms reales continuos → pérdida real
+	                                  line_state      = LINE_STATE_LOST;
+	                                  line_search_dir = last_line_dir;
+	                                  line_integral   = 0.0f;
+	                              }
+	                              // Mientras tanto: mantener último steering
 	                          }
 
 	                          if (steering_adjustment >  30.0f) steering_adjustment =  30.0f;
 	                          if (steering_adjustment < -30.0f) steering_adjustment = -30.0f;
 	                          break;
+	                      }
 
 	                      case LINE_STATE_LOST:
 	                          if (line_detected) {
 	                              line_integral   = 0.0f;
 	                              line_error_prev = 0.0f;
+	                              line_lost_ms    = HAL_GetTick();  // ← resetear también al recuperar
 	                              line_state      = LINE_STATE_FOLLOWING;
-	                              // Dejamos que el controlador retome desde donde está para que sea suave
 	                          } else if ((HAL_GetTick() - line_lost_ms) > LINE_LOST_TIMEOUT_MS) {
 	                              line_state = LINE_STATE_SEARCHING;
 	                          } else {
-	                              // En vez de decaer, buscar suavemente hacia la dirección recordada
-	                              float target_steering = line_search_dir * LINE_LOST_STEERING;
-	                              // Filtro suave para llegar al valor objetivo
-	                              steering_adjustment += 0.05f * (target_steering - steering_adjustment);
+	                              float target = last_line_dir * 4.0f;
+	                              steering_adjustment += 0.02f * (target - steering_adjustment);
 	                          }
 	                          break;
 
@@ -1667,11 +1764,11 @@ int main(void)
 	                          if (line_detected) {
 	                              line_integral   = 0.0f;
 	                              line_error_prev = 0.0f;
+	                              line_lost_ms    = HAL_GetTick();  // ← resetear también al recuperar
 	                              line_state      = LINE_STATE_FOLLOWING;
 	                          } else {
-	                              // Búsqueda más agresiva en la misma dirección
-	                              float target_steering = line_search_dir * LINE_SEARCH_STEERING;
-	                              steering_adjustment += 0.05f * (target_steering - steering_adjustment);
+	                              float target = last_line_dir * 6.0f;
+	                              steering_adjustment += 0.02f * (target - steering_adjustment);
 	                          }
 	                          break;
 	                  }
@@ -1695,7 +1792,6 @@ int main(void)
 	                      motorRightVelocity = -(int16_t)mL;
 	                      motorLeftVelocity  = -(int16_t)mR;
 	                  }
-
 	              } else {
 	                  line_integral       = 0.0f;
 	                  line_error_prev     = 0.0f;
