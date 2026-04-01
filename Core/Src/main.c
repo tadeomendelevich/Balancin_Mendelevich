@@ -76,7 +76,7 @@ typedef enum {
 // PID
 #define KP     		3.100f
 #define KD     		0.180f
-#define KI    		0.010f
+#define KI    		0.005f
 #define BETA_G 		0.060f		 // LPF for Gyro
 #define BETA_A 		0.020f        // LPF for Accel
 
