@@ -74,9 +74,9 @@ typedef enum {
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP     		2.900f	// 2.745f antes
-#define KD     		0.180f	// 0.17f antes
-#define KI    		0.030f
+#define KP     		3.100f
+#define KD     		0.180f
+#define KI    		0.010f
 #define BETA_G 		0.060f		 // LPF for Gyro
 #define BETA_A 		0.020f        // LPF for Accel
 
@@ -98,17 +98,21 @@ typedef enum {
 #define DT_MAX 0.01f        // Max valid DT (10ms)
 
 // Fall detection (hysteresis)
-#define FALL_ANGLE      38.0f   // grados: detecta caída
-#define RECOVER_ANGLE   4.0f   // grados: condición para volver a balancear
-#define UPSIDE_DOWN_ANGLE    140.0f   // desde acá ya lo consideramos boca abajo
+#define FALL_ANGLE           50.0f
+#define RECOVER_ANGLE        3.0f
+#define UPSIDE_DOWN_ANGLE    120.0f  // más agresivo para detectar boca abajo antes
+#define DEAD_ZONE_ANGLE      15.0f   // entre 35° y 120° → zona muerta, motores off
 
 // --- DT fijo calibrado ---
 #define DT_WARMUP_SAMPLES	200
 #define BETA_JITTER    		0.01f
 
-#define KV_BRAKE         0.20f  // cuánto inclina el setpoint por velocidad estimada
-#define VEL_DECAY        0.970f // decaimiento del estimado (1.0=sin decay, 0.99=decay rápido)
-#define VEL_LPF_BETA     0.20f  // suavizado de la velocidad estimada
+//#define KV_BRAKE         0.20f  // cuánto inclina el setpoint por velocidad estimada
+//#define VEL_DECAY        0.970f // decaimiento del estimado (1.0=sin decay, 0.99=decay rápido)
+#define KV_BRAKE         0.15f
+#define VEL_DECAY        0.980f
+#define VEL_LPF_BETA     0.10f
+#define INTEGRAL_DECAY   0.998f
 #define KV_LINE_BRAKE 	 0.10f
 
 #define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
@@ -153,7 +157,7 @@ static volatile uint8_t usb_tx_busy = 0;
 static const char HEX_DIGITS[] = "0123456789ABCDEF";	// Tabla de dígitos hex para USB
 
 //static uint8_t ema_initialized = 0;
-static uint8_t sendModulesCounter, aliveCounter, mpu6050Counter;
+static uint8_t aliveCounter, mpu6050Counter;
 uint8_t mpuDataReady = 0;
 uint8_t mpu_initialized = 0;
 static float roll_deg = 0.0f;	// Ángulo de balanceo (eje Y, usado para el equilibrio)
@@ -249,7 +253,7 @@ float BETA_A_value;
 float KV_brake_value;
 
 // Line Follower Variables
-float KP_LINE = 12.0f;
+float KP_LINE = 18.0f;
 float KD_LINE = 0.2f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;
@@ -1556,8 +1560,10 @@ int main(void)
 	              if (line_angle_cmd < LINE_ANGLE_MIN) line_angle_cmd = LINE_ANGLE_MIN;
 
 	          } else {
-	              velocity_est    = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
-	              velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+	        	  velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
+	        	  if (velocity_est >  60.0f) velocity_est =  60.0f;
+	        	  if (velocity_est < -60.0f) velocity_est = -60.0f;
+	        	  velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
 	          }
 
 	          static uint8_t prev_line_following = 0;
@@ -1585,7 +1591,10 @@ int main(void)
 					  if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
 	        	  }
 	          } else {
-	              dynamic_setpoint = SETPOINT_ANGLE + (velocity_est_f * KV_brake_value);
+	              float brake = velocity_est_f * KV_brake_value;
+	              if (brake >  4.0f) brake =  4.0f;
+	              if (brake < -4.0f) brake = -4.0f;
+	              dynamic_setpoint = SETPOINT_ANGLE + brake;
 	          }
 
 	          if (dynamic_setpoint >  5.0f) dynamic_setpoint =  5.0f;
@@ -1605,6 +1614,9 @@ int main(void)
 	          float abs_roll_filt = fabsf(filtered_roll_deg);
 	          float abs_roll_raw  = fabsf(accel_ang_deg);
 
+	          // Zona muerta: entre FALL_ANGLE y UPSIDE_DOWN_ANGLE el robot está caído
+	          // y NO intenta recuperarse — espera quieto hasta estar casi vertical
+	          uint8_t in_dead_zone    = (abs_roll_raw >= FALL_ANGLE);
 	          uint8_t upright_now     = (abs_roll_raw < RECOVER_ANGLE);
 	          uint8_t upside_down_now = (abs_roll_raw > UPSIDE_DOWN_ANGLE);
 	          uint8_t fall_by_angle   = (abs_roll_filt > FALL_ANGLE);
@@ -1624,27 +1636,25 @@ int main(void)
 	          uint8_t fall_upside_down = (upside_down_count >= 5);
 
 	          if (!f_fallen) {
-	              if (fall_by_angle || fall_upside_down) {
+	              if (fall_by_angle || fall_upside_down || in_dead_zone) {
 	                  f_fallen = 1;
-
 	                  integral            = 0.0f;
 	                  velocity_est        = 0.0f;
 	                  velocity_est_f      = 0.0f;
 	                  line_integral       = 0.0f;
 	                  line_error_prev     = 0.0f;
 	                  steering_adjustment = 0.0f;
-
+	                  gyro_f              = 0.0f;   // ← limpiar gyro al caer
 	                  motorRightVelocity  = 0;
 	                  motorLeftVelocity   = 0;
 	              }
 	          } else {
-	              if (recover_by_angle && !fall_upside_down) {
+	              // Solo recuperar si está CASI vertical Y no está boca abajo
+	              if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
 	                  f_fallen = 0;
-
 	                  accel_roll_f      = accel_ang_deg;
 	                  filtered_roll_deg = accel_ang_deg;
 	                  gyro_f            = 0.0f;
-
 	                  integral            = 0.0f;
 	                  velocity_est        = 0.0f;
 	                  velocity_est_f      = 0.0f;
@@ -1653,12 +1663,14 @@ int main(void)
 	                  steering_adjustment = 0.0f;
 	                  dynamic_setpoint    = SETPOINT_ANGLE;
 	                  dynamic_setpoint_f  = SETPOINT_ANGLE;
-
 	                  upright_count       = 0;
 	                  upside_down_count   = 0;
 	              } else {
 	                  motorRightVelocity = 0;
 	                  motorLeftVelocity  = 0;
+	                  // Mantener gyro_f en cero mientras está caído
+	                  gyro_f = 0.0f;
+	                  filtered_roll_deg = accel_ang_deg;  // seguir el acelerómetro mientras está caído
 	              }
 	          }
 
@@ -1677,6 +1689,10 @@ int main(void)
 	          float log_d_line = 0.0f;
 
 	          if (!f_fallen) {
+	              if (!f_line_following) {
+	                  integral *= INTEGRAL_DECAY;
+	              }
+	              p_term = KP_value * error;
 	              p_term = KP_value * error;
 	              i_term = KI_value * integral;
 	              d_term = -KD_value * gyro_f;
@@ -1829,9 +1845,10 @@ int main(void)
 	                  steering_adjustment = 0.0f;
 	                  line_state          = LINE_STATE_FOLLOWING;
 
-	                  float steering_scale = 1.0f - (fabsf(steering_adjustment) / 100.0f);
-	                  float mR = pwm_sat * steering_scale + steering_adjustment;
-	                  float mL = pwm_sat * steering_scale - steering_adjustment;
+	                  steering_adjustment = 0.0f;  // ← AGREGAR ESTO
+
+					  float mR = pwm_sat;
+					  float mL = pwm_sat;
 
 	                  if (mR >  100.0f) mR =  100.0f;
 	                  if (mR < -100.0f) mR = -100.0f;
@@ -1964,45 +1981,36 @@ int main(void)
 
 	  if(is10ms) {
 	      is10ms = 0;
+	      static uint8_t subtick = 0;
+	      subtick = (subtick + 1) % 4;
 
-	      // -------------------------------------------------------
-	      // BLOQUE 10ms: Comunicaciones, display, ADC, tareas lentas
-	      // -------------------------------------------------------
-
+	      // Estas dos van siempre — son rápidas y críticas
 	      ESP01_Timeout10ms();
-	      ESP01_Task();
-
-	      tmo100ms--;
-	      if (tmo100ms == 0) {
-	          tmo100ms = 10;
-	          HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-	          HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_10);
-	      }
-
-	      sendModulesCounter++;
-	      if (sendModulesCounter >= 20) {
-	          sendModulesCounter = 0;
-	          if (UNER_ShouldSendAllSensors()) {
-	              UNER_SendAllSensors();
-	          }
-	      }
-
 	      UpdateADC_MovingAverage();
 
-	      static uint8_t display_timer = 0;
-	      display_timer++;
-	      if (display_timer >= 5) { // 50ms (20Hz) refresh rate
-		  display_timer = 0;
-		      if (SSD1306_IsUpdateDone()) {
-		          updateDisplay();
-		      }
-	      }
-
-	      if (f_resetMassCenter) {
-	          if (!i2c1_tx_busy) {
-	              MPU6050_Calibrate();
-	              f_resetMassCenter = 0;
-	          }
+	      // El resto se reparte en subticks
+	      switch (subtick) {
+	          case 0:
+	              ESP01_Task();
+	              break;
+	          case 1:
+	              if (SSD1306_IsUpdateDone()) updateDisplay();
+	              break;
+	          case 2:
+	              if (UNER_ShouldSendAllSensors()) UNER_SendAllSensors();
+	              if (f_resetMassCenter && !i2c1_tx_busy) {
+	                  MPU6050_Calibrate();
+	                  f_resetMassCenter = 0;
+	              }
+	              break;
+	          case 3:
+	              tmo100ms--;
+	              if (tmo100ms == 0) {
+	                  tmo100ms = 10;
+	                  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+	                  HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_10);
+	              }
+	              break;
 	      }
 	  }
 
