@@ -64,6 +64,7 @@ static uint8_t *p_resetMassCenter_flag = NULL;	// Bandera para resetear el centr
 static uint8_t *p_send_csv_log_flag = NULL;	//
 static uint8_t *p_send_wifi_log_flag = NULL;
 static uint8_t *p_change_display = NULL;
+static uint8_t *p_pos_maintenance_flag = NULL;
 
 static float *p_KP_LINE = NULL;
 static float *p_KD_LINE = NULL;
@@ -622,6 +623,15 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			}
 		break;
 
+        case ACTIVATE_POS_MAINTENANCE:
+			if (p_pos_maintenance_flag != NULL) {
+				*p_pos_maintenance_flag = !(*p_pos_maintenance_flag);
+				putHeaderOnTx(dataTx, ACTIVATE_POS_MAINTENANCE, 2);
+				putByteOnTx(dataTx, ACK);
+				putByteOnTx(dataTx, dataTx->chk);
+			}
+		break;
+
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
@@ -839,12 +849,13 @@ void UNER_RegisterSteering(float *steeringPtr) {
     p_steering = steeringPtr;
 }
 
-void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4, uint8_t *flagPtr5) {
+void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4, uint8_t *flagPtr5, uint8_t *flagPtr6) {
     p_balance_flag = flagPtr1;
     p_resetMassCenter_flag = flagPtr2;
     p_send_csv_log_flag = flagPtr3;
     p_send_wifi_log_flag = flagPtr4;
     p_change_display = flagPtr5;
+    p_pos_maintenance_flag = flagPtr6;
 }
 
 void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLinePtr, float *thresPtr, float *speedPtr, uint8_t *lineFollowFlagPtr) {

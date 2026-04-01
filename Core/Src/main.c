@@ -109,9 +109,9 @@ typedef enum {
 
 //#define KV_BRAKE         0.20f  // cuánto inclina el setpoint por velocidad estimada
 //#define VEL_DECAY        0.970f // decaimiento del estimado (1.0=sin decay, 0.99=decay rápido)
-#define KV_BRAKE         0.15f
+#define KV_BRAKE         0.10f
 #define VEL_DECAY        0.980f
-#define VEL_LPF_BETA     0.10f
+#define VEL_LPF_BETA     0.05f
 #define INTEGRAL_DECAY   0.998f
 #define KV_LINE_BRAKE 	 0.10f
 
@@ -227,6 +227,7 @@ static uint8_t  log_header_sent = 0;
 uint8_t f_send_csv_log = 0;
 uint8_t f_send_wifi_log = 0;
 uint8_t f_change_display = 4;
+uint8_t f_pos_maintenance = 0; // Starts disabled
 
 static uint8_t f_wifi_connected = 0;
 static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
@@ -1404,7 +1405,7 @@ int main(void)
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
   UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &BETA_G_value, &BETA_A_value, &KV_brake_value);
   UNER_RegisterSteering(&steering_adjustment);
-  UNER_RegisterFlags(&f_balancing, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
+  UNER_RegisterFlags(&f_balancing, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display, &f_pos_maintenance);
   UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_ANGLE, &f_line_following);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
@@ -1559,11 +1560,14 @@ int main(void)
 	              if (line_angle_cmd > LINE_ANGLE) line_angle_cmd = LINE_ANGLE;
 	              if (line_angle_cmd < LINE_ANGLE_MIN) line_angle_cmd = LINE_ANGLE_MIN;
 
-	          } else {
+	          } else if (f_pos_maintenance) {
 	        	  velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
 	        	  if (velocity_est >  60.0f) velocity_est =  60.0f;
 	        	  if (velocity_est < -60.0f) velocity_est = -60.0f;
 	        	  velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+	          } else {
+	              velocity_est   = 0.0f;
+	              velocity_est_f = 0.0f;
 	          }
 
 	          static uint8_t prev_line_following = 0;
@@ -1590,17 +1594,23 @@ int main(void)
 					  if (dynamic_setpoint >  LINE_ANGLE) dynamic_setpoint =  LINE_ANGLE;
 					  if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
 	        	  }
-	          } else {
+	          } else if (f_pos_maintenance) {
 	              float brake = velocity_est_f * KV_brake_value;
-	              if (brake >  4.0f) brake =  4.0f;
-	              if (brake < -4.0f) brake = -4.0f;
+	              if (brake >  3.0f) brake =  3.0f; // Limit the max brake angle to avoid abrupt falls
+	              if (brake < -3.0f) brake = -3.0f;
 	              dynamic_setpoint = SETPOINT_ANGLE + brake;
+	          } else {
+	              dynamic_setpoint = SETPOINT_ANGLE;
 	          }
 
 	          if (dynamic_setpoint >  5.0f) dynamic_setpoint =  5.0f;
 	          if (dynamic_setpoint < -5.0f) dynamic_setpoint = -5.0f;
 
 	          float sp_step_max = 0.0005f;  // Variacion maxima de angulo de avance para seguir linea
+	          if (f_pos_maintenance && !f_line_following) {
+			  sp_step_max = 0.002f; // Permitimos un cambio más rápido si estamos frenando para que reaccione mejor pero suavemente
+	          }
+
 	          float sp_delta = dynamic_setpoint - dynamic_setpoint_f;
 
 	          if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;
