@@ -121,7 +121,6 @@ typedef enum{
     MODIFY_LINE_THRES = 0xC3,
     MODIFY_LINE_SPEED = 0xC4,
     ACTIVATE_LINE_FOLLOWING = 0xC5,
-    ACTIVATE_POS_MAINTENANCE = 0xC6,
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -210,7 +209,7 @@ void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, 
 
 void UNER_RegisterSteering(float *steeringPtr);
 
-void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4, uint8_t *flagPtr5, uint8_t *flagPtr6);
+void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4, uint8_t *flagPtr5);
 
 void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLinePtr, float *thresPtr, float *speedPtr, uint8_t *lineFollowFlagPtr);
 
