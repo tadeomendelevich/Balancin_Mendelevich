@@ -105,7 +105,7 @@ typedef enum {
 #define DT_MAX 0.01f        // Max valid DT (10ms)
 
 // Fall detection (hysteresis)
-#define FALL_ANGLE           50.0f
+#define FALL_ANGLE           55.0f
 #define RECOVER_ANGLE        3.0f
 #define UPSIDE_DOWN_ANGLE    120.0f  // más agresivo para detectar boca abajo antes
 #define DEAD_ZONE_ANGLE      15.0f   // entre 35° y 120° → zona muerta, motores off
@@ -196,13 +196,13 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 //const char *wifiPassword = "fcalconcordia.06-2019";
 //const char *wifiIp = "172.23.205.98";
 
-const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-const char *wifiPassword = "djg19dlk";
-const char *wifiIp 		 = "192.168.100.5";
+//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+//const char *wifiPassword = "djg19dlk";
+//const char *wifiIp 		 = "192.168.100.5";
 
-//const char *wifiSSID     = "Delco_Mendelevich";
-//const char *wifiPassword = "toyotakia";
-//const char *wifiIp = "192.168.1.39";
+const char *wifiSSID     = "Delco_Mendelevich";
+const char *wifiPassword = "toyotakia";
+const char *wifiIp = "192.168.1.36";
 
 //const char *wifiSSID     = "Wifi Habitaciones";
 //const char *wifiPassword = "toyotakia";
@@ -233,7 +233,7 @@ static uint32_t last_log_us = 0;
 static uint8_t  log_header_sent = 0;
 uint8_t f_send_csv_log = 0;
 uint8_t f_send_wifi_log = 0;
-uint8_t f_change_display = 4;
+uint8_t f_change_display = 0;
 
 static uint8_t f_wifi_connected = 0;
 static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
@@ -274,7 +274,7 @@ static float      line_error_f_d   = 0.0f;
 
 static uint8_t upside_down_count = 0;
 static uint8_t upright_count = 0;
-
+static uint8_t fall_count = 0;
 
 /* USER CODE END PV */
 
@@ -972,40 +972,84 @@ void updateDisplay(void) {
         }
 
         // -------------------------------------------------------
-        // Mitad derecha: P, D, I, BG, BA, KV
-        // -------------------------------------------------------
-        {
-            const uint16_t rx = SCREEN_W / 2 + 2;
+		// Mitad derecha: P, D, I + estado actual del robot
+		// -------------------------------------------------------
+		{
+			const uint16_t rx = SCREEN_W / 2 + 2;
 
-            const char *param_labels[6] = { "P:", "D:", "I:", "BG:", "BA:", "KV:" };
-            float       param_vals[6]   = { KP_value, KD_value, KI_value,
-                                            BETA_G_value, BETA_A_value, KV_BRAKE };
+			// --- Filas 0-2: P, D, I con sus valores ---
+			const char *param_labels[3] = { "P:", "D:", "I:" };
+			float       param_vals[3]   = { KP_value, KD_value, KI_value };
 
-            for (uint8_t i = 0; i < 6; i++) {
-                uint16_t y = 1 + i * 10;
+			for (uint8_t i = 0; i < 3; i++) {
+				uint16_t y = 1 + i * 10;
 
-                SSD1306_GotoXY(rx, y);
-                SSD1306_Puts(param_labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
+				SSD1306_GotoXY(rx, y);
+				SSD1306_Puts(param_labels[i], &Font_7x10, SSD1306_COLOR_WHITE);
 
-                char fbuf[10];
-                float v = param_vals[i];
-                uint8_t neg = (v < 0);
-                if (neg) v = -v;
-                uint32_t int_part  = (uint32_t)v;
-                uint32_t frac_part = (uint32_t)((v - (float)int_part) * 1000.0f + 0.5f);
-                if (neg)
-                    snprintf(fbuf, sizeof(fbuf), "-%lu.%03lu",
-                             (unsigned long)int_part, (unsigned long)frac_part);
-                else
-                    snprintf(fbuf, sizeof(fbuf), "%lu.%03lu",
-                             (unsigned long)int_part, (unsigned long)frac_part);
+				char fbuf[10];
+				float v = param_vals[i];
+				uint8_t neg = (v < 0);
+				if (neg) v = -v;
+				uint32_t int_part  = (uint32_t)v;
+				uint32_t frac_part = (uint32_t)((v - (float)int_part) * 1000.0f + 0.5f);
+				if (neg)
+					snprintf(fbuf, sizeof(fbuf), "-%lu.%03lu",
+							 (unsigned long)int_part, (unsigned long)frac_part);
+				else
+					snprintf(fbuf, sizeof(fbuf), "%lu.%03lu",
+							 (unsigned long)int_part, (unsigned long)frac_part);
 
-                uint16_t label_w = (i < 3) ? 2 * Font_7x10.FontWidth
-                                           : 3 * Font_7x10.FontWidth;
-                SSD1306_GotoXY(rx + label_w, y);
-                SSD1306_Puts(fbuf, &Font_7x10, SSD1306_COLOR_WHITE);
-            }
-        }
+				uint16_t label_w = 2 * Font_7x10.FontWidth;
+				SSD1306_GotoXY(rx + label_w, y);
+				SSD1306_Puts(fbuf, &Font_7x10, SSD1306_COLOR_WHITE);
+			}
+
+			// --- Separador horizontal ---
+			SSD1306_DrawLine(SCREEN_W / 2 + 1, 32, SCREEN_W - 1, 32, SSD1306_COLOR_WHITE);
+
+			// --- Estado robot: nombre + sub-estado ---
+			{
+				const char *state_str = "";
+				const char *sub_str   = "";
+
+				switch (robot_state) {
+					case ROBOT_STATE_IDLE:
+						state_str = "IDLE";
+						sub_str   = "stopped";
+						break;
+					case ROBOT_STATE_BALANCE_ONLY:
+						state_str = "BAL";
+						sub_str   = f_fallen ? "FALLEN" : "balancing";
+						break;
+					case ROBOT_STATE_BALANCE_AND_SPEED:
+						state_str = "SPEED";
+						sub_str   = f_fallen ? "FALLEN" : "moving";
+						break;
+					case ROBOT_STATE_LINE_FOLLOWING:
+						state_str = "LINE";
+						switch (line_state) {
+							case LINE_STATE_FOLLOWING:  sub_str = "following"; break;
+							case LINE_STATE_LOST:       sub_str = "lost";      break;
+							case LINE_STATE_SEARCHING:  sub_str = "search";    break;
+							default:                    sub_str = "???";       break;
+						}
+						break;
+					default:
+						state_str = "???";
+						sub_str   = "";
+						break;
+				}
+
+				// Estado principal en Font_7x10 (fila y=35)
+				SSD1306_GotoXY(rx, 35);
+				SSD1306_Puts(state_str, &Font_7x10, SSD1306_COLOR_WHITE);
+
+				// Sub-estado en Font_5x7 (fila y=50)
+				SSD1306_GotoXY(rx, 50);
+				SSD1306_Puts(sub_str, &Font_5x7, SSD1306_COLOR_WHITE);
+			}
+		}
 
         // -------------------------------------------------------
         // Spinner
@@ -1595,6 +1639,16 @@ int main(void)
 	          }
 	          prev_robot_state = robot_state;
 
+	          if ((robot_state == ROBOT_STATE_BALANCE_ONLY || robot_state == ROBOT_STATE_BALANCE_AND_SPEED)
+	               && (prev_robot_state != robot_state)) {
+	              integral            = 0.0f;
+	              steering_adjustment = 0.0f;
+	              velocity_est        = 0.0f;
+	              velocity_est_f      = 0.0f;
+	              dynamic_setpoint    = SETPOINT_ANGLE;
+	              dynamic_setpoint_f  = SETPOINT_ANGLE;
+	          }
+
 	          // 6. Setpoint dinámico
 	          if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
 	        	  if (line_state == LINE_STATE_FOLLOWING && line_detected) {
@@ -1634,7 +1688,13 @@ int main(void)
 	          uint8_t in_dead_zone    = (abs_roll_raw >= FALL_ANGLE);
 	          uint8_t upright_now     = (abs_roll_raw < RECOVER_ANGLE);
 	          uint8_t upside_down_now = (abs_roll_raw > UPSIDE_DOWN_ANGLE);
-	          uint8_t fall_by_angle   = (abs_roll_filt > FALL_ANGLE);
+
+	          if (abs_roll_filt > FALL_ANGLE) {
+	              if (fall_count < 5) fall_count++;
+	          } else {
+	              fall_count = 0;
+	          }
+	          uint8_t fall_by_angle = (fall_count >= 3);
 
 	          if (upright_now) {
 	              if (upright_count < 20) upright_count++;
@@ -1680,6 +1740,7 @@ int main(void)
 	                  dynamic_setpoint_f  = SETPOINT_ANGLE;
 	                  upright_count       = 0;
 	                  upside_down_count   = 0;
+	                  fall_count          = 0;
 	              } else {
 	                  motorRightVelocity = 0;
 	                  motorLeftVelocity  = 0;
