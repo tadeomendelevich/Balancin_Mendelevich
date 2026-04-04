@@ -111,7 +111,7 @@ typedef enum {
 #define DT_MAX 0.01f        // Max valid DT (10ms)
 
 // Fall detection (hysteresis)
-#define FALL_ANGLE           55.0f
+#define FALL_ANGLE           45.0f
 #define RECOVER_ANGLE        3.0f
 #define UPSIDE_DOWN_ANGLE    120.0f  // más agresivo para detectar boca abajo antes
 #define DEAD_ZONE_ANGLE      15.0f   // entre 35° y 120° → zona muerta, motores off
@@ -1018,46 +1018,85 @@ void updateDisplay(void) {
 			// --- Separador horizontal ---
 			SSD1306_DrawLine(SCREEN_W / 2 + 1, 32, SCREEN_W - 1, 32, SSD1306_COLOR_WHITE);
 
-			// --- Estado robot: nombre + sub-estado ---
+			// -------------------------------------------------------
+			// Lado derecho inferior: modo + ángulo
+			// -------------------------------------------------------
 			{
-				const char *state_str = "";
-				const char *sub_str   = "";
+			    const uint16_t x0 = SCREEN_W / 2 + 4;
 
-				switch (robot_state) {
-					case ROBOT_STATE_IDLE:
-						state_str = "IDLE";
-						sub_str   = "stopped";
-						break;
-					case ROBOT_STATE_BALANCE_ONLY:
-						state_str = "BAL";
-						sub_str   = f_fallen ? "FALLEN" : "balancing";
-						break;
-					case ROBOT_STATE_BALANCE_AND_SPEED:
-						state_str = "SPEED";
-						sub_str   = f_fallen ? "FALLEN" : "moving";
-						break;
-					case ROBOT_STATE_LINE_FOLLOWING:
-						state_str = "LINE";
-						switch (line_state) {
-							case LINE_STATE_FOLLOWING:  sub_str = "following"; break;
-							case LINE_STATE_LOST:       sub_str = "lost";      break;
-							case LINE_STATE_SEARCHING:  sub_str = "search";    break;
-							default:                    sub_str = "???";       break;
-						}
-						break;
-					default:
-						state_str = "???";
-						sub_str   = "";
-						break;
-				}
+			    // -------- MODO (abajo a la derecha) --------
+			    const char *mode_str = "IDLE";
+			    switch (robot_state) {
+			        case ROBOT_STATE_IDLE:
+			            mode_str = "IDLE";
+			            break;
+			        case ROBOT_STATE_BALANCE_ONLY:
+			            mode_str = "BAL";
+			            break;
+			        case ROBOT_STATE_BALANCE_AND_SPEED:
+			            mode_str = "SPD";
+			            break;
+			        case ROBOT_STATE_LINE_FOLLOWING:
+			            mode_str = "LINE";
+			            break;
+			        default:
+			            mode_str = "UNK";
+			            break;
+			    }
 
-				// Estado principal en Font_7x10 (fila y=35)
-				SSD1306_GotoXY(rx, 35);
-				SSD1306_Puts(state_str, &Font_7x10, SSD1306_COLOR_WHITE);
+			    {
+			        uint16_t x = x0;
+			        uint16_t y = 42;   // modo abajo
+			        for (const char *p = mode_str; *p; p++) {
+			            SSD1306_DrawChar5x7(*p, x, y);
+			            x += Font_5x7.FontWidth + 1;
+			        }
+			    }
 
-				// Sub-estado en Font_5x7 (fila y=50)
-				SSD1306_GotoXY(rx, 50);
-				SSD1306_Puts(sub_str, &Font_5x7, SSD1306_COLOR_WHITE);
+			    // línea separadora chiquita
+			    SSD1306_DrawLine(x0, 51, SCREEN_W - 2, 51, SSD1306_COLOR_WHITE);
+
+			    // -------- ANGULO (debajo del modo) --------
+			    {
+			        char angbuf[16];
+			        uint16_t x = x0;
+			        uint16_t y = 54;
+
+			        int32_t ang10;
+			        int32_t ent;
+			        int32_t dec;
+
+			        // redondeo a 1 decimal
+			        if (filtered_roll_deg >= 0.0f) {
+			            ang10 = (int32_t)(filtered_roll_deg * 10.0f + 0.5f);
+			        } else {
+			            ang10 = (int32_t)(filtered_roll_deg * 10.0f - 0.5f);
+			        }
+
+			        ent = ang10 / 10;
+			        dec = ang10 % 10;
+			        if (dec < 0) dec = -dec;
+
+			        // texto corto y seguro
+			        snprintf(angbuf, sizeof(angbuf), "A:%ld.%ld", ent, dec);
+
+			        for (char *p = angbuf; *p; p++) {
+			            if (*p == '-') {
+			                SSD1306_DrawLine(x, y + 3, x + 3, y + 3, SSD1306_COLOR_WHITE);
+			                x += 5;
+			            } else if (*p == ':') {
+			                SSD1306_DrawPixel(x + 1, y + 1, SSD1306_COLOR_WHITE);
+			                SSD1306_DrawPixel(x + 1, y + 4, SSD1306_COLOR_WHITE);
+			                x += 4;
+			            } else if (*p == '.') {
+			                SSD1306_DrawPixel(x + 1, y + 6, SSD1306_COLOR_WHITE);
+			                x += 3;
+			            } else {
+			                SSD1306_DrawChar5x7(*p, x, y);
+			                x += Font_5x7.FontWidth + 1;
+			            }
+			        }
+			    }
 			}
 		}
 
@@ -1776,9 +1815,11 @@ int main(void)
 	          float log_d_line = 0.0f;
 
 	          if (!f_fallen) {
-	              if (robot_state != ROBOT_STATE_LINE_FOLLOWING) {
-	                  integral *= INTEGRAL_DECAY;
-	              }
+	        	  if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
+	        	      integral = 0.0f;   // sin integral en balance puro — evita control de posición implícito
+	        	  } else if (robot_state != ROBOT_STATE_LINE_FOLLOWING) {
+	        	      integral *= INTEGRAL_DECAY;
+	        	  }
 	              p_term = KP_value * error;
 	              p_term = KP_value * error;
 	              i_term = KI_value * integral;
@@ -1936,11 +1977,14 @@ int main(void)
 	                  line_error_prev     = 0.0f;
 	                  steering_adjustment = 0.0f;
 	                  line_state          = LINE_STATE_FOLLOWING;
+	                  steering_adjustment = 0.0f;
 
-	                  steering_adjustment = 0.0f;  // ← AGREGAR ESTO
+	                  // Corrección de yaw: gz resiste rotación vertical
+	                  float gz_dps = (float)gz / 131.0f;
+	                  float yaw_correction = -gz_dps * 0.3f;   // ← ganancia ajustable
 
-					  float mR = pwm_sat;
-					  float mL = pwm_sat;
+	                  float mR = pwm_sat + yaw_correction;
+	                  float mL = pwm_sat - yaw_correction;
 
 	                  if (mR >  100.0f) mR =  100.0f;
 	                  if (mR < -100.0f) mR = -100.0f;
