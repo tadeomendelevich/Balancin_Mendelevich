@@ -55,8 +55,14 @@ typedef enum {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define LED_Pin 			GPIO_PIN_13
-#define LED_GPIO_Port 		GPIOC
+#define LED_Pin 			GPIO_PIN_10
+#define LED_GPIO_Port 		GPIOB
+
+#define INTEGRATED_LED_Pin 			GPIO_PIN_13
+#define INTEGRATED_LED_GPIO_Port    GPIOC
+
+#define KEY_Pin        		GPIO_PIN_0
+#define KEY_GPIO_Port  		GPIOA
 
 #define CH_PD_GPIO_Port  	GPIOB
 #define CH_PD_Pin        	GPIO_PIN_2
@@ -83,7 +89,7 @@ typedef enum {
 // PID
 #define KP     		3.100f
 #define KD     		0.180f
-#define KI    		0.010f
+#define KI    		0.005f
 #define BETA_G 		0.060f		 // LPF for Gyro
 #define BETA_A 		0.020f        // LPF for Accel
 
@@ -276,6 +282,10 @@ static uint8_t upside_down_count = 0;
 static uint8_t upright_count = 0;
 static uint8_t fall_count = 0;
 
+static uint8_t key_prev = 1;
+static uint32_t key_last_ms = 0;
+static uint32_t key_click_time = 0;
+static uint8_t  key_click_count = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -1424,6 +1434,7 @@ int main(void)
   HAL_TIM_Base_Start_IT(&htim1);   // 10 ms
   HAL_TIM_Base_Start_IT(&htim2);   // 250 us (si lo vas a usar)
   HAL_TIM_Base_Start_IT(&htim5);   // 2 ms (500 Hz)
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
 
   PWM_init();
 
@@ -1798,6 +1809,11 @@ int main(void)
 	              if (integral >  I_MAX) integral =  I_MAX;
 	              if (integral < -I_MAX) integral = -I_MAX;
 
+	              if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
+	                  if (integral >  8.0f) integral =  8.0f;
+	                  if (integral < -8.0f) integral = -8.0f;
+	              }
+
 	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
 	                  if (integral >  2.0f) integral =  2.0f;
 	                  if (integral < -2.0f) integral = -2.0f;
@@ -2084,7 +2100,61 @@ int main(void)
 	              if (tmo100ms == 0) {
 	                  tmo100ms = 10;
 	                  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-	                  HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_10);
+	                  HAL_GPIO_TogglePin(INTEGRATED_LED_GPIO_Port, INTEGRATED_LED_Pin);
+	              }
+
+	              // ── Botón KEY: simple / doble / largo ──────────────────────────
+	              {
+	                  uint8_t key_now = HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin);
+	                  uint32_t now    = HAL_GetTick();
+
+	                  // Flanco de bajada: empieza pulsación
+	                  if (key_prev == 1 && key_now == 0) {
+	                      key_last_ms = now;
+	                  }
+
+	                  // Click largo: detectar mientras está presionado, sin esperar soltar
+	                  if (key_now == 0 && key_last_ms != 0 && (now - key_last_ms) > 800) {
+	                      f_change_display = (f_change_display + 1) % 5;
+	                      key_last_ms = 0;   // ← evita que se dispare repetidamente
+	                  }
+
+	                  // Flanco de subida: soltó el botón
+	                  if (key_prev == 0 && key_now == 1) {
+	                      uint32_t held = now - key_last_ms;
+
+	                      // key_last_ms == 0 significa que ya fue procesado como largo, ignorar
+	                      if (key_last_ms != 0 && held > 20) {
+	                          uint32_t since_last = now - key_click_time;
+	                          key_click_time = now;
+
+	                          if (since_last < 400) {
+	                              // Doble click
+	                              key_click_count = 0;
+	                              if (robot_state == ROBOT_STATE_IDLE ||
+	                                  robot_state == ROBOT_STATE_BALANCE_ONLY) {
+	                                  robot_state = ROBOT_STATE_LINE_FOLLOWING;
+	                              } else {
+	                                  robot_state = ROBOT_STATE_IDLE;
+	                              }
+	                          } else {
+	                              key_click_count = 1;
+	                          }
+	                      }
+	                      key_last_ms = 0;
+	                  }
+
+	                  // Click simple: si pasaron 400ms desde el primer click y no vino otro
+	                  if (key_click_count == 1 && (now - key_click_time) > 400) {
+	                      key_click_count = 0;
+	                      if (robot_state == ROBOT_STATE_IDLE) {
+	                          robot_state = ROBOT_STATE_BALANCE_ONLY;
+	                      } else {
+	                          robot_state = ROBOT_STATE_IDLE;
+	                      }
+	                  }
+
+	                  key_prev = key_now;
 	              }
 	              break;
 	      }
@@ -2636,6 +2706,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB2 LED_BLINKER_Pin */
   GPIO_InitStruct.Pin = GPIO_PIN_2|LED_BLINKER_Pin;
