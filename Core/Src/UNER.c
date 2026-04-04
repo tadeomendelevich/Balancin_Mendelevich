@@ -59,7 +59,7 @@ static float *p_pitch = NULL;
 static float *p_steering = NULL;
 
 
-static uint8_t *p_balance_flag = NULL;	// Bandera para activar o desctivar el balance del auto, si esta apagada, los motores estan desabilitados
+static uint8_t *p_robot_state = NULL;	// Puntero a la maquina de estados de los modos del robot
 static uint8_t *p_resetMassCenter_flag = NULL;	// Bandera para resetear el centro de gravedad del auto, realizando la medicion de la mpu nuevamente
 static uint8_t *p_send_csv_log_flag = NULL;	//
 static uint8_t *p_send_wifi_log_flag = NULL;
@@ -70,7 +70,6 @@ static float *p_KD_LINE = NULL;
 static float *p_KI_LINE = NULL;
 static float *p_LINE_THRES = NULL;
 static float *p_LINE_SPEED = NULL;
-static uint8_t *p_line_follow_flag = NULL;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
@@ -455,8 +454,12 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 		break;
 
         case BALANCE:
-        	if (p_balance_flag != NULL) {
-				*p_balance_flag = !(*p_balance_flag);
+		if (p_robot_state != NULL) {
+				if (*p_robot_state == 0) { // IDLE -> BALANCE_ONLY
+					*p_robot_state = 1;
+				} else { // ALL OTHER STATES -> IDLE
+					*p_robot_state = 0;
+				}
 				putHeaderOnTx(dataTx, BALANCE, 2);
 				putByteOnTx(dataTx, ACK);
 				putByteOnTx(dataTx, dataTx->chk);
@@ -614,9 +617,26 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 		break;
 
         case ACTIVATE_LINE_FOLLOWING:
-			if (p_line_follow_flag != NULL) {
-				*p_line_follow_flag = !(*p_line_follow_flag);
+			if (p_robot_state != NULL) {
+				if (*p_robot_state == 3) { // ROBOT_STATE_LINE_FOLLOWING -> BALANCE_ONLY
+					*p_robot_state = 1;
+				} else if (*p_robot_state != 0) { // IF NOT IDLE -> LINE_FOLLOWING
+					*p_robot_state = 3;
+				}
 				putHeaderOnTx(dataTx, ACTIVATE_LINE_FOLLOWING, 2);
+				putByteOnTx(dataTx, ACK);
+				putByteOnTx(dataTx, dataTx->chk);
+			}
+		break;
+
+        case ACTIVATE_POS_MAINTENANCE:
+			if (p_robot_state != NULL) {
+				if (*p_robot_state == 2) { // BALANCE_AND_SPEED -> BALANCE_ONLY
+					*p_robot_state = 1;
+				} else if (*p_robot_state == 1) { // BALANCE_ONLY -> BALANCE_AND_SPEED
+					*p_robot_state = 2;
+				}
+				putHeaderOnTx(dataTx, ACTIVATE_POS_MAINTENANCE, 2);
 				putByteOnTx(dataTx, ACK);
 				putByteOnTx(dataTx, dataTx->chk);
 			}
@@ -839,8 +859,11 @@ void UNER_RegisterSteering(float *steeringPtr) {
     p_steering = steeringPtr;
 }
 
+void UNER_RegisterRobotState(uint8_t *robotStatePtr) {
+    p_robot_state = robotStatePtr;
+}
+
 void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4, uint8_t *flagPtr5) {
-    p_balance_flag = flagPtr1;
     p_resetMassCenter_flag = flagPtr2;
     p_send_csv_log_flag = flagPtr3;
     p_send_wifi_log_flag = flagPtr4;
@@ -853,7 +876,6 @@ void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLineP
     p_KI_LINE = kiLinePtr;
     p_LINE_THRES = thresPtr;
     p_LINE_SPEED = speedPtr;
-    p_line_follow_flag = lineFollowFlagPtr;
 }
 
 // Envía el ring-buffer por USB y por UDP

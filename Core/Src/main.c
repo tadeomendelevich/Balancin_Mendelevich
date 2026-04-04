@@ -37,6 +37,13 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef enum {
+    ROBOT_STATE_IDLE = 0,
+    ROBOT_STATE_BALANCE_ONLY,
+    ROBOT_STATE_BALANCE_AND_SPEED,
+    ROBOT_STATE_LINE_FOLLOWING
+} eRobotState;
+
 // --- Line Search & Loss Control ---
 typedef enum {
     LINE_STATE_FOLLOWING = 0,  // Siguiendo línea normalmente
@@ -213,11 +220,11 @@ static uint32_t last_ctrl_us = 0;
 static float gyro_f = 0.0f;
 static float accel_roll_f = 0.0f;
 
-uint8_t f_line_following = 0; // Enables line following mode
+uint8_t robot_state = ROBOT_STATE_IDLE; // Controls the main state machine of the robot
+
 static float line_error_prev = 0.0f;
 static float line_integral = 0.0f;
 
-uint8_t f_balancing = 0;	// En 0 (cero) desactiva los motores del PID y en 1 ativa los motores con el PID
 uint8_t f_resetMassCenter = 0; // Resetea el centro de gravedad en el cual el auto hace balance
 
 // LOGGING VARIABLES
@@ -1277,7 +1284,7 @@ void updateDisplay(void) {
                 const char *state_str;
                 const char *sub_str;
 
-                if (!f_line_following) {
+                if (robot_state != ROBOT_STATE_LINE_FOLLOWING) {
                     state_str = "OFF";
                     sub_str   = "line off";
                 } else {
@@ -1314,7 +1321,7 @@ void updateDisplay(void) {
 
                 // f_line_following flag abajo
                 SSD1306_GotoXY(63, 44);
-                SSD1306_Puts(f_line_following ? "LF:ON " : "LF:OFF", &Font_5x7, SSD1306_COLOR_WHITE);
+                SSD1306_Puts((robot_state == ROBOT_STATE_LINE_FOLLOWING) ? "LF:ON " : "LF:OFF", &Font_5x7, SSD1306_COLOR_WHITE);
             }
     	} else {
         SSD1306_GotoXY(30, 25);
@@ -1404,8 +1411,9 @@ int main(void)
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
   UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &BETA_G_value, &BETA_A_value, &KV_brake_value);
   UNER_RegisterSteering(&steering_adjustment);
-  UNER_RegisterFlags(&f_balancing, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
-  UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_ANGLE, &f_line_following);
+  UNER_RegisterFlags(NULL, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
+  UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_ANGLE, NULL);
+  UNER_RegisterRobotState(&robot_state);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();
@@ -1515,7 +1523,7 @@ int main(void)
 			  static float adc_f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 			  const float ADC_BETA = 0.3f;
 
-	          if (f_line_following) {
+	          if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
 	              velocity_est   = 0.0f;
 	              velocity_est_f = 0.0f;
 
@@ -1560,14 +1568,19 @@ int main(void)
 	              if (line_angle_cmd < LINE_ANGLE_MIN) line_angle_cmd = LINE_ANGLE_MIN;
 
 	          } else {
-	        	  velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
-	        	  if (velocity_est >  60.0f) velocity_est =  60.0f;
-	        	  if (velocity_est < -60.0f) velocity_est = -60.0f;
-	        	  velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+	              if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
+			      velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
+			      if (velocity_est >  60.0f) velocity_est =  60.0f;
+			      if (velocity_est < -60.0f) velocity_est = -60.0f;
+			      velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+	              } else {
+	                  velocity_est = 0.0f;
+	                  velocity_est_f = 0.0f;
+	              }
 	          }
 
-	          static uint8_t prev_line_following = 0;
-	          if (f_line_following && !prev_line_following) {
+	          static eRobotState prev_robot_state = ROBOT_STATE_IDLE;
+	          if (robot_state == ROBOT_STATE_LINE_FOLLOWING && prev_robot_state != ROBOT_STATE_LINE_FOLLOWING) {
 	              integral            = 0.0f;
 	              line_integral       = 0.0f;
 	              line_error_prev     = 0.0f;
@@ -1580,21 +1593,23 @@ int main(void)
 	              dynamic_setpoint_f  = SETPOINT_ANGLE;
 	              line_lost_ms = HAL_GetTick();
 	          }
-	          prev_line_following = f_line_following;
+	          prev_robot_state = robot_state;
 
 	          // 6. Setpoint dinámico
-	          if (f_line_following) {
+	          if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
 	        	  if (line_state == LINE_STATE_FOLLOWING && line_detected) {
 					  dynamic_setpoint = SETPOINT_ANGLE + line_angle_cmd;
 
 					  if (dynamic_setpoint >  LINE_ANGLE) dynamic_setpoint =  LINE_ANGLE;
 					  if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
 	        	  }
-	          } else {
+	          } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
 	              float brake = velocity_est_f * KV_brake_value;
 	              if (brake >  4.0f) brake =  4.0f;
 	              if (brake < -4.0f) brake = -4.0f;
 	              dynamic_setpoint = SETPOINT_ANGLE + brake;
+	          } else {
+	              dynamic_setpoint = SETPOINT_ANGLE;
 	          }
 
 	          if (dynamic_setpoint >  5.0f) dynamic_setpoint =  5.0f;
@@ -1689,7 +1704,7 @@ int main(void)
 	          float log_d_line = 0.0f;
 
 	          if (!f_fallen) {
-	              if (!f_line_following) {
+	              if (robot_state != ROBOT_STATE_LINE_FOLLOWING) {
 	                  integral *= INTEGRAL_DECAY;
 	              }
 	              p_term = KP_value * error;
@@ -1704,12 +1719,12 @@ int main(void)
 	              if (pwm_sat >  100.0f) { pwm_sat =  100.0f; sat_flag = 1; }
 	              if (pwm_sat < -100.0f) { pwm_sat = -100.0f; sat_flag = 1; }
 
-	              if (f_line_following) {
+	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
 	                  if (pwm_sat >  40.0f) pwm_sat =  40.0f;
 	                  if (pwm_sat < -40.0f) pwm_sat = -40.0f;
 	              }
 
-	              float pwm_limit = f_line_following ? 40.0f : 100.0f;
+	              float pwm_limit = (robot_state == ROBOT_STATE_LINE_FOLLOWING) ? 40.0f : 100.0f;
 	              if (fabsf(pwm_cmd) <= pwm_limit) {
 	                  integral += error * dt_fixed;
 	              } else {
@@ -1722,12 +1737,12 @@ int main(void)
 	              if (integral >  I_MAX) integral =  I_MAX;
 	              if (integral < -I_MAX) integral = -I_MAX;
 
-	              if (f_line_following) {
+	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
 	                  if (integral >  2.0f) integral =  2.0f;
 	                  if (integral < -2.0f) integral = -2.0f;
 	              }
 
-	              if (f_line_following) {
+	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
 	                  uint8_t line_pivot_active = 0;
 
 	                  switch (line_state) {
@@ -1972,7 +1987,7 @@ int main(void)
 	          }
 	      }
 
-	      if (f_balancing && !f_fallen) {
+	      if ((robot_state != ROBOT_STATE_IDLE) && !f_fallen) {
 	          MotorControl(motorRightVelocity, motorLeftVelocity);
 	      } else {
 	          MotorControl(0, 0);
