@@ -89,7 +89,7 @@ typedef enum {
 // PID
 #define KP     		3.100f
 #define KD     		0.180f
-#define KI    		0.005f
+#define KI    		0.010f
 #define BETA_G 		0.060f		 // LPF for Gyro
 #define BETA_A 		0.020f        // LPF for Accel
 
@@ -122,10 +122,10 @@ typedef enum {
 
 //#define KV_BRAKE         0.20f  // cuánto inclina el setpoint por velocidad estimada
 //#define VEL_DECAY        0.970f // decaimiento del estimado (1.0=sin decay, 0.99=decay rápido)
-#define KV_BRAKE         0.15f
-#define VEL_DECAY        0.980f
-#define VEL_LPF_BETA     0.10f
-#define INTEGRAL_DECAY   0.998f
+#define KV_BRAKE         0.08f
+#define VEL_DECAY        0.970f
+#define VEL_LPF_BETA     0.06f
+#define INTEGRAL_DECAY   0.990f
 #define KV_LINE_BRAKE 	 0.10f
 
 #define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
@@ -1034,7 +1034,7 @@ void updateDisplay(void) {
 			            mode_str = "BAL";
 			            break;
 			        case ROBOT_STATE_BALANCE_AND_SPEED:
-			            mode_str = "SPD";
+			            mode_str = "SPEED";
 			            break;
 			        case ROBOT_STATE_LINE_FOLLOWING:
 			            mode_str = "LINE";
@@ -1045,8 +1045,8 @@ void updateDisplay(void) {
 			    }
 
 			    {
-			        uint16_t x = x0;
-			        uint16_t y = 42;   // modo abajo
+			        uint16_t x = x0 + 8;
+			        uint16_t y = 38;   // modo abajo
 			        for (const char *p = mode_str; *p; p++) {
 			            SSD1306_DrawChar5x7(*p, x, y);
 			            x += Font_5x7.FontWidth + 1;
@@ -1664,8 +1664,8 @@ int main(void)
 	          } else {
 	              if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
 			      velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
-			      if (velocity_est >  60.0f) velocity_est =  60.0f;
-			      if (velocity_est < -60.0f) velocity_est = -60.0f;
+			      if (velocity_est >  20.0f) velocity_est =  20.0f;
+				  if (velocity_est < -20.0f) velocity_est = -20.0f;
 			      velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
 	              } else {
 	                  velocity_est = 0.0f;
@@ -1708,16 +1708,14 @@ int main(void)
 					  if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
 	        	  }
 	          } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
-	              float brake = velocity_est_f * KV_brake_value;
-	              if (brake >  4.0f) brake =  4.0f;
-	              if (brake < -4.0f) brake = -4.0f;
-	              dynamic_setpoint = SETPOINT_ANGLE + brake;
+	              dynamic_setpoint = SETPOINT_ANGLE;
 	          } else {
 	              dynamic_setpoint = SETPOINT_ANGLE;
 	          }
 
-	          if (dynamic_setpoint >  5.0f) dynamic_setpoint =  5.0f;
-	          if (dynamic_setpoint < -5.0f) dynamic_setpoint = -5.0f;
+	          float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f : 5.0f;
+	          if (dynamic_setpoint >  sp_limit) dynamic_setpoint =  sp_limit;
+	          if (dynamic_setpoint < -sp_limit) dynamic_setpoint = -sp_limit;
 
 	          float sp_step_max = 0.0005f;  // Variacion maxima de angulo de avance para seguir linea
 	          float sp_delta = dynamic_setpoint - dynamic_setpoint_f;
@@ -1816,8 +1814,9 @@ int main(void)
 
 	          if (!f_fallen) {
 	        	  if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
-	        	      integral = 0.0f;   // sin integral en balance puro — evita control de posición implícito
-	        	  } else if (robot_state != ROBOT_STATE_LINE_FOLLOWING) {
+	        	      integral = 0.0f;
+	        	  } else if (robot_state != ROBOT_STATE_LINE_FOLLOWING &&
+	        	             robot_state != ROBOT_STATE_BALANCE_AND_SPEED) {
 	        	      integral *= INTEGRAL_DECAY;
 	        	  }
 	              p_term = KP_value * error;
@@ -1858,6 +1857,11 @@ int main(void)
 	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
 	                  if (integral >  2.0f) integral =  2.0f;
 	                  if (integral < -2.0f) integral = -2.0f;
+	              }
+
+	              if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
+	            	  if (integral >  15.0f) integral =  15.0f;
+					  if (integral < -15.0f) integral = -15.0f;
 	              }
 
 	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
@@ -2147,7 +2151,7 @@ int main(void)
 	                  HAL_GPIO_TogglePin(INTEGRATED_LED_GPIO_Port, INTEGRATED_LED_Pin);
 	              }
 
-	              // ── Botón KEY: simple / doble / largo ──────────────────────────
+	              // ── Botón KEY: simple / doble / triple / largo ──────────────────────────
 	              {
 	                  uint8_t key_now = HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin);
 	                  uint32_t now    = HAL_GetTick();
@@ -2167,35 +2171,48 @@ int main(void)
 	                  if (key_prev == 0 && key_now == 1) {
 	                      uint32_t held = now - key_last_ms;
 
-	                      // key_last_ms == 0 significa que ya fue procesado como largo, ignorar
 	                      if (key_last_ms != 0 && held > 20) {
 	                          uint32_t since_last = now - key_click_time;
-	                          key_click_time = now;
+	                          key_click_time = now;  // ← siempre actualizar al soltar
 
-	                          if (since_last < 400) {
-	                              // Doble click
-	                              key_click_count = 0;
-	                              if (robot_state == ROBOT_STATE_IDLE ||
-	                                  robot_state == ROBOT_STATE_BALANCE_ONLY) {
-	                                  robot_state = ROBOT_STATE_LINE_FOLLOWING;
-	                              } else {
-	                                  robot_state = ROBOT_STATE_IDLE;
-	                              }
+	                          if (since_last < 400 && key_click_count > 0) {
+	                              // Continúa la secuencia
+	                              key_click_count++;
 	                          } else {
+	                              // Nueva secuencia
 	                              key_click_count = 1;
 	                          }
 	                      }
 	                      key_last_ms = 0;
 	                  }
 
-	                  // Click simple: si pasaron 400ms desde el primer click y no vino otro
-	                  if (key_click_count == 1 && (now - key_click_time) > 400) {
-	                      key_click_count = 0;
-	                      if (robot_state == ROBOT_STATE_IDLE) {
-	                          robot_state = ROBOT_STATE_BALANCE_ONLY;
-	                      } else {
-	                          robot_state = ROBOT_STATE_IDLE;
+	                  // Resolución por timeout: 400ms desde el último click sin otro click
+	                  if (key_click_count > 0 && (now - key_click_time) > 400) {
+
+	                      if (key_click_count == 1) {
+	                          if (robot_state == ROBOT_STATE_IDLE) {
+	                              robot_state = ROBOT_STATE_BALANCE_ONLY;
+	                          } else {
+	                              robot_state = ROBOT_STATE_IDLE;
+	                          }
+
+	                      } else if (key_click_count == 2) {
+	                          if (robot_state == ROBOT_STATE_IDLE ||
+	                              robot_state == ROBOT_STATE_BALANCE_ONLY) {
+	                              robot_state = ROBOT_STATE_LINE_FOLLOWING;
+	                          } else {
+	                              robot_state = ROBOT_STATE_IDLE;
+	                          }
+
+	                      } else if (key_click_count >= 3) {
+	                          if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
+	                              robot_state = ROBOT_STATE_IDLE;
+	                          } else {
+	                              robot_state = ROBOT_STATE_BALANCE_AND_SPEED;
+	                          }
 	                      }
+
+	                      key_click_count = 0;
 	                  }
 
 	                  key_prev = key_now;
