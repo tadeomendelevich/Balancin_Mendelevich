@@ -122,6 +122,12 @@ typedef enum{
     MODIFY_LINE_SPEED = 0xC4,
     ACTIVATE_LINE_FOLLOWING = 0xC5,
     ACTIVATE_POS_MAINTENANCE = 0xC6,
+    ACTIVATE_MANUAL_CONTROL = 0xC7,
+    MANUAL_FORWARD = 0xD0,
+    MANUAL_BACKWARD = 0xD1,
+    MANUAL_LEFT = 0xD2,
+    MANUAL_RIGHT = 0xD3,
+    MANUAL_STOP = 0xD4,
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -213,6 +219,8 @@ void UNER_RegisterSteering(float *steeringPtr);
 void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4, uint8_t *flagPtr5);
 
 void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLinePtr, float *thresPtr, float *speedPtr, uint8_t *lineFollowFlagPtr);
+
+void UNER_RegisterManualControl(float *spCmdPtr, float *stCmdPtr, uint32_t *tmoPtr);
 
 void UNER_RegisterRobotState(uint8_t *robotStatePtr);
 
