@@ -2017,47 +2017,25 @@ int main(void)
 
 	                  motorRightVelocity = -(int16_t)mL;
 	                  motorLeftVelocity  = -(int16_t)mR;
-	              } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                      line_integral       = 0.0f;
-	                  line_error_prev     = 0.0f;
-	                  line_state          = LINE_STATE_FOLLOWING;
-
-                      steering_adjustment = manual_steering_cmd;
-
-	                  float mR = pwm_sat - steering_adjustment;
-	                  float mL = pwm_sat + steering_adjustment;
-
-	                  if (mR >  100.0f) mR =  100.0f;
-	                  if (mR < -100.0f) mR = -100.0f;
-	                  if (mL >  100.0f) mL =  100.0f;
-	                  if (mL < -100.0f) mL = -100.0f;
-
-	                  motorRightVelocity = -(int16_t)mL;
-	                  motorLeftVelocity  = -(int16_t)mR;
-                  } else {
-	                  line_integral       = 0.0f;
-	                  line_error_prev     = 0.0f;
-	                  steering_adjustment = 0.0f;
-	                  line_state          = LINE_STATE_FOLLOWING;
-	                  steering_adjustment = 0.0f;
-
-	                  // Corrección de yaw: gz resiste rotación vertical
-	                  float gz_dps = (float)gz / 131.0f;
-	                  float yaw_correction = -gz_dps * 0.3f;   // ← ganancia ajustable
-
-	                  float mR = pwm_sat + yaw_correction;
-	                  float mL = pwm_sat - yaw_correction;
-
-	                  if (mR >  100.0f) mR =  100.0f;
-	                  if (mR < -100.0f) mR = -100.0f;
-	                  if (mL >  100.0f) mL =  100.0f;
-	                  if (mL < -100.0f) mL = -100.0f;
-
-	                  motorRightVelocity = -(int16_t)mL;
-	                  motorLeftVelocity  = -(int16_t)mR;
 	              }
+	          } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                  line_integral       = 0.0f;
+                  line_error_prev     = 0.0f;
+                  line_state          = LINE_STATE_FOLLOWING;
 
-	          } else {
+                  steering_adjustment = manual_steering_cmd;
+
+                  float mR = pwm_sat - steering_adjustment;
+                  float mL = pwm_sat + steering_adjustment;
+
+                  if (mR >  100.0f) mR =  100.0f;
+                  if (mR < -100.0f) mR = -100.0f;
+                  if (mL >  100.0f) mL =  100.0f;
+                  if (mL < -100.0f) mL = -100.0f;
+
+                  motorRightVelocity = -(int16_t)mL;
+                  motorLeftVelocity  = -(int16_t)mR;
+              } else {
 	              motorRightVelocity = 0;
 	              motorLeftVelocity  = 0;
 	          }
