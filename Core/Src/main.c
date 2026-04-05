@@ -41,7 +41,8 @@ typedef enum {
     ROBOT_STATE_IDLE = 0,
     ROBOT_STATE_BALANCE_ONLY,
     ROBOT_STATE_BALANCE_AND_SPEED,
-    ROBOT_STATE_LINE_FOLLOWING
+    ROBOT_STATE_LINE_FOLLOWING,
+    ROBOT_STATE_MANUAL_CONTROL
 } eRobotState;
 
 // --- Line Search & Loss Control ---
@@ -227,6 +228,10 @@ static float gyro_f = 0.0f;
 static float accel_roll_f = 0.0f;
 
 uint8_t robot_state = ROBOT_STATE_IDLE; // Controls the main state machine of the robot
+
+static uint32_t manual_cmd_last_ms = 0;
+static float manual_setpoint_cmd = 0.0f;
+static float manual_steering_cmd = 0.0f;
 
 static float line_error_prev = 0.0f;
 static float line_integral = 0.0f;
@@ -1039,6 +1044,9 @@ void updateDisplay(void) {
 			        case ROBOT_STATE_LINE_FOLLOWING:
 			            mode_str = "LINE";
 			            break;
+                    case ROBOT_STATE_MANUAL_CONTROL:
+                        mode_str = "MANUAL";
+                        break;
 			        default:
 			            mode_str = "UNK";
 			            break;
@@ -1507,6 +1515,7 @@ int main(void)
   UNER_RegisterSteering(&steering_adjustment);
   UNER_RegisterFlags(NULL, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
   UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_ANGLE, NULL);
+  UNER_RegisterManualControl(&manual_setpoint_cmd, &manual_steering_cmd, &manual_cmd_last_ms);
   UNER_RegisterRobotState(&robot_state);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
@@ -1689,7 +1698,7 @@ int main(void)
 	          }
 	          prev_robot_state = robot_state;
 
-	          if ((robot_state == ROBOT_STATE_BALANCE_ONLY || robot_state == ROBOT_STATE_BALANCE_AND_SPEED)
+	          if ((robot_state == ROBOT_STATE_BALANCE_ONLY || robot_state == ROBOT_STATE_BALANCE_AND_SPEED || robot_state == ROBOT_STATE_MANUAL_CONTROL)
 	               && (prev_robot_state != robot_state)) {
 	              integral            = 0.0f;
 	              steering_adjustment = 0.0f;
@@ -1697,6 +1706,11 @@ int main(void)
 	              velocity_est_f      = 0.0f;
 	              dynamic_setpoint    = SETPOINT_ANGLE;
 	              dynamic_setpoint_f  = SETPOINT_ANGLE;
+                  if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                      manual_setpoint_cmd = 0.0f;
+                      manual_steering_cmd = 0.0f;
+                      manual_cmd_last_ms = HAL_GetTick();
+                  }
 	          }
 
 	          // 6. Setpoint dinámico
@@ -1707,7 +1721,13 @@ int main(void)
 					  if (dynamic_setpoint >  LINE_ANGLE) dynamic_setpoint =  LINE_ANGLE;
 					  if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
 	        	  }
-	          } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
+	          } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                  if (HAL_GetTick() - manual_cmd_last_ms > 500) {
+                      manual_setpoint_cmd = 0.0f;
+                      manual_steering_cmd = 0.0f;
+                  }
+                  dynamic_setpoint = SETPOINT_ANGLE + manual_setpoint_cmd;
+              } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
 	              dynamic_setpoint = SETPOINT_ANGLE;
 	          } else {
 	              dynamic_setpoint = SETPOINT_ANGLE;
@@ -1997,6 +2017,44 @@ int main(void)
 
 	                  motorRightVelocity = -(int16_t)mL;
 	                  motorLeftVelocity  = -(int16_t)mR;
+	              } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                      line_integral       = 0.0f;
+	                  line_error_prev     = 0.0f;
+	                  line_state          = LINE_STATE_FOLLOWING;
+
+                      steering_adjustment = manual_steering_cmd;
+
+	                  float mR = pwm_sat - steering_adjustment;
+	                  float mL = pwm_sat + steering_adjustment;
+
+	                  if (mR >  100.0f) mR =  100.0f;
+	                  if (mR < -100.0f) mR = -100.0f;
+	                  if (mL >  100.0f) mL =  100.0f;
+	                  if (mL < -100.0f) mL = -100.0f;
+
+	                  motorRightVelocity = -(int16_t)mL;
+	                  motorLeftVelocity  = -(int16_t)mR;
+                  } else {
+	                  line_integral       = 0.0f;
+	                  line_error_prev     = 0.0f;
+	                  steering_adjustment = 0.0f;
+	                  line_state          = LINE_STATE_FOLLOWING;
+	                  steering_adjustment = 0.0f;
+
+	                  // Corrección de yaw: gz resiste rotación vertical
+	                  float gz_dps = (float)gz / 131.0f;
+	                  float yaw_correction = -gz_dps * 0.3f;   // ← ganancia ajustable
+
+	                  float mR = pwm_sat + yaw_correction;
+	                  float mL = pwm_sat - yaw_correction;
+
+	                  if (mR >  100.0f) mR =  100.0f;
+	                  if (mR < -100.0f) mR = -100.0f;
+	                  if (mL >  100.0f) mL =  100.0f;
+	                  if (mL < -100.0f) mL = -100.0f;
+
+	                  motorRightVelocity = -(int16_t)mL;
+	                  motorLeftVelocity  = -(int16_t)mR;
 	              }
 
 	          } else {
@@ -2204,13 +2262,19 @@ int main(void)
 	                              robot_state = ROBOT_STATE_IDLE;
 	                          }
 
-	                      } else if (key_click_count >= 3) {
+	                      } else if (key_click_count == 3) {
 	                          if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
 	                              robot_state = ROBOT_STATE_IDLE;
 	                          } else {
 	                              robot_state = ROBOT_STATE_BALANCE_AND_SPEED;
 	                          }
-	                      }
+	                      } else if (key_click_count >= 4) {
+                              if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                                  robot_state = ROBOT_STATE_IDLE;
+                              } else {
+                                  robot_state = ROBOT_STATE_MANUAL_CONTROL;
+                              }
+                          }
 
 	                      key_click_count = 0;
 	                  }

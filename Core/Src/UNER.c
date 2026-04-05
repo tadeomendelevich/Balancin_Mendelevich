@@ -71,6 +71,10 @@ static float *p_KI_LINE = NULL;
 static float *p_LINE_THRES = NULL;
 static float *p_LINE_SPEED = NULL;
 
+static float *p_manual_sp_cmd = NULL;
+static float *p_manual_st_cmd = NULL;
+static uint32_t *p_manual_tmo = NULL;
+
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
     unerTx = tx;
@@ -642,6 +646,74 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			}
 		break;
 
+        case ACTIVATE_MANUAL_CONTROL:
+            if (p_robot_state != NULL) {
+                if (*p_robot_state == 4) { // MANUAL_CONTROL -> BALANCE_ONLY
+                    *p_robot_state = 1;
+                } else if (*p_robot_state != 0) { // IF NOT IDLE -> MANUAL_CONTROL
+                    *p_robot_state = 4;
+                }
+                putHeaderOnTx(dataTx, ACTIVATE_MANUAL_CONTROL, 2);
+                putByteOnTx(dataTx, ACK);
+                putByteOnTx(dataTx, dataTx->chk);
+            }
+        break;
+
+        case MANUAL_FORWARD:
+            if (p_robot_state != NULL && *p_robot_state == 4) {
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = 1.0f; // 1 degree forward
+                if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
+                if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
+            }
+            putHeaderOnTx(dataTx, MANUAL_FORWARD, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
+        case MANUAL_BACKWARD:
+            if (p_robot_state != NULL && *p_robot_state == 4) {
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = -1.0f; // 1 degree backward
+                if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
+                if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
+            }
+            putHeaderOnTx(dataTx, MANUAL_BACKWARD, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
+        case MANUAL_LEFT:
+            if (p_robot_state != NULL && *p_robot_state == 4) {
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
+                if (p_manual_st_cmd) *p_manual_st_cmd = -20.0f; // steering value for left
+                if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
+            }
+            putHeaderOnTx(dataTx, MANUAL_LEFT, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
+        case MANUAL_RIGHT:
+            if (p_robot_state != NULL && *p_robot_state == 4) {
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
+                if (p_manual_st_cmd) *p_manual_st_cmd = 20.0f; // steering value for right
+                if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
+            }
+            putHeaderOnTx(dataTx, MANUAL_RIGHT, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
+        case MANUAL_STOP:
+            if (p_robot_state != NULL && *p_robot_state == 4) {
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
+                if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
+                if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
+            }
+            putHeaderOnTx(dataTx, MANUAL_STOP, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
@@ -876,6 +948,12 @@ void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLineP
     p_KI_LINE = kiLinePtr;
     p_LINE_THRES = thresPtr;
     p_LINE_SPEED = speedPtr;
+}
+
+void UNER_RegisterManualControl(float *spCmdPtr, float *stCmdPtr, uint32_t *tmoPtr) {
+    p_manual_sp_cmd = spCmdPtr;
+    p_manual_st_cmd = stCmdPtr;
+    p_manual_tmo = tmoPtr;
 }
 
 // Envía el ring-buffer por USB y por UDP
