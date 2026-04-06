@@ -1954,12 +1954,18 @@ int main(void)
 	              }
 
 	              float pwm_limit = (robot_state == ROBOT_STATE_LINE_FOLLOWING) ? 40.0f : 100.0f;
-	              if (robot_state != ROBOT_STATE_BALANCE_ONLY && robot_state != ROBOT_STATE_MANUAL_CONTROL) {
-	                  if (fabsf(pwm_cmd) <= pwm_limit) {
-	                      integral += error * dt_fixed;
+	              if (robot_state != ROBOT_STATE_MANUAL_CONTROL) {
+	                  // Acumular integral solo si el error es significativo (zona muerta de 0.2 grados)
+	                  if (fabsf(error) > 0.2f) {
+	                      if (fabsf(pwm_cmd) <= pwm_limit) {
+	                          integral += error * dt_fixed;
+	                      } else {
+	                          if (pwm_cmd >  pwm_limit && error < 0) integral += error * dt_fixed;
+	                          else if (pwm_cmd < -pwm_limit && error > 0) integral += error * dt_fixed;
+	                      }
 	                  } else {
-	                      if (pwm_cmd >  pwm_limit && error < 0) integral += error * dt_fixed;
-	                      else if (pwm_cmd < -pwm_limit && error > 0) integral += error * dt_fixed;
+	                      // Decaimiento de la integral cuando el error es casi nulo (evita temblores)
+	                      integral *= 0.95f;
 	                  }
 	              }
 	              sat_flag = (fabsf(pwm_cmd) > pwm_limit) ? 1 : 0;
