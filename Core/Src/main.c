@@ -1930,7 +1930,7 @@ int main(void)
 	        	  if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
 	        	      integral = 0.0f;
 	        	  } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-	        		  integral = 0.0f;
+	        	      integral *= INTEGRAL_DECAY;
 	        	  } else if (robot_state != ROBOT_STATE_LINE_FOLLOWING &&
 	        	             robot_state != ROBOT_STATE_BALANCE_AND_SPEED) {
 	        	      integral *= INTEGRAL_DECAY;
@@ -1953,13 +1953,14 @@ int main(void)
 	              }
 
 	              float pwm_limit = (robot_state == ROBOT_STATE_LINE_FOLLOWING) ? 40.0f : 100.0f;
-	              if (fabsf(pwm_cmd) <= pwm_limit) {
-	                  integral += error * dt_fixed;
-	              } else {
-	                  if (pwm_cmd >  pwm_limit && error < 0) integral += error * dt_fixed;
-	                  else if (pwm_cmd < -pwm_limit && error > 0) integral += error * dt_fixed;
+	              if (robot_state != ROBOT_STATE_BALANCE_ONLY && robot_state != ROBOT_STATE_MANUAL_CONTROL) {
+	                  if (fabsf(pwm_cmd) <= pwm_limit) {
+	                      integral += error * dt_fixed;
+	                  } else {
+	                      if (pwm_cmd >  pwm_limit && error < 0) integral += error * dt_fixed;
+	                      else if (pwm_cmd < -pwm_limit && error > 0) integral += error * dt_fixed;
+	                  }
 	              }
-
 	              sat_flag = (fabsf(pwm_cmd) > pwm_limit) ? 1 : 0;
 
 	              if (integral >  I_MAX) integral =  I_MAX;
