@@ -123,11 +123,11 @@ typedef enum{
     ACTIVATE_LINE_FOLLOWING = 0xC5,
     ACTIVATE_POS_MAINTENANCE = 0xC6,
     ACTIVATE_MANUAL_CONTROL = 0xC7,
-    MANUAL_FORWARD = 0xD0,
-    MANUAL_BACKWARD = 0xD1,
-    MANUAL_LEFT = 0xD2,
-    MANUAL_RIGHT = 0xD3,
-    MANUAL_STOP = 0xD4,
+    MOVE_FORWARD = 0xD0,
+    MOVE_BACKWARD = 0xD1,
+    MOVE_LEFT = 0xD2,
+    MOVE_RIGHT = 0xD3,
+    MOVE_STOP = 0xD4,
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -230,5 +230,6 @@ void UNER_SendWifiLogData(WifiLogData_t *data);
 
 void UNER_SendData(void);
 
+uint8_t UNER_GetLastManualCmd(void);
 
 #endif /* ESP01_H_ */

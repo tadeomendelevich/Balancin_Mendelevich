@@ -112,8 +112,8 @@ typedef enum {
 #define DT_MAX 0.01f        // Max valid DT (10ms)
 
 // Fall detection (hysteresis)
-#define FALL_ANGLE           45.0f
-#define RECOVER_ANGLE        3.0f
+#define FALL_ANGLE           60.0f
+#define RECOVER_ANGLE        2.0f
 #define UPSIDE_DOWN_ANGLE    120.0f  // más agresivo para detectar boca abajo antes
 #define DEAD_ZONE_ANGLE      15.0f   // entre 35° y 120° → zona muerta, motores off
 
@@ -207,13 +207,13 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 //const char *wifiPassword = "djg19dlk";
 //const char *wifiIp 		 = "192.168.100.5";
 
-const char *wifiSSID     = "Delco_Mendelevich";
-const char *wifiPassword = "toyotakia";
-const char *wifiIp = "192.168.1.36";
-
-//const char *wifiSSID     = "Wifi Habitaciones";
+//const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
-//const char *wifiIp = "192.168.1.52";
+//const char *wifiIp = "192.168.1.36";
+
+const char *wifiSSID     = "Wifi Habitaciones";
+const char *wifiPassword = "toyotakia";
+const char *wifiIp = "192.168.1.48";
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
@@ -1029,6 +1029,63 @@ void updateDisplay(void) {
 			{
 			    const uint16_t x0 = SCREEN_W / 2 + 4;
 
+			    if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+					const uint16_t ax = x0;
+					const uint16_t ay = 38;
+					uint8_t cmd = UNER_GetLastManualCmd();
+
+					if (cmd == MOVE_FORWARD) {
+						// Flecha ARRIBA ↑
+						SSD1306_DrawPixel(ax + 3, ay + 0, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 2, ay + 1, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 1, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 4, ay + 1, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 1, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 5, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 3, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 4, SSD1306_COLOR_WHITE);
+					} else if (cmd == MOVE_BACKWARD) {
+						// Flecha ABAJO ↓
+						SSD1306_DrawPixel(ax + 3, ay + 0, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 1, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 1, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 5, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 2, ay + 3, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 3, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 4, ay + 3, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 4, SSD1306_COLOR_WHITE);
+					} else if (cmd == MOVE_RIGHT) {
+						// Flecha DERECHA →
+						SSD1306_DrawPixel(ax + 0, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 1, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 2, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 4, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 1, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 4, ay + 1, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 5, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 3, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 4, ay + 3, SSD1306_COLOR_WHITE);
+					} else if (cmd == MOVE_LEFT) {
+						// Flecha IZQUIERDA ←
+						SSD1306_DrawPixel(ax + 5, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 4, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 3, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 2, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 1, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 0, ay + 2, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 1, ay + 1, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 2, ay + 1, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 1, ay + 3, SSD1306_COLOR_WHITE);
+						SSD1306_DrawPixel(ax + 2, ay + 3, SSD1306_COLOR_WHITE);
+					} else {
+						// STOP: cuadradito
+						SSD1306_DrawFilledRectangle(ax + 1, ay + 1, 5, 3, SSD1306_COLOR_WHITE);
+					}
+				}
+
 			    // -------- MODO (abajo a la derecha) --------
 			    const char *mode_str = "IDLE";
 			    switch (robot_state) {
@@ -1053,7 +1110,7 @@ void updateDisplay(void) {
 			    }
 
 			    {
-			        uint16_t x = x0 + 8;
+			        uint16_t x = x0 + 15;
 			        uint16_t y = 38;   // modo abajo
 			        for (const char *p = mode_str; *p; p++) {
 			            SSD1306_DrawChar5x7(*p, x, y);
@@ -1607,7 +1664,7 @@ int main(void)
 	          const float ANG_SIGN = +1.0f;
 
 	          // 2) Gyro LPF
-	          float gyro_rate_dps = ANG_SIGN * ((float)gx / 131.0f);
+	          float gyro_rate_dps = ANG_SIGN * ((float)gx / 100.0f);
 	          gyro_f += BETA_G_value * (gyro_rate_dps - gyro_f);
 
 	          // 3) Accel angle (roll) LPF
@@ -1683,6 +1740,7 @@ int main(void)
 	          }
 
 	          static eRobotState prev_robot_state = ROBOT_STATE_IDLE;
+
 	          if (robot_state == ROBOT_STATE_LINE_FOLLOWING && prev_robot_state != ROBOT_STATE_LINE_FOLLOWING) {
 	              integral            = 0.0f;
 	              line_integral       = 0.0f;
@@ -1696,7 +1754,6 @@ int main(void)
 	              dynamic_setpoint_f  = SETPOINT_ANGLE;
 	              line_lost_ms = HAL_GetTick();
 	          }
-	          prev_robot_state = robot_state;
 
 	          if ((robot_state == ROBOT_STATE_BALANCE_ONLY || robot_state == ROBOT_STATE_BALANCE_AND_SPEED || robot_state == ROBOT_STATE_MANUAL_CONTROL)
 	               && (prev_robot_state != robot_state)) {
@@ -1713,6 +1770,8 @@ int main(void)
                   }
 	          }
 
+	          prev_robot_state = robot_state;
+
 	          // 6. Setpoint dinámico
 	          if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
 	        	  if (line_state == LINE_STATE_FOLLOWING && line_detected) {
@@ -1722,11 +1781,36 @@ int main(void)
 					  if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
 	        	  }
 	          } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                  if (HAL_GetTick() - manual_cmd_last_ms > 500) {
-                      manual_setpoint_cmd = 0.0f;
-                      manual_steering_cmd = 0.0f;
-                  }
-                  dynamic_setpoint = SETPOINT_ANGLE + manual_setpoint_cmd;
+	              if (HAL_GetTick() - manual_cmd_last_ms > 1500) {
+	                  manual_setpoint_cmd = 0.0f;
+	                  manual_steering_cmd = 0.0f;
+	              }
+
+	              const float manual_safe_angle = 15.0f;
+	              const float manual_max_angle  = 35.0f;
+
+	              float abs_roll = fabsf(filtered_roll_deg);
+	              float safety_factor;
+
+	              if (abs_roll <= manual_safe_angle) {
+	                  safety_factor = 1.0f;
+	              } else if (abs_roll >= manual_max_angle) {
+	                  safety_factor = 0.0f;
+	              } else {
+	                  safety_factor = 1.0f - ((abs_roll - manual_safe_angle)
+	                                  / (manual_max_angle - manual_safe_angle));
+	              }
+
+	              float scaled_cmd = manual_setpoint_cmd * safety_factor;
+
+				  // Solo bloquear si la inclinación es considerable (más de 5°)
+				  // Por debajo de eso, dejar que el PID y el comando coexistan
+				  const float conflict_threshold = 10.0f;
+
+				  if (filtered_roll_deg >  conflict_threshold && scaled_cmd > 0.0f) scaled_cmd = 0.0f;
+				  if (filtered_roll_deg < -conflict_threshold && scaled_cmd < 0.0f) scaled_cmd = 0.0f;
+
+				  dynamic_setpoint = SETPOINT_ANGLE + scaled_cmd;
               } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
 	              dynamic_setpoint = SETPOINT_ANGLE;
 	          } else {
@@ -1737,13 +1821,15 @@ int main(void)
 	          if (dynamic_setpoint >  sp_limit) dynamic_setpoint =  sp_limit;
 	          if (dynamic_setpoint < -sp_limit) dynamic_setpoint = -sp_limit;
 
-	          float sp_step_max = 0.0005f;  // Variacion maxima de angulo de avance para seguir linea
-	          float sp_delta = dynamic_setpoint - dynamic_setpoint_f;
-
-	          if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;
-	          if (sp_delta < -sp_step_max) sp_delta = -sp_step_max;
-
-	          dynamic_setpoint_f += sp_delta;
+	          if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+	              dynamic_setpoint_f = dynamic_setpoint;
+	          } else {
+	              float sp_step_max = 0.0005f;
+	              float sp_delta = dynamic_setpoint - dynamic_setpoint_f;
+	              if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;
+	              if (sp_delta < -sp_step_max) sp_delta = -sp_step_max;
+	              dynamic_setpoint_f += sp_delta;
+	          }
 
 	          // -------------------------------------------------------
 	          // FALL DETECTION
@@ -1753,9 +1839,16 @@ int main(void)
 
 	          // Zona muerta: entre FALL_ANGLE y UPSIDE_DOWN_ANGLE el robot está caído
 	          // y NO intenta recuperarse — espera quieto hasta estar casi vertical
-	          uint8_t in_dead_zone    = (abs_roll_raw >= FALL_ANGLE);
 	          uint8_t upright_now     = (abs_roll_raw < RECOVER_ANGLE);
 	          uint8_t upside_down_now = (abs_roll_raw > UPSIDE_DOWN_ANGLE);
+
+	          static uint8_t dead_zone_count = 0;
+	          if (abs_roll_raw >= FALL_ANGLE) {
+	        	  if (dead_zone_count < 10) dead_zone_count++;
+	          } else {
+	              dead_zone_count = 0;
+	          }
+	          uint8_t in_dead_zone = (dead_zone_count >= 10);
 
 	          if (abs_roll_filt > FALL_ANGLE) {
 	              if (fall_count < 5) fall_count++;
@@ -1809,6 +1902,7 @@ int main(void)
 	                  upright_count       = 0;
 	                  upside_down_count   = 0;
 	                  fall_count          = 0;
+	                  dead_zone_count     = 0;
 	              } else {
 	                  motorRightVelocity = 0;
 	                  motorLeftVelocity  = 0;
@@ -1835,15 +1929,17 @@ int main(void)
 	          if (!f_fallen) {
 	        	  if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
 	        	      integral = 0.0f;
+	        	  } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+	        		  integral = 0.0f;
 	        	  } else if (robot_state != ROBOT_STATE_LINE_FOLLOWING &&
 	        	             robot_state != ROBOT_STATE_BALANCE_AND_SPEED) {
 	        	      integral *= INTEGRAL_DECAY;
 	        	  }
-	              p_term = KP_value * error;
-	              p_term = KP_value * error;
-	              i_term = KI_value * integral;
-	              d_term = -KD_value * gyro_f;
-	              output = p_term + i_term + d_term;
+	        	  p_term = KP_value * error;
+	        	  i_term = KI_value * integral;
+	        	  d_term = -KD_value * gyro_f;
+
+	        	  output = p_term + i_term + d_term;
 
 	              pwm_cmd = output * MOTOR_GAIN;
 	              pwm_sat = pwm_cmd;
@@ -1882,6 +1978,11 @@ int main(void)
 	              if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
 	            	  if (integral >  15.0f) integral =  15.0f;
 					  if (integral < -15.0f) integral = -15.0f;
+	              }
+
+	              if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+	                  if (integral >  3.0f) integral =  3.0f;
+	                  if (integral < -3.0f) integral = -3.0f;
 	              }
 
 	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {

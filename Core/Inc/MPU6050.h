@@ -66,7 +66,7 @@ typedef struct {
 
 #define OFFSET_AX  450
 #define OFFSET_AY  450
-#define OFFSET_AZ  20000  // en reposo el Z mide 1g → ≈ 16384 + margen
+#define OFFSET_AZ  500  // en reposo el Z mide 1g → ≈ 16384 + margen
 
 #define OFFSET_GX  450
 #define OFFSET_GY  350

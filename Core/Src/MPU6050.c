@@ -129,7 +129,7 @@ void MPU6050_ProcessDMA(void) {
     }
     // Z
     if (abs(raw_az) <= OFFSET_AZ) {
-        az_real = ACCEL_SCALE_C;
+        az_real = 0;
     } else {
         az_real = (raw_az * ACCEL_SCALE_C) >> 14;
     }

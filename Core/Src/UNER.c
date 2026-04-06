@@ -75,6 +75,8 @@ static float *p_manual_sp_cmd = NULL;
 static float *p_manual_st_cmd = NULL;
 static uint32_t *p_manual_tmo = NULL;
 
+static uint8_t last_manual_cmd = 0;
+
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
     unerTx = tx;
@@ -659,57 +661,62 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
             }
         break;
 
-        case MANUAL_FORWARD:
+        case MOVE_FORWARD:
             if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = 1.0f; // 1 degree forward
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = 1.0f; // degree forward
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
+                last_manual_cmd = MOVE_FORWARD;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
             }
-            putHeaderOnTx(dataTx, MANUAL_FORWARD, 2);
+            putHeaderOnTx(dataTx, MOVE_FORWARD, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);
         break;
 
-        case MANUAL_BACKWARD:
+        case MOVE_BACKWARD:
             if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = -1.0f; // 1 degree backward
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = -1.0f; // degree backward
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
+                last_manual_cmd = MOVE_BACKWARD;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
             }
-            putHeaderOnTx(dataTx, MANUAL_BACKWARD, 2);
+            putHeaderOnTx(dataTx, MOVE_BACKWARD, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);
         break;
 
-        case MANUAL_LEFT:
+        case MOVE_LEFT:
             if (p_robot_state != NULL && *p_robot_state == 4) {
                 if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
                 if (p_manual_st_cmd) *p_manual_st_cmd = -20.0f; // steering value for left
+                last_manual_cmd = MOVE_LEFT;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
             }
-            putHeaderOnTx(dataTx, MANUAL_LEFT, 2);
+            putHeaderOnTx(dataTx, MOVE_LEFT, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);
         break;
 
-        case MANUAL_RIGHT:
+        case MOVE_RIGHT:
             if (p_robot_state != NULL && *p_robot_state == 4) {
                 if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
                 if (p_manual_st_cmd) *p_manual_st_cmd = 20.0f; // steering value for right
+                last_manual_cmd = MOVE_RIGHT;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
             }
-            putHeaderOnTx(dataTx, MANUAL_RIGHT, 2);
+            putHeaderOnTx(dataTx, MOVE_RIGHT, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);
         break;
 
-        case MANUAL_STOP:
+        case MOVE_STOP:
             if (p_robot_state != NULL && *p_robot_state == 4) {
                 if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
+                last_manual_cmd = MOVE_STOP;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
             }
-            putHeaderOnTx(dataTx, MANUAL_STOP, 2);
+            putHeaderOnTx(dataTx, MOVE_STOP, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);
         break;
@@ -1021,5 +1028,7 @@ void UNER_SendLogData(LogData_t *data) {
 
     UNER_SendData();
 }
+
+uint8_t UNER_GetLastManualCmd(void) { return last_manual_cmd; }
 
 /* END Private Functions*/
