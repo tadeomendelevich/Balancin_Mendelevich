@@ -1928,7 +1928,8 @@ int main(void)
 
 	          if (!f_fallen) {
 	        	  if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
-	        	      integral = 0.0f;
+	        	      if (integral >  3.0f) integral =  3.0f;
+	        	      if (integral < -3.0f) integral = -3.0f;
 	        	  } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
 	        	      integral *= INTEGRAL_DECAY;
 	        	  } else if (robot_state != ROBOT_STATE_LINE_FOLLOWING &&
