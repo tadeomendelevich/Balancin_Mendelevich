@@ -663,7 +663,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
         case MOVE_FORWARD:
             if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = 2.0f; // degree forward
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = 4.0f; // degree forward
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
                 last_manual_cmd = MOVE_FORWARD;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
@@ -675,7 +675,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
         case MOVE_BACKWARD:
             if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = -2.0f; // degree backward
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = -4.0f; // degree backward
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
                 last_manual_cmd = MOVE_BACKWARD;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
@@ -688,7 +688,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         case MOVE_LEFT:
             if (p_robot_state != NULL && *p_robot_state == 4) {
                 if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
-                if (p_manual_st_cmd) *p_manual_st_cmd = -20.0f; // steering value for left
+                if (p_manual_st_cmd) *p_manual_st_cmd = -60.0f; // steering value for left
                 last_manual_cmd = MOVE_LEFT;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
             }
@@ -700,7 +700,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         case MOVE_RIGHT:
             if (p_robot_state != NULL && *p_robot_state == 4) {
                 if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
-                if (p_manual_st_cmd) *p_manual_st_cmd = 20.0f; // steering value for right
+                if (p_manual_st_cmd) *p_manual_st_cmd = 60.0f; // steering value for right
                 last_manual_cmd = MOVE_RIGHT;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
             }
