@@ -60,19 +60,6 @@ typedef struct {
 #define MPU6050_READ_SIZE    14    // 6 bytes Accel + 2 bytes Temp + 6 bytes Gyro
 
 // ------------------------------------------------------
-// ➤ Offsets digitales para calibración (medidos en reposo)
-// ------------------------------------------------------
-// Se aplican para compensar el ruido o desvío de fábrica
-
-#define OFFSET_AX  450
-#define OFFSET_AY  450
-#define OFFSET_AZ  500  // en reposo el Z mide 1g → ≈ 16384 + margen
-
-#define OFFSET_GX  450
-#define OFFSET_GY  350
-#define OFFSET_GZ  350
-
-// ------------------------------------------------------
 // ➤ Parámetros de escala
 // ------------------------------------------------------
 

@@ -116,23 +116,11 @@ void MPU6050_ProcessDMA(void) {
     raw_az -= (int16_t)bias_az;
 
     // X
-    if (abs(raw_ax) <= OFFSET_AX) {
-        ax_real = 0;
-    } else {
-        ax_real = (raw_ax * ACCEL_SCALE_C) >> 14;
-    }
+    ax_real = (raw_ax * ACCEL_SCALE_C) >> 14;
     // Y
-    if (abs(raw_ay) <= OFFSET_AY) {
-        ay_real = 0;
-    } else {
-        ay_real = (raw_ay * ACCEL_SCALE_C) >> 14;
-    }
+    ay_real = (raw_ay * ACCEL_SCALE_C) >> 14;
     // Z
-    if (abs(raw_az) <= OFFSET_AZ) {
-        az_real = 0;
-    } else {
-        az_real = (raw_az * ACCEL_SCALE_C) >> 14;
-    }
+    az_real = (raw_az * ACCEL_SCALE_C) >> 14;
 
     // ----------------------------
     // 2) Compensa bias Giroscopio
@@ -142,23 +130,11 @@ void MPU6050_ProcessDMA(void) {
     raw_gz -= (int16_t)bias_gz;
 
     // X
-    if (abs(raw_gx) <= OFFSET_GX) {
-        gx_real = 0;
-    } else {
-        gx_real = (raw_gx * GYRO_SCALE_C) / GYRO_SENS;
-    }
+    gx_real = (raw_gx * GYRO_SCALE_C) / GYRO_SENS;
     // Y
-    if (abs(raw_gy) <= OFFSET_GY) {
-        gy_real = 0;
-    } else {
-        gy_real = (raw_gy * GYRO_SCALE_C) / GYRO_SENS;
-    }
+    gy_real = (raw_gy * GYRO_SCALE_C) / GYRO_SENS;
     // Z
-    if (abs(raw_gz) <= OFFSET_GZ) {
-        gz_real = 0;
-    } else {
-        gz_real = (raw_gz * GYRO_SCALE_C) / GYRO_SENS;
-    }
+    gz_real = (raw_gz * GYRO_SCALE_C) / GYRO_SENS;
 
     mpu_data_ready = 1; // Todos los datos listos
 }
@@ -168,11 +144,12 @@ void MPU6050_Calibrate(void) {
     int32_t sum_gx=0, sum_gy=0, sum_gz=0;
     int16_t raw_ax, raw_ay, raw_az;
     int16_t raw_gx, raw_gy, raw_gz;
-    uint8_t buf[6];
+    uint8_t buf[14]; // 14 bytes: 6 accel + 2 temp + 6 gyro
 
     for (int i = 0; i < CALIB_SAMPLES; ++i) {
-        // 1) Lee acelerómetro RAW
-        _platform->readReg(_platform->ctx, MPU6050_ADDR, ACCEL_XOUT_H_REG, buf, 6);
+        // 1) Lee acelerómetro, temp y giroscopio RAW en una sola transacción I2C
+        _platform->readReg(_platform->ctx, MPU6050_ADDR, ACCEL_XOUT_H_REG, buf, 14);
+
         raw_ax = (int16_t)(buf[0]<<8 | buf[1]);
         raw_ay = (int16_t)(buf[2]<<8 | buf[3]);
         raw_az = (int16_t)(buf[4]<<8 | buf[5]);
@@ -180,18 +157,18 @@ void MPU6050_Calibrate(void) {
         sum_ay += raw_ay;
         sum_az += raw_az;
 
-        // 2) Lee giroscopio RAW
-        _platform->readReg(_platform->ctx, MPU6050_ADDR, GYRO_XOUT_H_REG, buf, 6);
-        raw_gx = (int16_t)(buf[0]<<8 | buf[1]);
-        raw_gy = (int16_t)(buf[2]<<8 | buf[3]);
-        raw_gz = (int16_t)(buf[4]<<8 | buf[5]);
+        // bytes 6 y 7 son temperatura (se ignoran)
+
+        raw_gx = (int16_t)(buf[8]<<8 | buf[9]);
+        raw_gy = (int16_t)(buf[10]<<8 | buf[11]);
+        raw_gz = (int16_t)(buf[12]<<8 | buf[13]);
         sum_gx += raw_gx;
         sum_gy += raw_gy;
         sum_gz += raw_gz;
 
-        _platform->delayMs(_platform->ctx, 5);
+        _platform->delayMs(_platform->ctx, 1);
     }
-    // 3) Guarda sesgos promedio (en LSB)
+    // 2) Guarda sesgos promedio (en LSB)
     bias_ax = sum_ax / CALIB_SAMPLES;
     bias_ay = sum_ay / CALIB_SAMPLES;
     // Para Z restamos 1g en LSB:
