@@ -70,7 +70,7 @@ typedef enum {
 
 #define UDP_RX_SIZE  	 	512
 #define UDP_RX_MASK   		(UDP_RX_SIZE - 1)
-#define USB_TX_BUF_SIZE 	512
+#define USB_TX_BUF_SIZE 	2048
 #define USB_TX_BUF_MASK 	(USB_TX_BUF_SIZE-1)
 
 #define MPU_AVERAGE_SIZE 	10
@@ -1635,20 +1635,30 @@ int main(void)
 
 	      if (MPU6050_IsDataReady()) {
 	          MPU6050_ClearDataReady();
-
 	          MPU6050_GetAccel(&ax, &ay, &az);
 	          MPU6050_GetGyro(&gx, &gy, &gz);
+	      }
 
-	          // 1. Medir DT real siempre
-	          uint32_t now_us = micros();
-	          if (last_ctrl_us == 0) last_ctrl_us = now_us - 2000;
-	          float dt = (float)(now_us - last_ctrl_us) * 1e-6f;
-	          last_ctrl_us = now_us;
+	      if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
+	          MPU6050_StartRead_DMA();
+	      }
 
-	          if (dt < DT_MIN) dt = DT_MIN;
-	          if (dt > DT_MAX) dt = DT_MAX;
+	      // 1. Medir DT real siempre
+	      uint32_t now_us = micros();
+	      if (last_ctrl_us == 0) last_ctrl_us = now_us - 2000;
+	      float dt = (float)(now_us - last_ctrl_us) * 1e-6f;
+	      last_ctrl_us = now_us;
 
-	          dt_real = dt;
+	      dt_real = dt;
+
+	      // Deteccion de ciclo malo (bad cycle mitigation)
+	      uint8_t bad_cycle = 0;
+	      if (dt_real > 0.004f) { // dt > 4ms
+	          bad_cycle = 1;
+	      }
+
+	      if (dt < DT_MIN) dt = DT_MIN;
+	      if (dt > DT_MAX) dt = DT_MAX;
 
 	          if (!dt_calibrated) {
 	              dt_warmup_sum += dt_real;
@@ -1987,7 +1997,10 @@ int main(void)
 	          float log_i_line = 0.0f;
 	          float log_d_line = 0.0f;
 
-	          if (!f_fallen) {
+	          if (bad_cycle) {
+	              // Bad cycle mitigation: skip PID entirely and keep previous outputs.
+	              // Integrators remain frozen, preventing massive windup or jolts.
+	          } else if (!f_fallen) {
 	        	  if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
 	        	      if (integral >  3.0f) integral =  3.0f;
 	        	      if (integral < -3.0f) integral = -3.0f;
@@ -2309,7 +2322,7 @@ int main(void)
 	              float denom = sqrtf(ay_f_log*ay_f_log + az_f_log*az_f_log);
 	              float accel_pitch_deg = atan2f(-ax, denom) * (180.0f / M_PI);
 
-	              char line[256];
+	              char line[512];
 	              int32_t accel_mdeg   = (int32_t)(accel_ang_deg * 1000.0f);
 	              int32_t accel_f_mdeg = (int32_t)(accel_roll_f * 1000.0f);
 	              int32_t gyro_mdps    = (int32_t)(gyro_rate_dps * 1000.0f);
@@ -2357,16 +2370,6 @@ int main(void)
 
 	              usb_enqueue_tx((uint8_t*)line, (uint16_t)(ptr - line));
 	          }
-
-	          if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
-	              MPU6050_StartRead_DMA();
-	          }
-
-	      } else {
-	          if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
-	              MPU6050_StartRead_DMA();
-	          }
-	      }
 
 	      if ((robot_state != ROBOT_STATE_IDLE) && !f_fallen) {
 	          MotorControl(motorRightVelocity, motorLeftVelocity);
