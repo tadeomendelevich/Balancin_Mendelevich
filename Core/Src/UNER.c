@@ -663,7 +663,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
         case MOVE_FORWARD:
             if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = 5.0f; // degree forward
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = 4.0f; // degree forward
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
                 last_manual_cmd = MOVE_FORWARD;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
@@ -675,7 +675,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
         case MOVE_BACKWARD:
             if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = -5.0f; // degree backward
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = -4.0f; // degree backward
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
                 last_manual_cmd = MOVE_BACKWARD;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();

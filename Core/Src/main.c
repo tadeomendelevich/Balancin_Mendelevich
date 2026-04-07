@@ -293,6 +293,7 @@ static uint32_t key_click_time = 0;
 static uint8_t  key_click_count = 0;
 
 static float manual_setpoint_ramped = 0.0f;  // setpoint con rampa aplicada
+static float pwm_sat_prev = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -1667,7 +1668,14 @@ int main(void)
 
 	          // 2) Gyro LPF
 	          float gyro_rate_dps = ANG_SIGN * ((float)gx / 100.0f);
+
+	          if (gyro_rate_dps >  250.0f) gyro_rate_dps =  250.0f;
+	          if (gyro_rate_dps < -250.0f) gyro_rate_dps = -250.0f;
+
 	          gyro_f += BETA_G_value * (gyro_rate_dps - gyro_f);
+
+	          if (gyro_f >  180.0f) gyro_f =  180.0f;
+	          if (gyro_f < -180.0f) gyro_f = -180.0f;
 
 	          // 3) Accel angle (roll) LPF
 	          float accel_ang_deg = ANG_SIGN * (atan2f(ay, az) * (180.0f / M_PI));
@@ -1676,9 +1684,25 @@ int main(void)
 	          float accel_mag = sqrtf((float)ax*(float)ax + (float)ay*(float)ay + (float)az*(float)az);
 	          const float ONE_G = 981.0f;
 	          float accel_ratio = accel_mag / ONE_G;
-	          float beta_a_used = ((accel_ratio >= 0.80f) && (accel_ratio <= 1.20f))
-	                              ? BETA_A_value
-	                              : 0.0f;
+	          float beta_a_used;
+
+	          if (accel_ratio >= 0.92f && accel_ratio <= 1.08f) {
+	              beta_a_used = BETA_A_value;
+	          } else if (accel_ratio < 0.75f || accel_ratio > 1.25f) {
+	              beta_a_used = 0.0f;
+	          } else {
+	              float dist;
+	              if (accel_ratio < 0.92f) {
+	                  dist = (accel_ratio - 0.75f) / (0.92f - 0.75f);
+	              } else {
+	                  dist = (1.25f - accel_ratio) / (1.25f - 1.08f);
+	              }
+
+	              if (dist < 0.0f) dist = 0.0f;
+	              if (dist > 1.0f) dist = 1.0f;
+
+	              beta_a_used = BETA_A_value * dist;
+	          }
 
 	          accel_roll_f += beta_a_used * (accel_ang_deg - accel_roll_f);
 
@@ -1774,6 +1798,7 @@ int main(void)
 	              velocity_est_f      = 0.0f;
 	              dynamic_setpoint    = SETPOINT_ANGLE;
 	              dynamic_setpoint_f  = SETPOINT_ANGLE;
+	              pwm_sat_prev = 0.0f;
                   if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                       manual_setpoint_cmd = 0.0f;
                       manual_steering_cmd = 0.0f;
@@ -1917,6 +1942,7 @@ int main(void)
 	                  gyro_f              = 0.0f;   // ← limpiar gyro al caer
 	                  motorRightVelocity  = 0;
 	                  motorLeftVelocity   = 0;
+	                  pwm_sat_prev = 0.0f;
 	              }
 	          } else {
 	              // Solo recuperar si está CASI vertical Y no está boca abajo
@@ -1937,6 +1963,7 @@ int main(void)
 	                  upside_down_count   = 0;
 	                  fall_count          = 0;
 	                  dead_zone_count     = 0;
+	                  pwm_sat_prev = 0.0f;
 	              } else {
 	                  motorRightVelocity = 0;
 	                  motorLeftVelocity  = 0;
@@ -1974,6 +2001,9 @@ int main(void)
 	        	  i_term = KI_value * integral;
 	        	  d_term = -KD_value * gyro_f;
 
+	        	  if (d_term >  8.0f) d_term =  8.0f;
+	        	  if (d_term < -8.0f) d_term = -8.0f;
+
 	        	  output = p_term + i_term + d_term;
 
 	              pwm_cmd = output * MOTOR_GAIN;
@@ -1999,6 +2029,25 @@ int main(void)
 	                  pwm_limit = 55.0f;
 	              } else {
 	                  pwm_limit = 100.0f;
+	              }
+
+	              {
+	                  float pwm_step_max;
+
+	                  if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+	                      pwm_step_max = 2.0f;   // más suave
+	                  } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+	                      pwm_step_max = 2.0f;
+	                  } else {
+	                      pwm_step_max = 3.0f;   // balance normal
+	                  }
+
+	                  float pwm_delta = pwm_sat - pwm_sat_prev;
+	                  if (pwm_delta >  pwm_step_max) pwm_delta =  pwm_step_max;
+	                  if (pwm_delta < -pwm_step_max) pwm_delta = -pwm_step_max;
+
+	                  pwm_sat = pwm_sat_prev + pwm_delta;
+	                  pwm_sat_prev = pwm_sat;
 	              }
 
 	              if (robot_state != ROBOT_STATE_MANUAL_CONTROL) {
