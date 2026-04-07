@@ -203,17 +203,17 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 //const char *wifiPassword = "fcalconcordia.06-2019";
 //const char *wifiIp = "172.23.205.98";
 
-//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-//const char *wifiPassword = "djg19dlk";
-//const char *wifiIp 		 = "192.168.100.5";
+const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+const char *wifiPassword = "djg19dlk";
+const char *wifiIp 		 = "192.168.100.5";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
 //const char *wifiIp = "192.168.1.36";
 
-const char *wifiSSID     = "Wifi Habitaciones";
-const char *wifiPassword = "toyotakia";
-const char *wifiIp = "192.168.1.48";
+//const char *wifiSSID     = "Wifi Habitaciones";
+//const char *wifiPassword = "toyotakia";
+//const char *wifiIp = "192.168.1.48";
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
@@ -291,6 +291,8 @@ static uint8_t key_prev = 1;
 static uint32_t key_last_ms = 0;
 static uint32_t key_click_time = 0;
 static uint8_t  key_click_count = 0;
+
+static float manual_setpoint_ramped = 0.0f;  // setpoint con rampa aplicada
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -1669,7 +1671,16 @@ int main(void)
 
 	          // 3) Accel angle (roll) LPF
 	          float accel_ang_deg = ANG_SIGN * (atan2f(ay, az) * (180.0f / M_PI));
-	          accel_roll_f += BETA_A_value * (accel_ang_deg - accel_roll_f);
+
+	          // Detectar aceleración lineal — si no es ~1g, no confiar en el acelerómetro
+	          float accel_mag = sqrtf((float)ax*(float)ax + (float)ay*(float)ay + (float)az*(float)az);
+	          const float ONE_G = 981.0f;
+	          float accel_ratio = accel_mag / ONE_G;
+	          float beta_a_used = ((accel_ratio >= 0.80f) && (accel_ratio <= 1.20f))
+	                              ? BETA_A_value
+	                              : 0.0f;
+
+	          accel_roll_f += beta_a_used * (accel_ang_deg - accel_roll_f);
 
 	          // 4) Complementary Filter
 	          filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_fixed)
@@ -1767,6 +1778,8 @@ int main(void)
                       manual_setpoint_cmd = 0.0f;
                       manual_steering_cmd = 0.0f;
                       manual_cmd_last_ms = HAL_GetTick();
+                      manual_setpoint_ramped = 0.0f;
+                      steering_adjustment    = 0.0f;
                   }
 	          }
 
@@ -1781,10 +1794,13 @@ int main(void)
 					  if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
 	        	  }
 	          } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-	              if (HAL_GetTick() - manual_cmd_last_ms > 1500) {
-	                  manual_setpoint_cmd = 0.0f;
-	                  manual_steering_cmd = 0.0f;
-	              }
+	        	  if (HAL_GetTick() - manual_cmd_last_ms > 60) {
+	        	      manual_setpoint_cmd *= 0.96f;
+	        	      manual_steering_cmd *= 0.90f;
+
+	        	      if (fabsf(manual_setpoint_cmd) < 0.01f) manual_setpoint_cmd = 0.0f;
+	        	      if (fabsf(manual_steering_cmd) < 0.01f) manual_steering_cmd = 0.0f;
+	        	  }
 
 	              const float manual_safe_angle = 15.0f;
 	              const float manual_max_angle  = 35.0f;
@@ -1803,14 +1819,32 @@ int main(void)
 
 	              float scaled_cmd = manual_setpoint_cmd * safety_factor;
 
-				  // Solo bloquear si la inclinación es considerable (más de 5°)
-				  // Por debajo de eso, dejar que el PID y el comando coexistan
-				  const float conflict_threshold = 10.0f;
+	              const float conflict_threshold = 10.0f;
+	              if (filtered_roll_deg >  conflict_threshold && scaled_cmd > 0.0f) scaled_cmd = 0.0f;
+	              if (filtered_roll_deg < -conflict_threshold && scaled_cmd < 0.0f) scaled_cmd = 0.0f;
 
-				  if (filtered_roll_deg >  conflict_threshold && scaled_cmd > 0.0f) scaled_cmd = 0.0f;
-				  if (filtered_roll_deg < -conflict_threshold && scaled_cmd < 0.0f) scaled_cmd = 0.0f;
+	              // --- RAMPA: limitar velocidad de cambio del setpoint ---
+	              // Velocidad de rampa: grados por ciclo de control (2ms)
+	              // 0.05f → tarda ~1 segundo en llegar a 2.5° (ajustable)
+	              const float RAMP_RATE_UP   = 0.01f;  // subida (cuando se da el comando)
+	              const float RAMP_RATE_DOWN = 0.008f;  // bajada/retorno (más rápido para seguridad)
 
-				  dynamic_setpoint = SETPOINT_ANGLE + scaled_cmd;
+	              float ramp_target = SETPOINT_ANGLE + scaled_cmd;
+	              float ramp_delta  = ramp_target - manual_setpoint_ramped;
+
+	              float ramp_rate = (ramp_delta > 0.0f) ? RAMP_RATE_UP : RAMP_RATE_DOWN;
+
+	              if (fabsf(ramp_delta) <= ramp_rate) {
+	                  manual_setpoint_ramped = ramp_target;   // llegó al destino
+	              } else {
+	                  manual_setpoint_ramped += (ramp_delta > 0.0f) ? ramp_rate : -ramp_rate;
+	              }
+	              velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
+	              if (velocity_est >  20.0f) velocity_est =  20.0f;
+	              if (velocity_est < -20.0f) velocity_est = -20.0f;
+	              velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+
+	              dynamic_setpoint = manual_setpoint_ramped - KV_brake_value * velocity_est_f;
               } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
 	              dynamic_setpoint = SETPOINT_ANGLE;
 	          } else {
@@ -1821,13 +1855,13 @@ int main(void)
 	          if (dynamic_setpoint >  sp_limit) dynamic_setpoint =  sp_limit;
 	          if (dynamic_setpoint < -sp_limit) dynamic_setpoint = -sp_limit;
 
-	          if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-	              dynamic_setpoint_f = dynamic_setpoint;
-	          } else {
-	              float sp_step_max = 0.0005f;
+	          {
+	              float sp_step_max = (robot_state == ROBOT_STATE_MANUAL_CONTROL) ? 0.004f : 0.0005f;
 	              float sp_delta = dynamic_setpoint - dynamic_setpoint_f;
+
 	              if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;
 	              if (sp_delta < -sp_step_max) sp_delta = -sp_step_max;
+
 	              dynamic_setpoint_f += sp_delta;
 	          }
 
@@ -1931,7 +1965,7 @@ int main(void)
 	        	      if (integral >  3.0f) integral =  3.0f;
 	        	      if (integral < -3.0f) integral = -3.0f;
 	        	  } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-	        	      integral *= INTEGRAL_DECAY;
+	        		  integral *= 0.970f;
 	        	  } else if (robot_state != ROBOT_STATE_LINE_FOLLOWING &&
 	        	             robot_state != ROBOT_STATE_BALANCE_AND_SPEED) {
 	        	      integral *= INTEGRAL_DECAY;
@@ -1953,7 +1987,20 @@ int main(void)
 	                  if (pwm_sat < -40.0f) pwm_sat = -40.0f;
 	              }
 
-	              float pwm_limit = (robot_state == ROBOT_STATE_LINE_FOLLOWING) ? 40.0f : 100.0f;
+	              if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+	                  if (pwm_sat >  55.0f) pwm_sat =  55.0f;
+	                  if (pwm_sat < -55.0f) pwm_sat = -55.0f;
+	              }
+
+	              float pwm_limit;
+	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+	                  pwm_limit = 40.0f;
+	              } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+	                  pwm_limit = 55.0f;
+	              } else {
+	                  pwm_limit = 100.0f;
+	              }
+
 	              if (robot_state != ROBOT_STATE_MANUAL_CONTROL) {
 	                  // Acumular integral solo si el error es significativo (zona muerta de 0.2 grados)
 	                  if (fabsf(error) > 0.2f) {
@@ -1989,8 +2036,8 @@ int main(void)
 	              }
 
 	              if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-	                  if (integral >  3.0f) integral =  3.0f;
-	                  if (integral < -3.0f) integral = -3.0f;
+	            	  if (integral >  1.5f) integral =  1.5f;
+	            	  if (integral < -1.5f) integral = -1.5f;
 	              }
 
 	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
@@ -2132,10 +2179,25 @@ int main(void)
                   line_error_prev     = 0.0f;
                   line_state          = LINE_STATE_FOLLOWING;
 
-                  steering_adjustment = manual_steering_cmd;
+                  {
+					  const float STEER_RATE = 1.5f;  // máx cambio por ciclo (2ms) → ajustable
+					  float steer_delta = manual_steering_cmd - steering_adjustment;
+					  if (steer_delta >  STEER_RATE) steer_delta =  STEER_RATE;
+					  if (steer_delta < -STEER_RATE) steer_delta = -STEER_RATE;
+					  steering_adjustment += steer_delta;
+				  }
 
-                  float mR = pwm_sat - steering_adjustment;
-                  float mL = pwm_sat + steering_adjustment;
+				  // Limpiar integral cuando el steering cambia de signo abruptamente
+				  // (detecta el momento exacto del cambio de dirección)
+				  static float prev_steering_cmd = 0.0f;
+				  if ((manual_steering_cmd > 0.5f && prev_steering_cmd < -0.5f) ||
+					  (manual_steering_cmd < -0.5f && prev_steering_cmd > 0.5f)) {
+					  integral = 0.0f;  // flush integral en cambio de dirección
+				  }
+				  prev_steering_cmd = manual_steering_cmd;
+
+				  float mR = pwm_sat - steering_adjustment;
+				  float mL = pwm_sat + steering_adjustment;
 
                   if (mR >  100.0f) mR =  100.0f;
                   if (mR < -100.0f) mR = -100.0f;
