@@ -72,6 +72,8 @@ typedef enum {
 #define UDP_RX_MASK   		(UDP_RX_SIZE - 1)
 #define USB_TX_BUF_SIZE 	512
 #define USB_TX_BUF_MASK 	(USB_TX_BUF_SIZE-1)
+#define UDP_BYTES_PER_CYCLE 8
+
 
 #define MPU_AVERAGE_SIZE 	10
 #define ADC_AVERAGE_SIZE 	40
@@ -131,7 +133,7 @@ typedef enum {
 
 #define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
 #define LINE_LOST_STEERING     12.0f // steering suave para cuando recién se pierde la línea
-#define LINE_ANGLE_MIN  	   0.05f
+#define LINE_ANGLE_MIN  	   0.00f
 
 /* USER CODE END PD */
 
@@ -240,11 +242,10 @@ uint8_t f_resetMassCenter = 0; // Resetea el centro de gravedad en el cual el au
 
 // LOGGING VARIABLES
 static uint32_t log_counter = 0;
-static uint32_t last_log_us = 0;
 static uint8_t  log_header_sent = 0;
 uint8_t f_send_csv_log = 0;
 uint8_t f_send_wifi_log = 0;
-uint8_t f_change_display = 0;
+uint8_t f_change_display = 1;
 
 static uint8_t f_wifi_connected = 0;
 static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
@@ -271,11 +272,11 @@ float BETA_A_value;
 float KV_brake_value;
 
 // Line Follower Variables
-float KP_LINE = 18.0f;
-float KD_LINE = 0.2f;
+float KP_LINE = 10.0f;
+float KD_LINE = 0.0f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;
-float LINE_ANGLE = 0.5f;  // Base inclination (degrees) for forward movement
+float LINE_ANGLE = 1;  // Base inclination (degrees) for forward movement
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
@@ -293,7 +294,16 @@ static uint32_t key_click_time = 0;
 static uint8_t  key_click_count = 0;
 
 static float manual_setpoint_ramped = 0.0f;  // setpoint con rampa aplicada
+static float line_angle_ramped      = 0.0f;  // rampa del avance en line follower
 static float pwm_sat_prev = 0.0f;
+
+volatile uint8_t tick2ms_count = 0;
+
+static uint8_t uart_tx_byte = 0;
+
+static int16_t ax = 0, ay = 0, az = 0;
+static int16_t gx = 0, gy = 0, gz = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -345,6 +355,10 @@ void updateDisplay(void);
 static void esp01_chpd(uint8_t val);
 void ESP01_AttachChangeState(OnESP01ChangeState aOnESP01ChangeState);
 void appOnESP01ChangeState(_eESP01STATUS state);
+
+void ProcessEspRxLimited(void);
+
+static void ControlStep2ms(void);
 
 static inline uint32_t micros(void) {
     return DWT->CYCCNT / (SystemCoreClock / 1000000);
@@ -426,7 +440,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     }
 
     if (htim->Instance == TIM5) {        // 2 ms
-            is2ms = 1;
+    	if (tick2ms_count < 10) tick2ms_count++;
     }
 }
 
@@ -878,6 +892,19 @@ void appOnESP01ChangeState(_eESP01STATUS state) {
 	}
 }
 
+void ProcessEspRxLimited(void) {
+    uint8_t count = 0;
+
+    while ((((esp01IwRx - esp01IrRx) & UDP_RX_MASK) != 0) && (count < UDP_BYTES_PER_CYCLE)) {
+        uint8_t b = esp01RxBuf[esp01IrRx];
+        esp01IrRx = (esp01IrRx + 1) & UDP_RX_MASK;
+
+        UNER_PushByte(b);
+
+        count++;
+    }
+}
+
 void updateDisplay(void) {
     SSD1306_Fill(SSD1306_COLOR_BLACK);
 
@@ -1203,7 +1230,182 @@ void updateDisplay(void) {
             spinPhase = (spinPhase + 1) % 8;
         }
 
-    } else if (f_change_display == 1) {
+    }  else if (f_change_display == 1) {
+        // -------------------------------------------------------
+        // PANTALLA 1: Estado general + estado line follower
+        // -------------------------------------------------------
+
+        // ----- 4 barras ADC izquierda -----
+        {
+            const uint8_t  adc_count  = 4;
+            const uint16_t bar_top    = 2;
+            const uint16_t digit_y    = 55;
+            const uint16_t bar_max_h  = digit_y - bar_top - 1;
+            const uint16_t spacing    = 2;
+            const uint16_t left_w     = 55;
+            const uint16_t bar_width  = (left_w - (adc_count + 1) * spacing) / adc_count;
+
+            for (uint8_t i = 0; i < adc_count; i++) {
+                uint8_t adc_idx = (adc_count - 1) - i;
+                uint16_t v = adcAvg[adc_idx] > 4095 ? 4095 : adcAvg[adc_idx];
+                uint16_t h = (uint32_t)v * bar_max_h / 4095;
+                uint16_t x0 = spacing + i * (bar_width + spacing);
+                uint16_t y0 = digit_y - 1 - h;
+
+                if (h > 0) {
+                    SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
+                }
+
+                uint16_t tx = x0 + (bar_width - Font_5x7.FontWidth) / 2;
+                SSD1306_DrawChar5x7('1' + adc_idx, tx, digit_y);
+            }
+
+            SSD1306_DrawLine(0, digit_y - 1, left_w - 1, digit_y - 1, SSD1306_COLOR_WHITE);
+        }
+
+        // ----- línea divisoria vertical -----
+        SSD1306_DrawLine(57, 0, 57, SCREEN_H - 1, SSD1306_COLOR_WHITE);
+
+        // ----- lado derecho -----
+        {
+            const char *robot_mode_str = "IDLE";
+            const char *line_mode_str  = "OFF";
+
+            switch (robot_state) {
+                case ROBOT_STATE_IDLE:
+                    robot_mode_str = "IDLE";
+                    break;
+                case ROBOT_STATE_BALANCE_ONLY:
+                    robot_mode_str = "BAL";
+                    break;
+                case ROBOT_STATE_BALANCE_AND_SPEED:
+                    robot_mode_str = "SPEED";
+                    break;
+                case ROBOT_STATE_LINE_FOLLOWING:
+                    robot_mode_str = "LINE";
+                    break;
+                case ROBOT_STATE_MANUAL_CONTROL:
+                    robot_mode_str = "MAN";
+                    break;
+                default:
+                    robot_mode_str = "UNK";
+                    break;
+            }
+
+            if (robot_state != ROBOT_STATE_LINE_FOLLOWING) {
+                line_mode_str = "OFF";
+            } else {
+                switch (line_state) {
+                    case LINE_STATE_FOLLOWING:
+                        line_mode_str = "FOLLOW";
+                        break;
+                    case LINE_STATE_LOST:
+                        line_mode_str = "LOST";
+                        break;
+                    case LINE_STATE_SEARCHING:
+                        line_mode_str = "SEARCH";
+                        break;
+                    default:
+                        line_mode_str = "UNK";
+                        break;
+                }
+            }
+
+            // WiFi chico arriba a la derecha
+            {
+                const uint16_t ix = 112;
+                const uint16_t iy = 3;
+
+                if (f_wifi_connected) {
+                    SSD1306_DrawPixel(ix + 3, iy + 6, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 4, iy + 6, SSD1306_COLOR_WHITE);
+
+                    SSD1306_DrawPixel(ix + 2, iy + 5, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 3, iy + 4, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 4, iy + 4, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 5, iy + 5, SSD1306_COLOR_WHITE);
+
+                    SSD1306_DrawPixel(ix + 1, iy + 4, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 2, iy + 3, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 3, iy + 2, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 4, iy + 2, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 5, iy + 3, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 6, iy + 4, SSD1306_COLOR_WHITE);
+
+                    SSD1306_DrawPixel(ix + 0, iy + 3, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 1, iy + 2, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 2, iy + 1, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 3, iy + 0, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 4, iy + 0, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 5, iy + 1, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 6, iy + 2, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 7, iy + 3, SSD1306_COLOR_WHITE);
+                } else {
+                    SSD1306_DrawLine(ix + 1, iy + 1, ix + 6, iy + 6, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawLine(ix + 6, iy + 1, ix + 1, iy + 6, SSD1306_COLOR_WHITE);
+                }
+            }
+
+            // línea separadora horizontal
+            SSD1306_DrawLine(62, 15, 123, 15, SSD1306_COLOR_WHITE);
+
+            // modo del auto grande en el centro
+            {
+                uint16_t title_w = strlen(robot_mode_str) * Font_7x10.FontWidth;
+                uint16_t title_x = 58 + (70 - title_w) / 2;
+
+                SSD1306_GotoXY(title_x, 20);
+                SSD1306_Puts(robot_mode_str, &Font_7x10, SSD1306_COLOR_WHITE);
+            }
+
+            // línea chica inferior
+            SSD1306_DrawLine(62, 47, 123, 47, SSD1306_COLOR_WHITE);
+
+            // modo del seguidor abajo, a la izquierda del spinner
+            {
+                uint16_t x = 62;
+                uint16_t y = 50;
+
+                for (const char *p = line_mode_str; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, y);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
+
+            // spinner abajo a la derecha
+            {
+                const uint16_t sx = 118;
+                const uint16_t sy = 57;
+
+                static uint8_t spinPhaseLF = 0;
+
+                static const int8_t spokes[8][4] = {
+                    { 0, -4,  0, -3},
+                    { 3, -3,  2, -2},
+                    { 4,  0,  3,  0},
+                    { 3,  3,  2,  2},
+                    { 0,  4,  0,  3},
+                    {-3,  3, -2,  2},
+                    {-4,  0, -3,  0},
+                    {-3, -3, -2, -2},
+                };
+
+                for (uint8_t s = 0; s < 3; s++) {
+                    uint8_t idx = (spinPhaseLF + s) % 8;
+                    SSD1306_DrawPixel(sx + spokes[idx][0], sy + spokes[idx][1], SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(sx + spokes[idx][2], sy + spokes[idx][3], SSD1306_COLOR_WHITE);
+                }
+
+                uint8_t head = (spinPhaseLF + 3) % 8;
+                SSD1306_DrawPixel(sx + spokes[head][0],     sy + spokes[head][1],     SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(sx + spokes[head][2],     sy + spokes[head][3],     SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(sx + spokes[head][0] + 1, sy + spokes[head][1],     SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(sx + spokes[head][2] + 1, sy + spokes[head][3],     SSD1306_COLOR_WHITE);
+
+                spinPhaseLF = (spinPhaseLF + 1) % 8;
+            }
+        }
+	} else if (f_change_display == 2) {
         // -------------------------------------------------------
         // PANTALLA 1: Barras ADC pantalla completa (8 canales)
         // -------------------------------------------------------
@@ -1233,7 +1435,7 @@ void updateDisplay(void) {
 
         SSD1306_DrawLine(0, digit_y - 1, SCREEN_W - 1, digit_y - 1, SSD1306_COLOR_WHITE);
 
-    } else if (f_change_display == 2) {
+    } else if (f_change_display == 3) {
         // -------------------------------------------------------
         // PANTALLA 2: ADC 1..4 barras izquierda | parámetros línea derecha
         // -------------------------------------------------------
@@ -1348,7 +1550,7 @@ void updateDisplay(void) {
 
             spinPhase2 = (spinPhase2 + 1) % 8;
         }
-    } else if (f_change_display == 3) {
+    } else if (f_change_display == 4) {
         // -------------------------------------------------------
         // PANTALLA 3: ADC1..ADC4 numéricos + spinner
         // -------------------------------------------------------
@@ -1406,89 +1608,790 @@ void updateDisplay(void) {
             spinPhase3 = (spinPhase3 + 1) % 8;
         }
 
-    } else if (f_change_display == 4) {
-            // -------------------------------------------------------
-            // PANTALLA 4: Estado seguidor de línea + barras ADC 1..4
-            // -------------------------------------------------------
-
-            // ----- 4 barras ADC izquierda -----
-            {
-                const uint8_t  adc_count  = 4;
-                const uint16_t bar_top    = 2;
-                const uint16_t digit_y    = 55;
-                const uint16_t bar_max_h  = digit_y - bar_top - 1;
-                const uint16_t spacing    = 2;
-                const uint16_t left_w     = 55;
-                const uint16_t bar_width  = (left_w - (adc_count + 1) * spacing) / adc_count;
-
-                for (uint8_t i = 0; i < adc_count; i++) {
-                    uint8_t adc_idx = (adc_count - 1) - i;  // orden invertido: 3,2,1,0
-                    uint16_t v = adcAvg[adc_idx] > 4095 ? 4095 : adcAvg[adc_idx];
-                    uint16_t h = (uint32_t)v * bar_max_h / 4095;
-                    uint16_t x0 = spacing + i * (bar_width + spacing);
-                    uint16_t y0 = digit_y - 1 - h;
-
-                    if (h > 0)
-                        SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
-
-                    uint16_t tx = x0 + (bar_width - Font_5x7.FontWidth) / 2;
-                    SSD1306_DrawChar5x7('1' + adc_idx, tx, digit_y);
-                }
-                SSD1306_DrawLine(0, digit_y - 1, left_w - 1, digit_y - 1, SSD1306_COLOR_WHITE);
-            }
-
-            // ----- línea divisoria -----
-            SSD1306_DrawLine(57, 0, 57, SCREEN_H - 1, SSD1306_COLOR_WHITE);
-
-            // ----- estado grande a la derecha -----
-            {
-                const char *state_str;
-                const char *sub_str;
-
-                if (robot_state != ROBOT_STATE_LINE_FOLLOWING) {
-                    state_str = "OFF";
-                    sub_str   = "line off";
-                } else {
-                    switch (line_state) {
-                        case LINE_STATE_FOLLOWING:
-                            state_str = "FOLL";
-                            sub_str   = "following";
-                            break;
-                        case LINE_STATE_LOST:
-                            state_str = "LOST";
-                            sub_str   = "lost";
-                            break;
-                        case LINE_STATE_SEARCHING:
-                            state_str = "SREACH";
-                            sub_str   = "search";
-                            break;
-                        default:
-                            state_str = "???";
-                            sub_str   = "unknown";
-                            break;
-                    }
-                }
-
-                // Texto grande centrado en la zona derecha (x=58..127 = 70px de ancho)
-                const uint16_t rx = 58 + (70 - 3 * Font_7x10.FontWidth) / 2;
-                SSD1306_GotoXY(rx, 10);
-                SSD1306_Puts(state_str, &Font_7x10, SSD1306_COLOR_WHITE);
-
-                // Subtítulo centrado
-                uint16_t sub_w = strlen(sub_str) * (Font_5x7.FontWidth + 1);
-                uint16_t sub_x = 58 + (70 - sub_w) / 2;
-                SSD1306_GotoXY(sub_x, 28);
-                SSD1306_Puts(sub_str, &Font_5x7, SSD1306_COLOR_WHITE);
-
-                // f_line_following flag abajo
-                SSD1306_GotoXY(63, 44);
-                SSD1306_Puts((robot_state == ROBOT_STATE_LINE_FOLLOWING) ? "LF:ON " : "LF:OFF", &Font_5x7, SSD1306_COLOR_WHITE);
-            }
-    	} else {
+    } else {
         SSD1306_GotoXY(30, 25);
         SSD1306_Puts("DISPLAY?", &Font_7x10, SSD1306_COLOR_WHITE);
     }
     SSD1306_RequestUpdate();
+}
+
+static void ControlStep2ms(void)
+{
+
+    if (MPU6050_IsDataReady()) {
+        MPU6050_ClearDataReady();
+
+        MPU6050_GetAccel(&ax, &ay, &az);
+        MPU6050_GetGyro(&gx, &gy, &gz);
+
+        // -------------------------------------------------------
+        // TIMING
+        // -------------------------------------------------------
+        uint32_t now_us = micros();
+        if (last_ctrl_us == 0) last_ctrl_us = now_us - 2000;
+        float dt = (float)(now_us - last_ctrl_us) * 1e-6f;
+        last_ctrl_us = now_us;
+
+        if (dt < DT_MIN) dt = DT_MIN;
+        if (dt > DT_MAX) dt = DT_MAX;
+
+        dt_real = dt;
+
+        if (!dt_calibrated) {
+            dt_warmup_sum += dt_real;
+            dt_warmup_count++;
+            if (dt_warmup_count >= DT_WARMUP_SAMPLES) {
+                dt_fixed = (float)(dt_warmup_sum / dt_warmup_count);
+                dt_calibrated = 1;
+            }
+        }
+
+        float jitter = fabsf(dt_real - dt_fixed);
+        dt_jitter_ema = dt_jitter_ema + BETA_JITTER * (jitter - dt_jitter_ema);
+        if (jitter > dt_jitter_max) dt_jitter_max = jitter;
+
+        // dt fijo para control
+        const float dt_ctrl = dt_fixed;
+
+        // ciclo tarde
+        uint8_t late_cycle = (dt_real > (dt_fixed * 1.8f)) ? 1 : 0;
+
+        const float ANG_SIGN = +1.0f;
+
+        // -------------------------------------------------------
+        // FILTRO IMU
+        // -------------------------------------------------------
+        float gyro_rate_dps = ANG_SIGN * ((float)gx / 100.0f);
+
+        if (gyro_rate_dps >  250.0f) gyro_rate_dps =  250.0f;
+        if (gyro_rate_dps < -250.0f) gyro_rate_dps = -250.0f;
+
+        gyro_f += BETA_G_value * (gyro_rate_dps - gyro_f);
+
+        if (gyro_f >  180.0f) gyro_f =  180.0f;
+        if (gyro_f < -180.0f) gyro_f = -180.0f;
+
+        float accel_ang_deg = ANG_SIGN * (atan2f((float)ay, (float)az) * (180.0f / M_PI));
+
+        float accel_mag = sqrtf((float)ax*(float)ax + (float)ay*(float)ay + (float)az*(float)az);
+        const float ONE_G = 981.0f;
+        float accel_ratio = accel_mag / ONE_G;
+        float beta_a_used;
+
+        if (accel_ratio >= 0.92f && accel_ratio <= 1.08f) {
+            beta_a_used = BETA_A_value;
+        } else if (accel_ratio < 0.75f || accel_ratio > 1.25f) {
+            beta_a_used = 0.0f;
+        } else {
+            float dist;
+            if (accel_ratio < 0.92f) {
+                dist = (accel_ratio - 0.75f) / (0.92f - 0.75f);
+            } else {
+                dist = (1.25f - accel_ratio) / (1.25f - 1.08f);
+            }
+
+            if (dist < 0.0f) dist = 0.0f;
+            if (dist > 1.0f) dist = 1.0f;
+
+            beta_a_used = BETA_A_value * dist;
+        }
+
+        accel_roll_f += beta_a_used * (accel_ang_deg - accel_roll_f);
+
+        filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_ctrl)
+                          + (1.0f - ALPHA) * accel_roll_f;
+
+        // -------------------------------------------------------
+        // LINE FOLLOWER INPUTS
+        // -------------------------------------------------------
+        float line_error = 0.0f;
+        float line_angle_cmd = LINE_ANGLE;
+        uint8_t line_detected = 0;
+        float w_sum = 0.0f;
+        static float adc_f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        const float ADC_BETA = 0.3f;
+
+        if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+            velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_ctrl);
+            if (velocity_est >  20.0f) velocity_est =  20.0f;
+            if (velocity_est < -20.0f) velocity_est = -20.0f;
+            velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+
+            adc_f[0] += ADC_BETA * ((float)adcValues[0] - adc_f[0]);
+            adc_f[1] += ADC_BETA * ((float)adcValues[1] - adc_f[1]);
+            adc_f[2] += ADC_BETA * ((float)adcValues[2] - adc_f[2]);
+            adc_f[3] += ADC_BETA * ((float)adcValues[3] - adc_f[3]);
+
+            float s0 = adc_f[0];
+            float s1 = adc_f[1];
+            float s2 = adc_f[2];
+            float s3 = adc_f[3];
+
+            float w0 = (s0 > LINE_THRESHOLD) ? s0 : 0.0f;
+            float w1 = (s1 > LINE_THRESHOLD) ? s1 : 0.0f;
+            float w2 = (s2 > LINE_THRESHOLD) ? s2 : 0.0f;
+            float w3 = (s3 > LINE_THRESHOLD) ? s3 : 0.0f;
+            w_sum = w0 + w1 + w2 + w3;
+
+            line_detected = (w_sum > 0.0f);
+
+            if (line_detected) {
+                line_error = ((w0 * 1.0f + w1 * 0.33f) - (w3 * 1.0f + w2 * 0.33f)) / w_sum;
+
+                if (line_error > 0.05f) {
+                    last_line_dir = 1.0f;
+                } else if (line_error < -0.05f) {
+                    last_line_dir = -1.0f;
+                }
+            }
+
+            float abs_line_error = fabsf(line_error);
+            float forward_factor = 1.0f - (abs_line_error / 0.5f);
+
+            if (forward_factor > 1.0f) forward_factor = 1.0f;
+            if (forward_factor < 0.0f) forward_factor = 0.0f;
+
+            line_angle_cmd = LINE_ANGLE_MIN + (LINE_ANGLE - LINE_ANGLE_MIN) * forward_factor;
+
+            if (line_angle_cmd > LINE_ANGLE) line_angle_cmd = LINE_ANGLE;
+            if (line_angle_cmd < LINE_ANGLE_MIN) line_angle_cmd = LINE_ANGLE_MIN;
+
+        } else {
+            if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
+                velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_ctrl);
+                if (velocity_est >  20.0f) velocity_est =  20.0f;
+                if (velocity_est < -20.0f) velocity_est = -20.0f;
+                velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+            } else {
+                velocity_est = 0.0f;
+                velocity_est_f = 0.0f;
+            }
+        }
+
+        // -------------------------------------------------------
+        // CAMBIOS DE ESTADO
+        // -------------------------------------------------------
+        static eRobotState prev_robot_state = ROBOT_STATE_IDLE;
+
+        if (robot_state == ROBOT_STATE_LINE_FOLLOWING && prev_robot_state != ROBOT_STATE_LINE_FOLLOWING) {
+            integral            = 0.0f;
+            line_integral       = 0.0f;
+            line_error_prev     = 0.0f;
+            line_error_f_d      = 0.0f;
+            steering_adjustment = 0.0f;
+            velocity_est        = 0.0f;
+            velocity_est_f      = 0.0f;
+            line_state          = LINE_STATE_FOLLOWING;
+            dynamic_setpoint    = SETPOINT_ANGLE;
+            dynamic_setpoint_f  = SETPOINT_ANGLE;
+            line_lost_ms        = HAL_GetTick();
+            line_angle_ramped     = 0.0f;
+        }
+
+        if ((robot_state == ROBOT_STATE_BALANCE_ONLY ||
+             robot_state == ROBOT_STATE_BALANCE_AND_SPEED ||
+             robot_state == ROBOT_STATE_MANUAL_CONTROL) &&
+            (prev_robot_state != robot_state)) {
+
+            integral            = 0.0f;
+            steering_adjustment = 0.0f;
+            velocity_est        = 0.0f;
+            velocity_est_f      = 0.0f;
+            dynamic_setpoint    = SETPOINT_ANGLE;
+            dynamic_setpoint_f  = SETPOINT_ANGLE;
+            pwm_sat_prev        = 0.0f;
+
+            if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                manual_setpoint_cmd    = 0.0f;
+                manual_steering_cmd    = 0.0f;
+                manual_cmd_last_ms     = HAL_GetTick();
+                manual_setpoint_ramped = 0.0f;
+                steering_adjustment    = 0.0f;
+            }
+        }
+
+        prev_robot_state = robot_state;
+
+        // -------------------------------------------------------
+        // SETPOINT DINÁMICO
+        // -------------------------------------------------------
+        if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+            float line_target_angle = 0.0f;
+
+            if (line_state == LINE_STATE_FOLLOWING && line_detected) {
+                line_target_angle = line_angle_cmd;
+            } else {
+                line_target_angle = 0.0f;
+            }
+
+            {
+                const float LINE_RAMP_UP   = 0.001f;
+                const float LINE_RAMP_DOWN = 0.0008f;
+
+                float ramp_delta = line_target_angle - line_angle_ramped;
+                float ramp_rate  = (ramp_delta > 0.0f) ? LINE_RAMP_UP : LINE_RAMP_DOWN;
+
+                if (fabsf(ramp_delta) <= ramp_rate) {
+                    line_angle_ramped = line_target_angle;
+                } else {
+                    line_angle_ramped += (ramp_delta > 0.0f) ? ramp_rate : -ramp_rate;
+                }
+            }
+
+            dynamic_setpoint = SETPOINT_ANGLE + line_angle_ramped;
+
+            if (dynamic_setpoint >  LINE_ANGLE) dynamic_setpoint =  LINE_ANGLE;
+            if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
+        } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+            if (HAL_GetTick() - manual_cmd_last_ms > 60) {
+                manual_setpoint_cmd *= 0.96f;
+                manual_steering_cmd *= 0.90f;
+
+                if (fabsf(manual_setpoint_cmd) < 0.01f) manual_setpoint_cmd = 0.0f;
+                if (fabsf(manual_steering_cmd) < 0.01f) manual_steering_cmd = 0.0f;
+            }
+
+            const float manual_safe_angle = 15.0f;
+            const float manual_max_angle  = 35.0f;
+
+            float abs_roll = fabsf(filtered_roll_deg);
+            float safety_factor;
+
+            if (abs_roll <= manual_safe_angle) {
+                safety_factor = 1.0f;
+            } else if (abs_roll >= manual_max_angle) {
+                safety_factor = 0.0f;
+            } else {
+                safety_factor = 1.0f - ((abs_roll - manual_safe_angle) / (manual_max_angle - manual_safe_angle));
+            }
+
+            float scaled_cmd = manual_setpoint_cmd * safety_factor;
+
+            const float conflict_threshold = 10.0f;
+            if (filtered_roll_deg >  conflict_threshold && scaled_cmd > 0.0f) scaled_cmd = 0.0f;
+            if (filtered_roll_deg < -conflict_threshold && scaled_cmd < 0.0f) scaled_cmd = 0.0f;
+
+            const float RAMP_RATE_UP   = 0.01f;
+            const float RAMP_RATE_DOWN = 0.008f;
+
+            float ramp_target = SETPOINT_ANGLE + scaled_cmd;
+            float ramp_delta  = ramp_target - manual_setpoint_ramped;
+            float ramp_rate   = (ramp_delta > 0.0f) ? RAMP_RATE_UP : RAMP_RATE_DOWN;
+
+            if (fabsf(ramp_delta) <= ramp_rate) {
+                manual_setpoint_ramped = ramp_target;
+            } else {
+                manual_setpoint_ramped += (ramp_delta > 0.0f) ? ramp_rate : -ramp_rate;
+            }
+
+            velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_ctrl);
+            if (velocity_est >  20.0f) velocity_est =  20.0f;
+            if (velocity_est < -20.0f) velocity_est = -20.0f;
+            velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+
+            dynamic_setpoint = manual_setpoint_ramped - KV_brake_value * velocity_est_f;
+
+        } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
+            dynamic_setpoint = SETPOINT_ANGLE;
+        } else {
+            dynamic_setpoint = SETPOINT_ANGLE;
+        }
+
+        float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f : 5.0f;
+        if (dynamic_setpoint >  sp_limit) dynamic_setpoint =  sp_limit;
+        if (dynamic_setpoint < -sp_limit) dynamic_setpoint = -sp_limit;
+
+        {
+            float sp_step_max;
+
+            if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                sp_step_max = 0.004f;
+            } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+                sp_step_max = 0.0015f;
+            } else {
+                sp_step_max = 0.0005f;
+            }
+
+            float sp_delta = dynamic_setpoint - dynamic_setpoint_f;
+
+            if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;
+            if (sp_delta < -sp_step_max) sp_delta = -sp_step_max;
+
+            dynamic_setpoint_f += sp_delta;
+        }
+
+        // -------------------------------------------------------
+        // FALL DETECTION
+        // -------------------------------------------------------
+        float abs_roll_filt = fabsf(filtered_roll_deg);
+        float abs_roll_raw  = fabsf(accel_ang_deg);
+
+        uint8_t upright_now     = (abs_roll_raw < RECOVER_ANGLE);
+        uint8_t upside_down_now = (abs_roll_raw > UPSIDE_DOWN_ANGLE);
+
+        static uint8_t dead_zone_count = 0;
+
+        if (abs_roll_raw >= FALL_ANGLE) {
+            if (dead_zone_count < 10) dead_zone_count++;
+        } else {
+            dead_zone_count = 0;
+        }
+
+        uint8_t in_dead_zone = (dead_zone_count >= 10);
+
+        if (abs_roll_filt > FALL_ANGLE) {
+            if (fall_count < 5) fall_count++;
+        } else {
+            fall_count = 0;
+        }
+        uint8_t fall_by_angle = (fall_count >= 3);
+
+        if (upright_now) {
+            if (upright_count < 20) upright_count++;
+        } else {
+            upright_count = 0;
+        }
+        uint8_t recover_by_angle = (upright_count >= 5);
+
+        if (upside_down_now) {
+            if (upside_down_count < 20) upside_down_count++;
+        } else {
+            upside_down_count = 0;
+        }
+        uint8_t fall_upside_down = (upside_down_count >= 5);
+
+        if (!f_fallen) {
+            if (fall_by_angle || fall_upside_down || in_dead_zone) {
+                f_fallen = 1;
+                integral            = 0.0f;
+                velocity_est        = 0.0f;
+                velocity_est_f      = 0.0f;
+                line_integral       = 0.0f;
+                line_error_prev     = 0.0f;
+                steering_adjustment = 0.0f;
+                gyro_f              = 0.0f;
+                motorRightVelocity  = 0;
+                motorLeftVelocity   = 0;
+                pwm_sat_prev        = 0.0f;
+            }
+        } else {
+            if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
+                f_fallen = 0;
+                accel_roll_f      = accel_ang_deg;
+                filtered_roll_deg = accel_ang_deg;
+                integral            = 0.0f;
+                velocity_est        = 0.0f;
+                velocity_est_f      = 0.0f;
+                line_integral       = 0.0f;
+                line_error_prev     = 0.0f;
+                steering_adjustment = 0.0f;
+                dynamic_setpoint    = SETPOINT_ANGLE;
+                dynamic_setpoint_f  = SETPOINT_ANGLE;
+                upright_count       = 0;
+                upside_down_count   = 0;
+                fall_count          = 0;
+                dead_zone_count     = 0;
+                pwm_sat_prev        = 0.0f;
+            } else {
+                motorRightVelocity = 0;
+                motorLeftVelocity  = 0;
+                gyro_f = 0.0f;
+                filtered_roll_deg = accel_ang_deg;
+            }
+        }
+
+        // -------------------------------------------------------
+        // PID
+        // -------------------------------------------------------
+        float error   = dynamic_setpoint_f - filtered_roll_deg;
+        float p_term  = 0.0f;
+        float i_term  = 0.0f;
+        float d_term  = 0.0f;
+        float output  = 0.0f;
+        float pwm_cmd = 0.0f;
+        float pwm_sat = 0.0f;
+        uint8_t sat_flag = 0;
+
+        float log_p_line = 0.0f;
+        float log_i_line = 0.0f;
+        float log_d_line = 0.0f;
+
+        if (!f_fallen) {
+            if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
+                if (integral >  3.0f) integral =  3.0f;
+                if (integral < -3.0f) integral = -3.0f;
+            } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                integral *= 0.970f;
+            } else if (robot_state != ROBOT_STATE_LINE_FOLLOWING &&
+                       robot_state != ROBOT_STATE_BALANCE_AND_SPEED) {
+                integral *= INTEGRAL_DECAY;
+            }
+
+            p_term = KP_value * error;
+            i_term = KI_value * integral;
+            d_term = -KD_value * gyro_f;
+
+            if (d_term >  8.0f) d_term =  8.0f;
+            if (d_term < -8.0f) d_term = -8.0f;
+
+            output = p_term + i_term + d_term;
+
+            pwm_cmd = output * MOTOR_GAIN;
+            pwm_sat = pwm_cmd;
+
+            if (pwm_sat >  100.0f) { pwm_sat =  100.0f; sat_flag = 1; }
+            if (pwm_sat < -100.0f) { pwm_sat = -100.0f; sat_flag = 1; }
+
+            if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+                if (pwm_sat >  40.0f) pwm_sat =  40.0f;
+                if (pwm_sat < -40.0f) pwm_sat = -40.0f;
+            }
+
+            if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                if (pwm_sat >  55.0f) pwm_sat =  55.0f;
+                if (pwm_sat < -55.0f) pwm_sat = -55.0f;
+            }
+
+            float pwm_limit;
+            if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+                pwm_limit = 40.0f;
+            } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                pwm_limit = 55.0f;
+            } else {
+                pwm_limit = 100.0f;
+            }
+
+            {
+                float pwm_step_max;
+
+                if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                    pwm_step_max = 2.0f;
+                } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+                    pwm_step_max = 2.0f;
+                } else {
+                    pwm_step_max = 3.0f;
+                }
+
+                float pwm_delta = pwm_sat - pwm_sat_prev;
+                if (pwm_delta >  pwm_step_max) pwm_delta =  pwm_step_max;
+                if (pwm_delta < -pwm_step_max) pwm_delta = -pwm_step_max;
+
+                pwm_sat = pwm_sat_prev + pwm_delta;
+                pwm_sat_prev = pwm_sat;
+            }
+
+            if (robot_state != ROBOT_STATE_MANUAL_CONTROL) {
+                if (!late_cycle) {
+                    if (fabsf(error) > 0.2f) {
+                        if (fabsf(pwm_cmd) <= pwm_limit) {
+                            integral += error * dt_ctrl;
+                        } else {
+                            if (pwm_cmd >  pwm_limit && error < 0) integral += error * dt_ctrl;
+                            else if (pwm_cmd < -pwm_limit && error > 0) integral += error * dt_ctrl;
+                        }
+                    } else {
+                        integral *= 0.95f;
+                    }
+                }
+            }
+
+            sat_flag = (fabsf(pwm_cmd) > pwm_limit) ? 1 : 0;
+
+            if (integral >  I_MAX) integral =  I_MAX;
+            if (integral < -I_MAX) integral = -I_MAX;
+
+            if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
+                if (integral >  8.0f) integral =  8.0f;
+                if (integral < -8.0f) integral = -8.0f;
+            }
+
+            if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+                if (integral >  2.0f) integral =  2.0f;
+                if (integral < -2.0f) integral = -2.0f;
+            }
+
+            if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
+                if (integral >  15.0f) integral =  15.0f;
+                if (integral < -15.0f) integral = -15.0f;
+            }
+
+            if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                if (integral >  1.5f) integral =  1.5f;
+                if (integral < -1.5f) integral = -1.5f;
+            }
+
+            if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+                uint8_t line_pivot_active = 0;
+
+                switch (line_state) {
+                    case LINE_STATE_FOLLOWING:
+                    {
+                        uint8_t line_detected_robust = line_detected && (w_sum > LINE_THRESHOLD * 0.5f);
+
+                        if (line_detected_robust) {
+                            line_lost_ms = HAL_GetTick();
+
+                            float p_line = KP_LINE * line_error * fabsf(line_error);
+
+                            if (!late_cycle) {
+                                line_integral += line_error * dt_ctrl;
+                            }
+
+                            if (line_integral >  5.0f) line_integral =  5.0f;
+                            if (line_integral < -5.0f) line_integral = -5.0f;
+
+                            float i_line = KI_LINE * line_integral;
+
+                            line_error_f_d += 0.4f * (line_error - line_error_f_d);
+
+                            float d_line = 0.0f;
+                            if (!late_cycle) {
+                                float line_delta = line_error_f_d - line_error_prev;
+                                if (line_delta >  0.3f) line_delta =  0.3f;
+                                if (line_delta < -0.3f) line_delta = -0.3f;
+                                d_line = KD_LINE * (line_delta / dt_ctrl);
+                            }
+                            line_error_prev = line_error_f_d;
+
+                            float steering_target = p_line + i_line + d_line;
+                            float steering_delta = steering_target - steering_adjustment;
+                            float steering_rate_limit = 2.0f;
+
+                            if (steering_delta >  steering_rate_limit) steering_delta =  steering_rate_limit;
+                            if (steering_delta < -steering_rate_limit) steering_delta = -steering_rate_limit;
+
+                            steering_adjustment += steering_delta;
+
+                            log_p_line = p_line;
+                            log_i_line = i_line;
+                            log_d_line = d_line;
+
+                        } else {
+                            uint32_t ms_sin_linea = HAL_GetTick() - line_lost_ms;
+
+                            if (ms_sin_linea > 1000) {
+                                line_state      = LINE_STATE_LOST;
+                                line_search_dir = last_line_dir;
+                                line_integral   = 0.0f;
+                            }
+                        }
+
+                        if (steering_adjustment >  20.0f) steering_adjustment =  20.0f;
+                        if (steering_adjustment < -20.0f) steering_adjustment = -20.0f;
+                        break;
+                    }
+
+                    case LINE_STATE_LOST:
+                        if (line_detected) {
+                            line_integral   = 0.0f;
+                            line_error_prev = 0.0f;
+                            line_lost_ms    = HAL_GetTick();
+                            line_state      = LINE_STATE_FOLLOWING;
+                        } else if ((HAL_GetTick() - line_lost_ms) > LINE_LOST_TIMEOUT_MS) {
+                            line_state = LINE_STATE_SEARCHING;
+                        } else {
+                            float target = last_line_dir * 4.0f;
+                            steering_adjustment += 0.02f * (target - steering_adjustment);
+                        }
+                        break;
+
+                    case LINE_STATE_SEARCHING:
+                        if (line_detected) {
+                            line_integral   = 0.0f;
+                            line_error_prev = 0.0f;
+                            line_lost_ms    = HAL_GetTick();
+                            line_state      = LINE_STATE_FOLLOWING;
+                        } else {
+                            float target = last_line_dir * 6.0f;
+                            steering_adjustment += 0.02f * (target - steering_adjustment);
+                        }
+                        break;
+                }
+
+                if (integral >  2.0f) integral =  2.0f;
+                if (integral < -2.0f) integral = -2.0f;
+                if (pwm_sat >  40.0f) pwm_sat =  40.0f;
+                if (pwm_sat < -40.0f) pwm_sat = -40.0f;
+
+                if (!line_pivot_active) {
+                    float half_steer = steering_adjustment * 0.5f;
+
+                    float mR = pwm_sat - half_steer;
+                    float mL = pwm_sat + half_steer;
+
+                    if (mR >  40.0f) mR =  40.0f;
+                    if (mR < -40.0f) mR = -40.0f;
+                    if (mL >  40.0f) mL =  40.0f;
+                    if (mL < -40.0f) mL = -40.0f;
+
+                    motorRightVelocity = -(int16_t)mL;
+                    motorLeftVelocity  = -(int16_t)mR;
+                }
+
+            } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+                line_integral       = 0.0f;
+                line_error_prev     = 0.0f;
+                line_state          = LINE_STATE_FOLLOWING;
+
+                {
+                    const float STEER_RATE = 1.5f;
+                    float steer_delta = manual_steering_cmd - steering_adjustment;
+                    if (steer_delta >  STEER_RATE) steer_delta =  STEER_RATE;
+                    if (steer_delta < -STEER_RATE) steer_delta = -STEER_RATE;
+                    steering_adjustment += steer_delta;
+                }
+
+                static float prev_steering_cmd = 0.0f;
+                if ((manual_steering_cmd > 0.5f && prev_steering_cmd < -0.5f) ||
+                    (manual_steering_cmd < -0.5f && prev_steering_cmd > 0.5f)) {
+                    integral = 0.0f;
+                }
+                prev_steering_cmd = manual_steering_cmd;
+
+                float mR = pwm_sat - steering_adjustment;
+                float mL = pwm_sat + steering_adjustment;
+
+                if (mR >  100.0f) mR =  100.0f;
+                if (mR < -100.0f) mR = -100.0f;
+                if (mL >  100.0f) mL =  100.0f;
+                if (mL < -100.0f) mL = -100.0f;
+
+                motorRightVelocity = -(int16_t)mL;
+                motorLeftVelocity  = -(int16_t)mR;
+
+            } else {
+                line_integral       = 0.0f;
+                line_error_prev     = 0.0f;
+                steering_adjustment = 0.0f;
+                line_state          = LINE_STATE_FOLLOWING;
+
+                float gz_dps = (float)gz / 131.0f;
+                float yaw_correction = -gz_dps * 0.3f;
+
+                float mR = pwm_sat + yaw_correction;
+                float mL = pwm_sat - yaw_correction;
+
+                if (mR >  100.0f) mR =  100.0f;
+                if (mR < -100.0f) mR = -100.0f;
+                if (mL >  100.0f) mL =  100.0f;
+                if (mL < -100.0f) mL = -100.0f;
+
+                motorRightVelocity = -(int16_t)mL;
+                motorLeftVelocity  = -(int16_t)mR;
+            }
+        } else {
+            motorRightVelocity = 0;
+            motorLeftVelocity  = 0;
+        }
+
+        roll_deg = filtered_roll_deg;
+
+        // -------------------------------------------------------
+        // LOG MINIMO EN 2ms
+        // -------------------------------------------------------
+        log_counter++;
+
+        if (f_send_wifi_log && (log_counter % LOG_WIFI_DECIM == 0)) {
+            WifiLogData_t wlog;
+            wlog.t_ms       = HAL_GetTick();
+            wlog.roll_filt  = filtered_roll_deg;
+            wlog.output     = output;
+            wlog.p_term     = p_term;
+            wlog.i_term     = i_term;
+            wlog.d_term     = d_term;
+            wlog.mR         = motorRightVelocity;
+            wlog.mL         = motorLeftVelocity;
+            wlog.dyn_sp     = dynamic_setpoint_f;
+            wlog.dt_ctrl_us = (uint32_t)(dt_real * 1000000.0f);
+
+            wlog.line_error          = line_error;
+            wlog.p_line              = log_p_line;
+            wlog.i_line              = log_i_line;
+            wlog.d_line              = log_d_line;
+            wlog.steering_adjustment = steering_adjustment;
+            wlog.adc1                = adcValues[0];
+            wlog.adc2                = adcValues[1];
+            wlog.adc3                = adcValues[2];
+            wlog.adc4                = adcValues[3];
+
+            UNER_SendWifiLogData(&wlog);
+        }
+
+        if (f_send_csv_log && !log_header_sent) {
+            USB_DebugStr("t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,dyn_sp,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n");
+            log_header_sent = 1;
+        }
+
+        if (f_send_csv_log && (log_counter % LOG_DECIM == 0)) {
+            char buf[128];
+
+            int roll_i   = (int)(filtered_roll_deg * 1000.0f);
+            int p_i      = (int)(p_term * 1000.0f);
+            int i_i      = (int)(i_term * 1000.0f);
+            int d_i      = (int)(d_term * 1000.0f);
+            int sp_i     = (int)(dynamic_setpoint_f * 1000.0f);
+            int error_i  = (int)(error * 1000.0f);
+            int gyrof_i  = (int)(gyro_f * 1000.0f);
+            int accel_i  = (int)(accel_ang_deg * 1000.0f);
+            int accelf_i = (int)(accel_roll_f * 1000.0f);
+            int output_i = (int)(output * 1000.0f);
+            int pwmcmd_i = (int)(pwm_cmd * 100.0f);
+            int pwmsat_i = (int)(pwm_sat * 100.0f);
+            int pitch_i  = (int)(pitch_deg * 1000.0f);
+
+            int ax_i = (int)ax;
+            int ay_i = (int)ay;
+            int az_i = (int)az;
+            int gx_i = (int)gx;
+            int gy_i = (int)gy;
+            int gz_i = (int)gz;
+
+            int len = snprintf(buf, sizeof(buf),
+                "%lu,%lu,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
+                HAL_GetTick(),                 // t_ms
+                (uint32_t)(dt_real * 1000000.0f), // dt_us
+                (uint32_t)(dt_ctrl * 1000000.0f), // dt_ctrl_us
+                accel_i,                       // accel_roll x1000
+                accelf_i,                      // accel_roll_f x1000
+                (int)(gyro_rate_dps * 1000.0f),// gyro_y x1000
+                gyrof_i,                       // gyro_f x1000
+                roll_i,                        // roll_filt x1000
+                sp_i,                          // dyn_sp x1000
+                error_i,                       // error x1000
+                p_i,                           // p x1000
+                i_i,                           // i x1000
+                d_i,                           // d x1000
+                output_i,                      // output x1000
+                pwmcmd_i,                      // pwm_cmd x100
+                pwmsat_i,                      // pwm_sat x100
+                sat_flag,                      // sat
+                motorRightVelocity,            // mR
+                motorLeftVelocity,             // mL
+                pitch_i,                       // pitch x1000
+                ax_i, ay_i, az_i,              // accel raw
+                gx_i, gy_i, gz_i               // gyro raw
+            );
+
+            if (len > 0) {
+                USB_DebugSend((uint8_t*)buf, (uint16_t)len);
+            }
+        }
+
+        if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
+            MPU6050_StartRead_DMA();
+        }
+
+    } else {
+        if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
+            MPU6050_StartRead_DMA();
+        }
+    }
+
+    if ((robot_state != ROBOT_STATE_IDLE) && !f_fallen) {
+        MotorControl(motorRightVelocity, motorLeftVelocity);
+    } else {
+        MotorControl(0, 0);
+    }
 }
 
 /* USER CODE END 0 */
@@ -1560,9 +2463,6 @@ int main(void)
   ESP01_AttachDebugStr(ESP01_USB_DbgStr);
   ESP01_SetWIFI(wifiSSID, wifiPassword);
 
-  int16_t ax, ay, az;	// Inicializo variables de aceleracion y giroscopio
-  int16_t gx, gy, gz;
-
   unerRx.buff = unerRxBuffer;
   unerRx.mask = RXBUFSIZE - 1;
   unerTx.buff = unerTxBuffer;
@@ -1630,752 +2530,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if(is2ms) {
-	      is2ms = 0;
 
-	      if (MPU6050_IsDataReady()) {
-	          MPU6050_ClearDataReady();
-
-	          MPU6050_GetAccel(&ax, &ay, &az);
-	          MPU6050_GetGyro(&gx, &gy, &gz);
-
-	          // 1. Medir DT real siempre
-	          uint32_t now_us = micros();
-	          if (last_ctrl_us == 0) last_ctrl_us = now_us - 2000;
-	          float dt = (float)(now_us - last_ctrl_us) * 1e-6f;
-	          last_ctrl_us = now_us;
-
-	          if (dt < DT_MIN) dt = DT_MIN;
-	          if (dt > DT_MAX) dt = DT_MAX;
-
-	          dt_real = dt;
-
-	          float dt_for_filter = dt_real;
-	          if (dt_for_filter > 0.004f) dt_for_filter = 0.004f;
-
-	          if (!dt_calibrated) {
-	              dt_warmup_sum += dt_real;
-	              dt_warmup_count++;
-	              if (dt_warmup_count >= DT_WARMUP_SAMPLES) {
-	                  dt_fixed = (float)(dt_warmup_sum / dt_warmup_count);
-	                  dt_calibrated = 1;
-	                  USB_Debug("DT_FIXED calibrado: %d us\r\n", (int)(dt_fixed * 1e6f));
-	              }
-	          }
-
-	          float jitter = fabsf(dt_real - dt_fixed);
-	          dt_jitter_ema = dt_jitter_ema + BETA_JITTER * (jitter - dt_jitter_ema);
-	          if (jitter > dt_jitter_max) dt_jitter_max = jitter;
-
-	          const float ANG_SIGN = +1.0f;
-
-	          // 2) Gyro LPF
-	          float gyro_rate_dps = ANG_SIGN * ((float)gx / 100.0f);
-
-	          if (gyro_rate_dps >  250.0f) gyro_rate_dps =  250.0f;
-	          if (gyro_rate_dps < -250.0f) gyro_rate_dps = -250.0f;
-
-	          gyro_f += BETA_G_value * (gyro_rate_dps - gyro_f);
-
-	          if (gyro_f >  180.0f) gyro_f =  180.0f;
-	          if (gyro_f < -180.0f) gyro_f = -180.0f;
-
-	          // 3) Accel angle (roll) LPF
-	          float accel_ang_deg = ANG_SIGN * (atan2f(ay, az) * (180.0f / M_PI));
-
-	          // Detectar aceleración lineal — si no es ~1g, no confiar en el acelerómetro
-	          float accel_mag = sqrtf((float)ax*(float)ax + (float)ay*(float)ay + (float)az*(float)az);
-	          const float ONE_G = 981.0f;
-	          float accel_ratio = accel_mag / ONE_G;
-	          float beta_a_used;
-
-	          if (accel_ratio >= 0.92f && accel_ratio <= 1.08f) {
-	              beta_a_used = BETA_A_value;
-	          } else if (accel_ratio < 0.75f || accel_ratio > 1.25f) {
-	              beta_a_used = 0.0f;
-	          } else {
-	              float dist;
-	              if (accel_ratio < 0.92f) {
-	                  dist = (accel_ratio - 0.75f) / (0.92f - 0.75f);
-	              } else {
-	                  dist = (1.25f - accel_ratio) / (1.25f - 1.08f);
-	              }
-
-	              if (dist < 0.0f) dist = 0.0f;
-	              if (dist > 1.0f) dist = 1.0f;
-
-	              beta_a_used = BETA_A_value * dist;
-	          }
-
-	          accel_roll_f += beta_a_used * (accel_ang_deg - accel_roll_f);
-
-	          // 4) Complementary Filter
-	          filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_for_filter)
-	                            + (1.0f - ALPHA) * accel_roll_f;
-
-	          // Variables de línea
-	          float line_error = 0.0f;
-	          float line_angle_cmd = LINE_ANGLE;
-	          uint8_t line_detected = 0;
-			  float w_sum = 0.0f;
-			  static float adc_f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-			  const float ADC_BETA = 0.3f;
-
-	          if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-	              velocity_est   = 0.0f;
-	              velocity_est_f = 0.0f;
-
-	              adc_f[0] += ADC_BETA * ((float)adcValues[0] - adc_f[0]);
-	              adc_f[1] += ADC_BETA * ((float)adcValues[1] - adc_f[1]);
-	              adc_f[2] += ADC_BETA * ((float)adcValues[2] - adc_f[2]);
-	              adc_f[3] += ADC_BETA * ((float)adcValues[3] - adc_f[3]);
-
-	              float s0 = adc_f[0];
-	              float s1 = adc_f[1];
-	              float s2 = adc_f[2];
-	              float s3 = adc_f[3];
-
-	              float w0 = (s0 > LINE_THRESHOLD) ? s0 : 0.0f;
-	              float w1 = (s1 > LINE_THRESHOLD) ? s1 : 0.0f;
-	              float w2 = (s2 > LINE_THRESHOLD) ? s2 : 0.0f;
-	              float w3 = (s3 > LINE_THRESHOLD) ? s3 : 0.0f;
-	              w_sum = w0 + w1 + w2 + w3;
-
-	              line_detected = (w_sum > 0.0f);
-
-	              if (line_detected) {
-	                  line_error = ((w0 * 1.0f + w1 * 0.33f) - (w3 * 1.0f + w2 * 0.33f)) / w_sum;
-
-	                  // Actualizar memoria de la última dirección válida
-	                  if (line_error > 0.05f) {
-	                      last_line_dir = 1.0f;
-	                  } else if (line_error < -0.05f) {
-	                      last_line_dir = -1.0f;
-	                  }
-	              }
-
-	              float abs_line_error = fabsf(line_error);
-	              float forward_factor = abs_line_error / 0.5f;
-
-	              if (forward_factor > 1.0f) forward_factor = 1.0f;
-	              if (forward_factor < 0.0f) forward_factor = 0.0f;
-
-	              line_angle_cmd = LINE_ANGLE_MIN + (LINE_ANGLE - LINE_ANGLE_MIN) * forward_factor;
-
-	              if (line_angle_cmd > LINE_ANGLE) line_angle_cmd = LINE_ANGLE;
-	              if (line_angle_cmd < LINE_ANGLE_MIN) line_angle_cmd = LINE_ANGLE_MIN;
-
-	          } else {
-	              if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
-			      velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
-			      if (velocity_est >  20.0f) velocity_est =  20.0f;
-				  if (velocity_est < -20.0f) velocity_est = -20.0f;
-			      velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
-	              } else {
-	                  velocity_est = 0.0f;
-	                  velocity_est_f = 0.0f;
-	              }
-	          }
-
-	          static eRobotState prev_robot_state = ROBOT_STATE_IDLE;
-
-	          if (robot_state == ROBOT_STATE_LINE_FOLLOWING && prev_robot_state != ROBOT_STATE_LINE_FOLLOWING) {
-	              integral            = 0.0f;
-	              line_integral       = 0.0f;
-	              line_error_prev     = 0.0f;
-	              line_error_f_d      = 0.0f;
-	              steering_adjustment = 0.0f;
-	              velocity_est        = 0.0f;
-	              velocity_est_f      = 0.0f;
-	              line_state          = LINE_STATE_FOLLOWING;
-	              dynamic_setpoint    = SETPOINT_ANGLE;
-	              dynamic_setpoint_f  = SETPOINT_ANGLE;
-	              line_lost_ms = HAL_GetTick();
-	          }
-
-	          if ((robot_state == ROBOT_STATE_BALANCE_ONLY || robot_state == ROBOT_STATE_BALANCE_AND_SPEED || robot_state == ROBOT_STATE_MANUAL_CONTROL)
-	               && (prev_robot_state != robot_state)) {
-	              integral            = 0.0f;
-	              steering_adjustment = 0.0f;
-	              velocity_est        = 0.0f;
-	              velocity_est_f      = 0.0f;
-	              dynamic_setpoint    = SETPOINT_ANGLE;
-	              dynamic_setpoint_f  = SETPOINT_ANGLE;
-	              pwm_sat_prev = 0.0f;
-                  if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                      manual_setpoint_cmd = 0.0f;
-                      manual_steering_cmd = 0.0f;
-                      manual_cmd_last_ms = HAL_GetTick();
-                      manual_setpoint_ramped = 0.0f;
-                      steering_adjustment    = 0.0f;
-                  }
-	          }
-
-	          prev_robot_state = robot_state;
-
-	          // 6. Setpoint dinámico
-	          if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-	        	  if (line_state == LINE_STATE_FOLLOWING && line_detected) {
-					  dynamic_setpoint = SETPOINT_ANGLE + line_angle_cmd;
-
-					  if (dynamic_setpoint >  LINE_ANGLE) dynamic_setpoint =  LINE_ANGLE;
-					  if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
-	        	  }
-	          } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-	        	  if (HAL_GetTick() - manual_cmd_last_ms > 60) {
-	        	      manual_setpoint_cmd *= 0.96f;
-	        	      manual_steering_cmd *= 0.90f;
-
-	        	      if (fabsf(manual_setpoint_cmd) < 0.01f) manual_setpoint_cmd = 0.0f;
-	        	      if (fabsf(manual_steering_cmd) < 0.01f) manual_steering_cmd = 0.0f;
-	        	  }
-
-	              const float manual_safe_angle = 15.0f;
-	              const float manual_max_angle  = 35.0f;
-
-	              float abs_roll = fabsf(filtered_roll_deg);
-	              float safety_factor;
-
-	              if (abs_roll <= manual_safe_angle) {
-	                  safety_factor = 1.0f;
-	              } else if (abs_roll >= manual_max_angle) {
-	                  safety_factor = 0.0f;
-	              } else {
-	                  safety_factor = 1.0f - ((abs_roll - manual_safe_angle)
-	                                  / (manual_max_angle - manual_safe_angle));
-	              }
-
-	              float scaled_cmd = manual_setpoint_cmd * safety_factor;
-
-	              const float conflict_threshold = 10.0f;
-	              if (filtered_roll_deg >  conflict_threshold && scaled_cmd > 0.0f) scaled_cmd = 0.0f;
-	              if (filtered_roll_deg < -conflict_threshold && scaled_cmd < 0.0f) scaled_cmd = 0.0f;
-
-	              // --- RAMPA: limitar velocidad de cambio del setpoint ---
-	              // Velocidad de rampa: grados por ciclo de control (2ms)
-	              // 0.05f → tarda ~1 segundo en llegar a 2.5° (ajustable)
-	              const float RAMP_RATE_UP   = 0.01f;  // subida (cuando se da el comando)
-	              const float RAMP_RATE_DOWN = 0.008f;  // bajada/retorno (más rápido para seguridad)
-
-	              float ramp_target = SETPOINT_ANGLE + scaled_cmd;
-	              float ramp_delta  = ramp_target - manual_setpoint_ramped;
-
-	              float ramp_rate = (ramp_delta > 0.0f) ? RAMP_RATE_UP : RAMP_RATE_DOWN;
-
-	              if (fabsf(ramp_delta) <= ramp_rate) {
-	                  manual_setpoint_ramped = ramp_target;   // llegó al destino
-	              } else {
-	                  manual_setpoint_ramped += (ramp_delta > 0.0f) ? ramp_rate : -ramp_rate;
-	              }
-	              velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_fixed);
-	              if (velocity_est >  20.0f) velocity_est =  20.0f;
-	              if (velocity_est < -20.0f) velocity_est = -20.0f;
-	              velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
-
-	              dynamic_setpoint = manual_setpoint_ramped - KV_brake_value * velocity_est_f;
-              } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
-	              dynamic_setpoint = SETPOINT_ANGLE;
-	          } else {
-	              dynamic_setpoint = SETPOINT_ANGLE;
-	          }
-
-	          float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f : 5.0f;
-	          if (dynamic_setpoint >  sp_limit) dynamic_setpoint =  sp_limit;
-	          if (dynamic_setpoint < -sp_limit) dynamic_setpoint = -sp_limit;
-
-	          {
-	              float sp_step_max = (robot_state == ROBOT_STATE_MANUAL_CONTROL) ? 0.004f : 0.0005f;
-	              float sp_delta = dynamic_setpoint - dynamic_setpoint_f;
-
-	              if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;
-	              if (sp_delta < -sp_step_max) sp_delta = -sp_step_max;
-
-	              dynamic_setpoint_f += sp_delta;
-	          }
-
-	          // -------------------------------------------------------
-	          // FALL DETECTION
-	          // -------------------------------------------------------
-	          float abs_roll_filt = fabsf(filtered_roll_deg);
-	          float abs_roll_raw  = fabsf(accel_ang_deg);
-
-	          // Zona muerta: entre FALL_ANGLE y UPSIDE_DOWN_ANGLE el robot está caído
-	          // y NO intenta recuperarse — espera quieto hasta estar casi vertical
-	          uint8_t upright_now     = (abs_roll_raw < RECOVER_ANGLE);
-	          uint8_t upside_down_now = (abs_roll_raw > UPSIDE_DOWN_ANGLE);
-
-	          static uint8_t dead_zone_count = 0;
-	          if (abs_roll_raw >= FALL_ANGLE) {
-	        	  if (dead_zone_count < 10) dead_zone_count++;
-	          } else {
-	              dead_zone_count = 0;
-	          }
-	          uint8_t in_dead_zone = (dead_zone_count >= 10);
-
-	          if (abs_roll_filt > FALL_ANGLE) {
-	              if (fall_count < 5) fall_count++;
-	          } else {
-	              fall_count = 0;
-	          }
-	          uint8_t fall_by_angle = (fall_count >= 3);
-
-	          if (upright_now) {
-	              if (upright_count < 20) upright_count++;
-	          } else {
-	              upright_count = 0;
-	          }
-	          uint8_t recover_by_angle = (upright_count >= 5);
-
-	          if (upside_down_now) {
-	              if (upside_down_count < 20) upside_down_count++;
-	          } else {
-	              upside_down_count = 0;
-	          }
-	          uint8_t fall_upside_down = (upside_down_count >= 5);
-
-	          if (!f_fallen) {
-	              if (fall_by_angle || fall_upside_down || in_dead_zone) {
-	                  f_fallen = 1;
-	                  integral            = 0.0f;
-	                  velocity_est        = 0.0f;
-	                  velocity_est_f      = 0.0f;
-	                  line_integral       = 0.0f;
-	                  line_error_prev     = 0.0f;
-	                  steering_adjustment = 0.0f;
-	                  gyro_f              = 0.0f;   // ← limpiar gyro al caer
-	                  motorRightVelocity  = 0;
-	                  motorLeftVelocity   = 0;
-	                  pwm_sat_prev = 0.0f;
-	              }
-	          } else {
-	              // Solo recuperar si está CASI vertical Y no está boca abajo
-	              if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
-	                  f_fallen = 0;
-	                  accel_roll_f      = accel_ang_deg;
-	                  filtered_roll_deg = accel_ang_deg;
-	                  //gyro_f            = 0.0f;
-	                  integral            = 0.0f;
-	                  velocity_est        = 0.0f;
-	                  velocity_est_f      = 0.0f;
-	                  line_integral       = 0.0f;
-	                  line_error_prev     = 0.0f;
-	                  steering_adjustment = 0.0f;
-	                  dynamic_setpoint    = SETPOINT_ANGLE;
-	                  dynamic_setpoint_f  = SETPOINT_ANGLE;
-	                  upright_count       = 0;
-	                  upside_down_count   = 0;
-	                  fall_count          = 0;
-	                  dead_zone_count     = 0;
-	                  pwm_sat_prev = 0.0f;
-	              } else {
-	                  motorRightVelocity = 0;
-	                  motorLeftVelocity  = 0;
-	                  // Mantener gyro_f en cero mientras está caído
-	                  gyro_f = 0.0f;
-	                  filtered_roll_deg = accel_ang_deg;  // seguir el acelerómetro mientras está caído
-	              }
-	          }
-
-	          float error   = dynamic_setpoint_f - filtered_roll_deg;
-	          float p_term  = 0.0f;
-	          float i_term  = 0.0f;
-	          float d_term  = 0.0f;
-	          float output  = 0.0f;
-	          float pwm_cmd = 0.0f;
-	          float pwm_sat = 0.0f;
-	          uint8_t sat_flag = 0;
-
-	          // Line follower variables for logging
-	          float log_p_line = 0.0f;
-	          float log_i_line = 0.0f;
-	          float log_d_line = 0.0f;
-
-	          if (!f_fallen) {
-	        	  if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
-	        	      if (integral >  3.0f) integral =  3.0f;
-	        	      if (integral < -3.0f) integral = -3.0f;
-	        	  } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-	        		  integral *= 0.970f;
-	        	  } else if (robot_state != ROBOT_STATE_LINE_FOLLOWING &&
-	        	             robot_state != ROBOT_STATE_BALANCE_AND_SPEED) {
-	        	      integral *= INTEGRAL_DECAY;
-	        	  }
-	        	  p_term = KP_value * error;
-	        	  i_term = KI_value * integral;
-	        	  d_term = -KD_value * gyro_f;
-
-	        	  if (d_term >  8.0f) d_term =  8.0f;
-	        	  if (d_term < -8.0f) d_term = -8.0f;
-
-	        	  output = p_term + i_term + d_term;
-
-	              pwm_cmd = output * MOTOR_GAIN;
-	              pwm_sat = pwm_cmd;
-
-	              if (pwm_sat >  100.0f) { pwm_sat =  100.0f; sat_flag = 1; }
-	              if (pwm_sat < -100.0f) { pwm_sat = -100.0f; sat_flag = 1; }
-
-	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-	                  if (pwm_sat >  40.0f) pwm_sat =  40.0f;
-	                  if (pwm_sat < -40.0f) pwm_sat = -40.0f;
-	              }
-
-	              if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-	                  if (pwm_sat >  55.0f) pwm_sat =  55.0f;
-	                  if (pwm_sat < -55.0f) pwm_sat = -55.0f;
-	              }
-
-	              float pwm_limit;
-	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-	                  pwm_limit = 40.0f;
-	              } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-	                  pwm_limit = 55.0f;
-	              } else {
-	                  pwm_limit = 100.0f;
-	              }
-
-	              {
-	                  float pwm_step_max;
-
-	                  if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-	                      pwm_step_max = 2.0f;   // más suave
-	                  } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-	                      pwm_step_max = 2.0f;
-	                  } else {
-	                      pwm_step_max = 3.0f;   // balance normal
-	                  }
-
-	                  float pwm_delta = pwm_sat - pwm_sat_prev;
-	                  if (pwm_delta >  pwm_step_max) pwm_delta =  pwm_step_max;
-	                  if (pwm_delta < -pwm_step_max) pwm_delta = -pwm_step_max;
-
-	                  pwm_sat = pwm_sat_prev + pwm_delta;
-	                  pwm_sat_prev = pwm_sat;
-	              }
-
-	              if (robot_state != ROBOT_STATE_MANUAL_CONTROL) {
-	                  // Acumular integral solo si el error es significativo (zona muerta de 0.2 grados)
-	                  if (fabsf(error) > 0.2f) {
-	                      if (fabsf(pwm_cmd) <= pwm_limit) {
-	                          integral += error * dt_for_filter;
-	                      } else {
-	                          if (pwm_cmd >  pwm_limit && error < 0) integral += error * dt_for_filter;
-	                          else if (pwm_cmd < -pwm_limit && error > 0) integral += error * dt_for_filter;
-	                      }
-	                  } else {
-	                      // Decaimiento de la integral cuando el error es casi nulo (evita temblores)
-	                      integral *= 0.95f;
-	                  }
-	              }
-	              sat_flag = (fabsf(pwm_cmd) > pwm_limit) ? 1 : 0;
-
-	              if (integral >  I_MAX) integral =  I_MAX;
-	              if (integral < -I_MAX) integral = -I_MAX;
-
-	              if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
-	                  if (integral >  8.0f) integral =  8.0f;
-	                  if (integral < -8.0f) integral = -8.0f;
-	              }
-
-	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-	                  if (integral >  2.0f) integral =  2.0f;
-	                  if (integral < -2.0f) integral = -2.0f;
-	              }
-
-	              if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
-	            	  if (integral >  15.0f) integral =  15.0f;
-					  if (integral < -15.0f) integral = -15.0f;
-	              }
-
-	              if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-	            	  if (integral >  1.5f) integral =  1.5f;
-	            	  if (integral < -1.5f) integral = -1.5f;
-	              }
-
-	              if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-	                  uint8_t line_pivot_active = 0;
-
-	                  switch (line_state) {
-	                      case LINE_STATE_FOLLOWING:
-	                      {
-	                          // Detección robusta: requiere peso total mínimo además de w_sum > 0
-	                          uint8_t line_detected_robust = line_detected && (w_sum > LINE_THRESHOLD * 0.5f);
-
-	                          if (line_detected_robust) {
-	                              // Línea vista: reiniciar el timestamp de pérdida
-	                              line_lost_ms = HAL_GetTick();
-
-	                              float p_line = KP_LINE * line_error;
-
-	                              line_integral += line_error * dt_fixed;
-	                              if (line_integral >  5.0f) line_integral =  5.0f;
-	                              if (line_integral < -5.0f) line_integral = -5.0f;
-
-	                              float i_line = KI_LINE * line_integral;
-
-	                              // LPF sobre line_error para suavizar el D (evita spikes por saltos de ADC)
-	                              static float line_error_f_d = 0.0f;
-	                              line_error_f_d += 0.4f * (line_error - line_error_f_d);
-
-	                              // D: solo calcular si el ciclo fue normal (dt <= 3x el esperado)
-	                              // Si el ciclo tardó más (dt saltó a 10ms), congelar el D en 0
-	                              float d_line = 0.0f;
-	                              if (dt_real <= dt_fixed * 3.0f) {
-	                                  float line_delta = line_error_f_d - line_error_prev;
-	                                  if (line_delta >  0.3f) line_delta =  0.3f;   // clamp delta
-	                                  if (line_delta < -0.3f) line_delta = -0.3f;
-	                                  d_line = KD_LINE * (line_delta / dt_fixed);
-	                              }
-	                              line_error_prev = line_error_f_d;  // siempre actualizar prev
-
-	                              float steering_target = p_line + i_line + d_line;
-
-	                              // Rate limiter: el steering no puede cambiar más de X por ciclo
-	                              float steering_delta = steering_target - steering_adjustment;
-	                              float steering_rate_limit = 8.0f;  // máximo cambio por ciclo (probar entre 4 y 12)
-	                              if (steering_delta >  steering_rate_limit) steering_delta =  steering_rate_limit;
-	                              if (steering_delta < -steering_rate_limit) steering_delta = -steering_rate_limit;
-	                              steering_adjustment += steering_delta;
-
-	                              log_p_line = p_line;
-	                              log_i_line = i_line;
-	                              log_d_line = d_line;
-
-	                          } else {
-	                              // Sin línea: medir tiempo real sin verla
-	                              uint32_t ms_sin_linea = HAL_GetTick() - line_lost_ms;
-
-	                              if (ms_sin_linea > 1000) {  // 1000ms reales continuos → pérdida real
-	                                  line_state      = LINE_STATE_LOST;
-	                                  line_search_dir = last_line_dir;
-	                                  line_integral   = 0.0f;
-	                              }
-	                              // Mientras tanto: mantener último steering
-	                          }
-
-	                          if (steering_adjustment >  20.0f) steering_adjustment =  20.0f;
-	                          if (steering_adjustment < -20.0f) steering_adjustment = -20.0f;
-	                          break;
-	                      }
-
-	                      case LINE_STATE_LOST:
-	                          if (line_detected) {
-	                              line_integral   = 0.0f;
-	                              line_error_prev = 0.0f;
-	                              line_lost_ms    = HAL_GetTick();  // ← resetear también al recuperar
-	                              line_state      = LINE_STATE_FOLLOWING;
-	                          } else if ((HAL_GetTick() - line_lost_ms) > LINE_LOST_TIMEOUT_MS) {
-	                              line_state = LINE_STATE_SEARCHING;
-	                          } else {
-	                              float target = last_line_dir * 4.0f;
-	                              steering_adjustment += 0.02f * (target - steering_adjustment);
-	                          }
-	                          break;
-
-	                      case LINE_STATE_SEARCHING:
-	                          if (line_detected) {
-	                              line_integral   = 0.0f;
-	                              line_error_prev = 0.0f;
-	                              line_lost_ms    = HAL_GetTick();  // ← resetear también al recuperar
-	                              line_state      = LINE_STATE_FOLLOWING;
-	                          } else {
-	                              float target = last_line_dir * 6.0f;
-	                              steering_adjustment += 0.02f * (target - steering_adjustment);
-	                          }
-	                          break;
-	                  }
-
-	                  if (integral >  2.0f) integral =  2.0f;
-	                  if (integral < -2.0f) integral = -2.0f;
-	                  if (pwm_sat >  40.0f) pwm_sat =  40.0f;
-	                  if (pwm_sat < -40.0f) pwm_sat = -40.0f;
-
-	                  if (!line_pivot_active) {
-	                      float half_steer = steering_adjustment * 0.5f;
-
-	                      float mR = pwm_sat - half_steer;
-	                      float mL = pwm_sat + half_steer;
-
-	                      if (mR >  40.0f) mR =  40.0f;
-	                      if (mR < -40.0f) mR = -40.0f;
-	                      if (mL >  40.0f) mL =  40.0f;
-	                      if (mL < -40.0f) mL = -40.0f;
-
-	                      motorRightVelocity = -(int16_t)mL;
-	                      motorLeftVelocity  = -(int16_t)mR;
-	                  }
-	              } else {
-	                  line_integral       = 0.0f;
-	                  line_error_prev     = 0.0f;
-	                  steering_adjustment = 0.0f;
-	                  line_state          = LINE_STATE_FOLLOWING;
-	                  steering_adjustment = 0.0f;
-
-	                  // Corrección de yaw: gz resiste rotación vertical
-	                  float gz_dps = (float)gz / 131.0f;
-	                  float yaw_correction = -gz_dps * 0.3f;   // ← ganancia ajustable
-
-	                  float mR = pwm_sat + yaw_correction;
-	                  float mL = pwm_sat - yaw_correction;
-
-	                  if (mR >  100.0f) mR =  100.0f;
-	                  if (mR < -100.0f) mR = -100.0f;
-	                  if (mL >  100.0f) mL =  100.0f;
-	                  if (mL < -100.0f) mL = -100.0f;
-
-	                  motorRightVelocity = -(int16_t)mL;
-	                  motorLeftVelocity  = -(int16_t)mR;
-	              }
-	          } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                  line_integral       = 0.0f;
-                  line_error_prev     = 0.0f;
-                  line_state          = LINE_STATE_FOLLOWING;
-
-                  {
-					  const float STEER_RATE = 1.5f;  // máx cambio por ciclo (2ms) → ajustable
-					  float steer_delta = manual_steering_cmd - steering_adjustment;
-					  if (steer_delta >  STEER_RATE) steer_delta =  STEER_RATE;
-					  if (steer_delta < -STEER_RATE) steer_delta = -STEER_RATE;
-					  steering_adjustment += steer_delta;
-				  }
-
-				  // Limpiar integral cuando el steering cambia de signo abruptamente
-				  // (detecta el momento exacto del cambio de dirección)
-				  static float prev_steering_cmd = 0.0f;
-				  if ((manual_steering_cmd > 0.5f && prev_steering_cmd < -0.5f) ||
-					  (manual_steering_cmd < -0.5f && prev_steering_cmd > 0.5f)) {
-					  integral = 0.0f;  // flush integral en cambio de dirección
-				  }
-				  prev_steering_cmd = manual_steering_cmd;
-
-				  float mR = pwm_sat - steering_adjustment;
-				  float mL = pwm_sat + steering_adjustment;
-
-                  if (mR >  100.0f) mR =  100.0f;
-                  if (mR < -100.0f) mR = -100.0f;
-                  if (mL >  100.0f) mL =  100.0f;
-                  if (mL < -100.0f) mL = -100.0f;
-
-                  motorRightVelocity = -(int16_t)mL;
-                  motorLeftVelocity  = -(int16_t)mR;
-              } else {
-	              motorRightVelocity = 0;
-	              motorLeftVelocity  = 0;
-	          }
-
-	          roll_deg = filtered_roll_deg;
-
-	          // --- LOGGING ---
-	          log_counter++;
-
-	          if (f_send_wifi_log && (log_counter % LOG_WIFI_DECIM == 0)) {
-	              WifiLogData_t wlog;
-	              wlog.t_ms       = HAL_GetTick();
-	              wlog.roll_filt  = filtered_roll_deg;
-	              wlog.output     = output;
-	              wlog.p_term     = p_term;
-	              wlog.i_term     = i_term;
-	              wlog.d_term     = d_term;
-	              wlog.mR         = motorRightVelocity;
-	              wlog.mL         = motorLeftVelocity;
-	              wlog.dyn_sp     = dynamic_setpoint_f;
-	              wlog.dt_ctrl_us = (uint32_t)(dt * 1000000.0f);
-
-	              wlog.line_error          = line_error;
-	              wlog.p_line              = log_p_line;
-	              wlog.i_line              = log_i_line;
-	              wlog.d_line              = log_d_line;
-	              wlog.steering_adjustment = steering_adjustment;
-	              wlog.adc1                = adcValues[0];
-	              wlog.adc2                = adcValues[1];
-	              wlog.adc3                = adcValues[2];
-	              wlog.adc4                = adcValues[3];
-
-	              UNER_SendWifiLogData(&wlog);
-	          }
-
-	          if (LOG_ENABLE && f_send_csv_log && (log_counter % LOG_DECIM == 0)) {
-	              uint32_t dt_ctrl_us = (uint32_t)(dt * 1000000.0f);
-	              uint32_t t_now_log  = micros();
-	              uint32_t dt_log_us  = t_now_log - last_log_us;
-	              last_log_us = t_now_log;
-	              uint32_t t_ms = HAL_GetTick();
-
-	              if (!log_header_sent) {
-	                  char *header = "t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,dyn_sp,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n";
-	                  usb_enqueue_tx((uint8_t*)header, strlen(header));
-	                  log_header_sent = 1;
-	              }
-
-	              float ay_f_log = (float)ay;
-	              float az_f_log = (float)az;
-	              float denom = sqrtf(ay_f_log*ay_f_log + az_f_log*az_f_log);
-	              float accel_pitch_deg = atan2f(-ax, denom) * (180.0f / M_PI);
-
-	              char line[256];
-	              int32_t accel_mdeg   = (int32_t)(accel_ang_deg * 1000.0f);
-	              int32_t accel_f_mdeg = (int32_t)(accel_roll_f * 1000.0f);
-	              int32_t gyro_mdps    = (int32_t)(gyro_rate_dps * 1000.0f);
-	              int32_t gyro_f_mdps  = (int32_t)(gyro_f * 1000.0f);
-	              int32_t roll_mdeg    = (int32_t)(filtered_roll_deg * 1000.0f);
-	              int32_t error_mdeg   = (int32_t)(error * 1000.0f);
-	              int32_t p_m          = (int32_t)(p_term * 1000.0f);
-	              int32_t i_m          = (int32_t)(i_term * 1000.0f);
-	              int32_t d_m          = (int32_t)(d_term * 1000.0f);
-	              int32_t out_m        = (int32_t)(output * 1000.0f);
-	              int32_t pwm_cmd_c    = (int32_t)(pwm_cmd * 100.0f);
-	              int32_t pwm_sat_c    = (int32_t)(pwm_sat * 100.0f);
-	              int32_t pitch_mdeg   = (int32_t)(accel_pitch_deg * 1000.0f);
-	              int32_t dyn_sp_m     = (int32_t)(dynamic_setpoint_f * 1000.0f);
-
-	              char *ptr = line;
-	              ptr = fast_cat_uint(ptr, t_ms); *ptr++ = ',';
-	              ptr = fast_cat_uint(ptr, dt_log_us); *ptr++ = ',';
-	              ptr = fast_cat_uint(ptr, dt_ctrl_us); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, accel_mdeg); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, accel_f_mdeg); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, gyro_mdps); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, gyro_f_mdps); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, roll_mdeg); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, dyn_sp_m); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, error_mdeg); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, p_m); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, i_m); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, d_m); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, out_m); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, pwm_cmd_c); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, pwm_sat_c); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, sat_flag); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, motorRightVelocity); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, motorLeftVelocity); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, pitch_mdeg); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, ax); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, ay); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, az); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, gx); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, gy); *ptr++ = ',';
-	              ptr = fast_cat_int(ptr, gz);
-	              *ptr++ = '\r';
-	              *ptr++ = '\n';
-
-	              usb_enqueue_tx((uint8_t*)line, (uint16_t)(ptr - line));
-	          }
-
-	          if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
-	              MPU6050_StartRead_DMA();
-	          }
-
-	      } else {
-	          if (mpu_initialized && !i2c1_tx_busy && !f_resetMassCenter) {
-	              MPU6050_StartRead_DMA();
-	          }
-	      }
-
-	      if ((robot_state != ROBOT_STATE_IDLE) && !f_fallen) {
-	          MotorControl(motorRightVelocity, motorLeftVelocity);
-	      } else {
-	          MotorControl(0, 0);
-	      }
+	  while (tick2ms_count) {
+		  tick2ms_count--;
+		  ControlStep2ms();
 	  }
 
 	  if(is10ms) {
@@ -2486,25 +2644,15 @@ int main(void)
 	      }
 	  }
 
-	  while ((esp01IwRx - esp01IrRx) & UDP_RX_MASK) {
-		  uint8_t b = esp01RxBuf[esp01IrRx];
-		  esp01IrRx = (esp01IrRx + 1) & UDP_RX_MASK;
-
-		  // DEBUG: mostrar en USB cada byte recibido
-		  char dbg[6];
-		  snprintf(dbg, sizeof(dbg), "%02X ", b);
-		  USB_DebugStr(dbg);
-
-		  UNER_PushByte(b);
-	  }
-
+	  ProcessEspRxLimited();
 	  UNER_Task(); 		// Procesa tramas UNER recibidas
 	  usb_service_tx();
 	  SSD1306_UpdateScreen();
 
-	  if (dataTx) {
-		  HAL_UART_Transmit(&huart1, &dataTx, 1, 100);
-		  dataTx = 0;
+	  if (dataTx && huart1.gState == HAL_UART_STATE_READY) {
+	      uart_tx_byte = dataTx;
+	      dataTx = 0;
+	      HAL_UART_Transmit_IT(&huart1, &uart_tx_byte, 1);
 	  }
   }
   /* USER CODE END 3 */
