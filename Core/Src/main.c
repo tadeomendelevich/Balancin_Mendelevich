@@ -1650,6 +1650,9 @@ int main(void)
 
 	          dt_real = dt;
 
+	          float dt_for_filter = dt_real;
+	          if (dt_for_filter > 0.004f) dt_for_filter = 0.004f;
+
 	          if (!dt_calibrated) {
 	              dt_warmup_sum += dt_real;
 	              dt_warmup_count++;
@@ -1707,7 +1710,7 @@ int main(void)
 	          accel_roll_f += beta_a_used * (accel_ang_deg - accel_roll_f);
 
 	          // 4) Complementary Filter
-	          filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_fixed)
+	          filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_for_filter)
 	                            + (1.0f - ALPHA) * accel_roll_f;
 
 	          // Variables de línea
@@ -1950,7 +1953,7 @@ int main(void)
 	                  f_fallen = 0;
 	                  accel_roll_f      = accel_ang_deg;
 	                  filtered_roll_deg = accel_ang_deg;
-	                  gyro_f            = 0.0f;
+	                  //gyro_f            = 0.0f;
 	                  integral            = 0.0f;
 	                  velocity_est        = 0.0f;
 	                  velocity_est_f      = 0.0f;
@@ -2054,10 +2057,10 @@ int main(void)
 	                  // Acumular integral solo si el error es significativo (zona muerta de 0.2 grados)
 	                  if (fabsf(error) > 0.2f) {
 	                      if (fabsf(pwm_cmd) <= pwm_limit) {
-	                          integral += error * dt_fixed;
+	                          integral += error * dt_for_filter;
 	                      } else {
-	                          if (pwm_cmd >  pwm_limit && error < 0) integral += error * dt_fixed;
-	                          else if (pwm_cmd < -pwm_limit && error > 0) integral += error * dt_fixed;
+	                          if (pwm_cmd >  pwm_limit && error < 0) integral += error * dt_for_filter;
+	                          else if (pwm_cmd < -pwm_limit && error > 0) integral += error * dt_for_filter;
 	                      }
 	                  } else {
 	                      // Decaimiento de la integral cuando el error es casi nulo (evita temblores)
