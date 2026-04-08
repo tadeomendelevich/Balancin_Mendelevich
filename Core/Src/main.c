@@ -295,8 +295,8 @@ static uint8_t  key_click_count = 0;
 static float manual_setpoint_ramped = 0.0f;  // setpoint con rampa aplicada
 static float pwm_sat_prev = 0.0f;
 
-int16_t ax, ay, az;	// Inicializo variables de aceleracion y giroscopio
-int16_t gx, gy, gz;
+static int16_t ax, ay, az;	// Inicializo variables de aceleracion y giroscopio
+static int16_t gx, gy, gz;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
