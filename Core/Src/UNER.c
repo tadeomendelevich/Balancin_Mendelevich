@@ -49,33 +49,15 @@ static int16_t *p_motorLeftVel  = NULL;
 static float *p_KP = NULL;		// Punteros a las variables de control proporcional en main.c
 static float *p_KD  = NULL;
 static float *p_KI  = NULL;
-static float *p_BETA_G  = NULL;
-static float *p_BETA_A  = NULL;
-static float *p_KV_BRAKE  = NULL;
 
 static float *p_roll  = NULL;	// Punteros a las variables de inclinacion en main.c
 static float *p_pitch = NULL;
 
 static float *p_steering = NULL;
 
+static uint8_t *p_balance_flag = NULL;	// Bandera para activar o desctivar el balance del auto, si esta apagada, los motores estan desabilitados
 
-static uint8_t *p_robot_state = NULL;	// Puntero a la maquina de estados de los modos del robot
-static uint8_t *p_resetMassCenter_flag = NULL;	// Bandera para resetear el centro de gravedad del auto, realizando la medicion de la mpu nuevamente
-static uint8_t *p_send_csv_log_flag = NULL;	//
-static uint8_t *p_send_wifi_log_flag = NULL;
-static uint8_t *p_change_display = NULL;
-
-static float *p_KP_LINE = NULL;
-static float *p_KD_LINE = NULL;
-static float *p_KI_LINE = NULL;
-static float *p_LINE_THRES = NULL;
-static float *p_LINE_SPEED = NULL;
-
-static float *p_manual_sp_cmd = NULL;
-static float *p_manual_st_cmd = NULL;
-static uint32_t *p_manual_tmo = NULL;
-
-static uint8_t last_manual_cmd = 0;
+static uint8_t *p_resetMassCenter_flag = NULL;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
     unerRx = rx;
@@ -185,7 +167,7 @@ void UNER_Send(uint8_t cmd, const uint8_t *payload, uint8_t length) {
         unerTx->indexW &= unerTx->mask;
     }
 
-    uint8_t len = length + 1;
+    uint8_t len = length + 1; // incluye el cmd
     unerTx->buff[unerTx->indexW++] = len;
     unerTx->indexW &= unerTx->mask;
     unerTx->buff[unerTx->indexW++] = ':';
@@ -262,7 +244,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         	USB_Debug("\n ALIVE RECIBIDO!\n");
             putHeaderOnTx(dataTx, ALIVE, 2);
             putByteOnTx(dataTx, ACK);
-            putByteOnTx(dataTx, dataTx->chk);	// EL CHECKSUM SE AGREGA SOLO COMO SUMA LUEGO DEL CALCULO DEL PAYLOAD
+            putByteOnTx(dataTx, dataTx->chk);
         break;
         case FIRMWARE:
             putHeaderOnTx(dataTx, FIRMWARE, 12);
@@ -460,12 +442,8 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 		break;
 
         case BALANCE:
-		if (p_robot_state != NULL) {
-				if (*p_robot_state == 0) { // IDLE -> BALANCE_ONLY
-					*p_robot_state = 1;
-				} else { // ALL OTHER STATES -> IDLE
-					*p_robot_state = 0;
-				}
+		if (p_balance_flag != NULL) {
+				*p_balance_flag = !(*p_balance_flag);
 				putHeaderOnTx(dataTx, BALANCE, 2);
 				putByteOnTx(dataTx, ACK);
 				putByteOnTx(dataTx, dataTx->chk);
@@ -510,216 +488,9 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 				*p_resetMassCenter_flag = !(*p_resetMassCenter_flag);
 				putHeaderOnTx(dataTx, RESETMASSCENTER, 2);
 				putByteOnTx(dataTx, ACK);
-				putByteOnTx(dataTx, dataTx->chk);	// EL CHECKSUM SE AGREGA SOLO COMO SUMA LUEGO DEL CALCULO DEL PAYLOAD
-			}
-		break;
-
-        case ACTIVATE_CSV_LOG:
-			if (p_send_csv_log_flag!= NULL) {
-				*p_send_csv_log_flag = !(*p_send_csv_log_flag);
-				putHeaderOnTx(dataTx, ACTIVATE_CSV_LOG, 2);
-				putByteOnTx(dataTx, ACK);
-				putByteOnTx(dataTx, dataTx->chk);	// EL CHECKSUM SE AGREGA SOLO COMO SUMA LUEGO DEL CALCULO DEL PAYLOAD
-			}
-		break;
-
-        case ACTIVATE_WIFI_LOG:
-            if (p_send_wifi_log_flag != NULL) {
-                *p_send_wifi_log_flag = !(*p_send_wifi_log_flag);
-                putHeaderOnTx(dataTx, ACTIVATE_WIFI_LOG, 2);
-                putByteOnTx(dataTx, ACK);
-                putByteOnTx(dataTx, dataTx->chk);
-            }
-        break;
-
-        case MODIFY_BETA_G:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			float new_BETA_G = myWord.f32;
-			if (p_BETA_G) *p_BETA_G = new_BETA_G;
-
-			putHeaderOnTx(dataTx, MODIFY_BETA_G, 2);
-			putByteOnTx(dataTx, ACK);
-			putByteOnTx(dataTx, dataTx->chk);
-		break;
-
-        case MODIFY_BETA_A:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			float new_BETA_A = myWord.f32;
-			if (p_BETA_A) *p_BETA_A = new_BETA_A;
-
-			putHeaderOnTx(dataTx, MODIFY_BETA_A, 2);
-			putByteOnTx(dataTx, ACK);
-			putByteOnTx(dataTx, dataTx->chk);
-		break;
-
-        case CHANGE_DISPLAY:
-            if (p_change_display != NULL) {
-                *p_change_display = (*p_change_display + 1) % 5;
-                putHeaderOnTx(dataTx, CHANGE_DISPLAY, 2);
-                putByteOnTx(dataTx, ACK);
-                putByteOnTx(dataTx, dataTx->chk);
-            }
-        break;
-
-        case MODIFY_KP_LINE:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			if (p_KP_LINE) *p_KP_LINE = myWord.f32;
-			putHeaderOnTx(dataTx, MODIFY_KP_LINE, 2);
-			putByteOnTx(dataTx, ACK);
-			putByteOnTx(dataTx, dataTx->chk);
-		break;
-
-        case MODIFY_KD_LINE:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			if (p_KD_LINE) *p_KD_LINE = myWord.f32;
-			putHeaderOnTx(dataTx, MODIFY_KD_LINE, 2);
-			putByteOnTx(dataTx, ACK);
-			putByteOnTx(dataTx, dataTx->chk);
-		break;
-
-        case MODIFY_KI_LINE:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			if (p_KI_LINE) *p_KI_LINE = myWord.f32;
-			putHeaderOnTx(dataTx, MODIFY_KI_LINE, 2);
-			putByteOnTx(dataTx, ACK);
-			putByteOnTx(dataTx, dataTx->chk);
-		break;
-
-        case MODIFY_LINE_THRES:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			if (p_LINE_THRES) *p_LINE_THRES = myWord.f32;
-			putHeaderOnTx(dataTx, MODIFY_LINE_THRES, 2);
-			putByteOnTx(dataTx, ACK);
-			putByteOnTx(dataTx, dataTx->chk);
-		break;
-
-        case MODIFY_LINE_SPEED:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			if (p_LINE_SPEED) *p_LINE_SPEED = myWord.f32;
-			putHeaderOnTx(dataTx, MODIFY_LINE_SPEED, 2);
-			putByteOnTx(dataTx, ACK);
-			putByteOnTx(dataTx, dataTx->chk);
-		break;
-
-        case ACTIVATE_LINE_FOLLOWING:
-			if (p_robot_state != NULL) {
-				if (*p_robot_state == 3) { // ROBOT_STATE_LINE_FOLLOWING -> BALANCE_ONLY
-					*p_robot_state = 1;
-				} else if (*p_robot_state != 0) { // IF NOT IDLE -> LINE_FOLLOWING
-					*p_robot_state = 3;
-				}
-				putHeaderOnTx(dataTx, ACTIVATE_LINE_FOLLOWING, 2);
-				putByteOnTx(dataTx, ACK);
 				putByteOnTx(dataTx, dataTx->chk);
 			}
 		break;
-
-        case ACTIVATE_POS_MAINTENANCE:
-			if (p_robot_state != NULL) {
-				if (*p_robot_state == 2) { // BALANCE_AND_SPEED -> BALANCE_ONLY
-					*p_robot_state = 1;
-				} else if (*p_robot_state == 1) { // BALANCE_ONLY -> BALANCE_AND_SPEED
-					*p_robot_state = 2;
-				}
-				putHeaderOnTx(dataTx, ACTIVATE_POS_MAINTENANCE, 2);
-				putByteOnTx(dataTx, ACK);
-				putByteOnTx(dataTx, dataTx->chk);
-			}
-		break;
-
-        case ACTIVATE_MANUAL_CONTROL:
-            if (p_robot_state != NULL) {
-                if (*p_robot_state == 4) { // MANUAL_CONTROL -> BALANCE_ONLY
-                    *p_robot_state = 1;
-                } else if (*p_robot_state != 0) { // IF NOT IDLE -> MANUAL_CONTROL
-                    *p_robot_state = 4;
-                }
-                putHeaderOnTx(dataTx, ACTIVATE_MANUAL_CONTROL, 2);
-                putByteOnTx(dataTx, ACK);
-                putByteOnTx(dataTx, dataTx->chk);
-            }
-        break;
-
-        case MOVE_FORWARD:
-            if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = 4.0f; // degree forward
-                if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
-                last_manual_cmd = MOVE_FORWARD;
-                if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
-            }
-            putHeaderOnTx(dataTx, MOVE_FORWARD, 2);
-            putByteOnTx(dataTx, ACK);
-            putByteOnTx(dataTx, dataTx->chk);
-        break;
-
-        case MOVE_BACKWARD:
-            if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = -4.0f; // degree backward
-                if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
-                last_manual_cmd = MOVE_BACKWARD;
-                if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
-            }
-            putHeaderOnTx(dataTx, MOVE_BACKWARD, 2);
-            putByteOnTx(dataTx, ACK);
-            putByteOnTx(dataTx, dataTx->chk);
-        break;
-
-        case MOVE_LEFT:
-            if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
-                if (p_manual_st_cmd) *p_manual_st_cmd = -60.0f; // steering value for left
-                last_manual_cmd = MOVE_LEFT;
-                if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
-            }
-            putHeaderOnTx(dataTx, MOVE_LEFT, 2);
-            putByteOnTx(dataTx, ACK);
-            putByteOnTx(dataTx, dataTx->chk);
-        break;
-
-        case MOVE_RIGHT:
-            if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
-                if (p_manual_st_cmd) *p_manual_st_cmd = 60.0f; // steering value for right
-                last_manual_cmd = MOVE_RIGHT;
-                if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
-            }
-            putHeaderOnTx(dataTx, MOVE_RIGHT, 2);
-            putByteOnTx(dataTx, ACK);
-            putByteOnTx(dataTx, dataTx->chk);
-        break;
-
-        case MOVE_STOP:
-            if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
-                if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
-                last_manual_cmd = MOVE_STOP;
-                if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
-            }
-            putHeaderOnTx(dataTx, MOVE_STOP, 2);
-            putByteOnTx(dataTx, ACK);
-            putByteOnTx(dataTx, dataTx->chk);
-        break;
 
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
@@ -919,13 +690,10 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr) {
     p_motorLeftVel  = leftPtr;
 }
 
-void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *BETA_G_Ptr, float *BETA_A_Ptr, float *KV_BRAKE_Ptr) {
+void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr) {
     p_KP  = kpPtr;
     p_KD  = kdPtr;
     p_KI  = kiPtr;
-    p_BETA_G = BETA_G_Ptr;
-	p_BETA_A = BETA_A_Ptr;
-	p_KV_BRAKE = KV_BRAKE_Ptr;
 }
 
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr)
@@ -938,30 +706,11 @@ void UNER_RegisterSteering(float *steeringPtr) {
     p_steering = steeringPtr;
 }
 
-void UNER_RegisterRobotState(uint8_t *robotStatePtr) {
-    p_robot_state = robotStatePtr;
-}
-
-void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4, uint8_t *flagPtr5) {
+void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2) {
+    p_balance_flag = flagPtr1;
     p_resetMassCenter_flag = flagPtr2;
-    p_send_csv_log_flag = flagPtr3;
-    p_send_wifi_log_flag = flagPtr4;
-    p_change_display = flagPtr5;
 }
 
-void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLinePtr, float *thresPtr, float *speedPtr, uint8_t *lineFollowFlagPtr) {
-    p_KP_LINE = kpLinePtr;
-    p_KD_LINE = kdLinePtr;
-    p_KI_LINE = kiLinePtr;
-    p_LINE_THRES = thresPtr;
-    p_LINE_SPEED = speedPtr;
-}
-
-void UNER_RegisterManualControl(float *spCmdPtr, float *stCmdPtr, uint32_t *tmoPtr) {
-    p_manual_sp_cmd = spCmdPtr;
-    p_manual_st_cmd = stCmdPtr;
-    p_manual_tmo = tmoPtr;
-}
 
 // Envía el ring-buffer por USB y por UDP
 void UNER_SendData(void) {
@@ -981,54 +730,5 @@ void UNER_SendData(void) {
     // Avanzar índice de lectura
     unerTx->indexR = (unerTx->indexR + len) & unerTx->mask;
 }
-
-void UNER_SendWifiLogData(WifiLogData_t *data) {
-    if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending()) {
-        return;
-    }
-
-    // sizeof(WifiLogData_t) bytes de payload + 1 byte CMD
-    uint8_t payloadLen = sizeof(WifiLogData_t);
-
-    unerTx->indexW = 0;
-    unerTx->indexR = 0;
-    unerTx->chk    = 0;
-
-    putHeaderOnTx(unerTx, CMD_WIFI_LOG_DATA, payloadLen + 1);
-
-    uint8_t *p = (uint8_t*)data;
-    for (uint8_t i = 0; i < payloadLen; i++) {
-        putByteOnTx(unerTx, p[i]);
-    }
-
-    putByteOnTx(unerTx, unerTx->chk);
-
-    UNER_SendData();
-}
-
-void UNER_SendLogData(LogData_t *data) {
-    if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending()) {
-        return;
-    }
-
-    uint8_t payloadLen = sizeof(LogData_t);
-
-    unerTx->indexW = 0;
-    unerTx->indexR = 0;
-    unerTx->chk    = 0;
-
-    putHeaderOnTx(unerTx, CMD_LOG_DATA, payloadLen);
-
-    uint8_t *p = (uint8_t*)data;
-    for (uint8_t i = 0; i < payloadLen; i++) {
-        putByteOnTx(unerTx, p[i]);
-    }
-
-    putByteOnTx(unerTx, unerTx->chk);
-
-    UNER_SendData();
-}
-
-uint8_t UNER_GetLastManualCmd(void) { return last_manual_cmd; }
 
 /* END Private Functions*/
