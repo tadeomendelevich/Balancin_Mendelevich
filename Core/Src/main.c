@@ -294,9 +294,6 @@ static uint8_t  key_click_count = 0;
 
 static float manual_setpoint_ramped = 0.0f;  // setpoint con rampa aplicada
 static float pwm_sat_prev = 0.0f;
-
-static int16_t ax, ay, az;	// Inicializo variables de aceleracion y giroscopio
-static int16_t gx, gy, gz;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -312,8 +309,6 @@ static void MX_TIM4_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM5_Init(void);
 /* USER CODE BEGIN PFP */
-void RunControlLoop(void);
-
 void USBRxData(uint8_t *buf, int len);
 void USB_BufferPush(uint8_t b);
 void USB_DebugSend(const uint8_t *data, uint16_t len);
@@ -431,7 +426,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     }
 
     if (htim->Instance == TIM5) {        // 2 ms
-        RunControlLoop();
+            is2ms = 1;
     }
 }
 
@@ -564,19 +559,15 @@ void USB_Debug(const char *fmt, ...) {
 
 uint8_t usb_enqueue_tx(const uint8_t *data, uint16_t len) {
     uint16_t next;
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
     for (uint16_t i = 0; i < len; i++) {
         next = (tx_head + 1) & USB_TX_BUF_MASK;
         if (next == tx_tail) {
             // buffer lleno
-            __set_PRIMASK(primask);
             return 0;
         }
         usb_tx_buf[tx_head] = data[i];
         tx_head = next;
     }
-    __set_PRIMASK(primask);
     if (usb_tx_busy == 0) {
         usb_service_tx();
     }
@@ -1506,9 +1497,141 @@ void updateDisplay(void) {
   * @brief  The application entry point.
   * @retval int
   */
+int main(void)
+{
 
-void RunControlLoop(void) {
+  /* USER CODE BEGIN 1 */
 
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_I2C1_Init();
+  MX_ADC1_Init();
+  MX_TIM1_Init();
+  MX_TIM3_Init();
+  MX_USB_DEVICE_Init();
+  MX_TIM2_Init();
+  MX_TIM4_Init();
+  MX_USART1_UART_Init();
+  MX_TIM5_Init();
+  /* USER CODE BEGIN 2 */
+  CDC_Attach_Rx(USBRxData);
+  nBytesTx = 0;
+  HAL_UART_Receive_IT(&huart1, &dataRx, 1);
+
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcValues, 8);
+  HAL_TIM_Base_Start_IT(&htim1);   // 10 ms
+  HAL_TIM_Base_Start_IT(&htim2);   // 250 us (si lo vas a usar)
+  HAL_TIM_Base_Start_IT(&htim5);   // 2 ms (500 Hz)
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+
+  PWM_init();
+
+  static _sESP01Handle esp01Handle = {
+      .aDoCHPD         = esp01_chpd,                  // Controla CH_PD
+      .aWriteUSARTByte = uart_send_byte,          // Envía un byte por UART
+      .bufRX           = esp01RxBuf,              // Buffer de recepción
+      .iwRX            = &esp01IwRx,              // Índice de escritura
+      .sizeBufferRX    = sizeof(esp01RxBuf)       // Tamaño del buffer
+  };
+
+  ESP01_Init(&esp01Handle);                        // Copia el handle interno :contentReference[oaicite:1]{index=1}
+  ESP01_AttachChangeState(appOnESP01ChangeState);
+  esp01_chpd(1);  // Pone CH_PD a nivel alto para sacar al módulo de reset
+  HAL_Delay(100);
+  ESP01_AttachDebugStr(ESP01_USB_DbgStr);
+  ESP01_SetWIFI(wifiSSID, wifiPassword);
+
+  int16_t ax, ay, az;	// Inicializo variables de aceleracion y giroscopio
+  int16_t gx, gy, gz;
+
+  unerRx.buff = unerRxBuffer;
+  unerRx.mask = RXBUFSIZE - 1;
+  unerTx.buff = unerTxBuffer;
+  unerTx.mask = TXBUFSIZE - 1;
+  UNER_Init(&unerRx, &unerTx, &ax, &ay, &az, &gx, &gy, &gz);
+  UNER_RegisterADCBuffer(adcAvg, 8);  // array adcValues[8]
+  UNER_RegisterMotorSpeed(&motorRightVelocity, &motorLeftVelocity);
+  UNER_RegisterAngle(&roll_deg, &pitch_deg);
+  UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &BETA_G_value, &BETA_A_value, &KV_brake_value);
+  UNER_RegisterSteering(&steering_adjustment);
+  UNER_RegisterFlags(NULL, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
+  UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_ANGLE, NULL);
+  UNER_RegisterManualControl(&manual_setpoint_cmd, &manual_steering_cmd, &manual_cmd_last_ms);
+  UNER_RegisterRobotState(&robot_state);
+
+  SSD1306_RegisterPlatform(&SSD1306_plat);
+  SSD1306_Init();
+
+  SSD1306_DrawBitmap(0, 0, unerLogo, 128, 64, SSD1306_COLOR_WHITE);
+  SSD1306_UpdateScreen_Blocking();
+
+  MPU6050_RegisterPlatform(&mpuPlat);
+  int status = MPU6050_Init();
+  if (status != MPU6050_OK) {
+   mpu_initialized = 0;
+      USB_Debug("ERROR MPU6050: NO SE HA PODIDO INICIALIZAR EL MODULO MPU6050\r\n");
+  } else {
+    mpu_initialized = 1;
+    MPU6050_Calibrate();		// Calibración
+    MPU6050_StartRead_DMA();	// Lanzo priemra lectura
+  }
+
+  tmo100ms = 10;
+  is10ms   = 0;
+  is250us  = 0;
+  mpu6050Counter = 0;
+  aliveCounter = 0;
+
+  motorRightVelocity = 0;
+  motorLeftVelocity  = 0;
+
+  esp01IwRx = 0;
+  esp01IrRx = 0;
+
+  KP_value = KP;
+  KD_value = KD;
+  KI_value = KI;
+  BETA_G_value = BETA_G;
+  BETA_A_value = BETA_A;
+  KV_brake_value = KV_BRAKE;
+
+  // Initialize DWT for micros()
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  // Use raw bit 0 if DWT_CTRL_CYCCNT_Msk is not defined (standard for Cortex-M4)
+  DWT->CTRL |= 1;
+
+  HAL_Delay(500);
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+	  if(is2ms) {
+	      is2ms = 0;
 
 	      if (MPU6050_IsDataReady()) {
 	          MPU6050_ClearDataReady();
@@ -2253,140 +2376,7 @@ void RunControlLoop(void) {
 	      } else {
 	          MotorControl(0, 0);
 	      }
-
-}
-
-int main(void)
-{
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
-  SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_I2C1_Init();
-  MX_ADC1_Init();
-  MX_TIM1_Init();
-  MX_TIM3_Init();
-  MX_USB_DEVICE_Init();
-  MX_TIM2_Init();
-  MX_TIM4_Init();
-  MX_USART1_UART_Init();
-  MX_TIM5_Init();
-  /* USER CODE BEGIN 2 */
-  CDC_Attach_Rx(USBRxData);
-  nBytesTx = 0;
-  HAL_UART_Receive_IT(&huart1, &dataRx, 1);
-
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcValues, 8);
-  HAL_TIM_Base_Start_IT(&htim1);   // 10 ms
-  HAL_TIM_Base_Start_IT(&htim2);   // 250 us (si lo vas a usar)
-  HAL_TIM_Base_Start_IT(&htim5);   // 2 ms (500 Hz)
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
-
-  PWM_init();
-
-  static _sESP01Handle esp01Handle = {
-      .aDoCHPD         = esp01_chpd,                  // Controla CH_PD
-      .aWriteUSARTByte = uart_send_byte,          // Envía un byte por UART
-      .bufRX           = esp01RxBuf,              // Buffer de recepción
-      .iwRX            = &esp01IwRx,              // Índice de escritura
-      .sizeBufferRX    = sizeof(esp01RxBuf)       // Tamaño del buffer
-  };
-
-  ESP01_Init(&esp01Handle);                        // Copia el handle interno :contentReference[oaicite:1]{index=1}
-  ESP01_AttachChangeState(appOnESP01ChangeState);
-  esp01_chpd(1);  // Pone CH_PD a nivel alto para sacar al módulo de reset
-  HAL_Delay(100);
-  ESP01_AttachDebugStr(ESP01_USB_DbgStr);
-  ESP01_SetWIFI(wifiSSID, wifiPassword);
-
-  unerRx.buff = unerRxBuffer;
-  unerRx.mask = RXBUFSIZE - 1;
-  unerTx.buff = unerTxBuffer;
-  unerTx.mask = TXBUFSIZE - 1;
-  UNER_Init(&unerRx, &unerTx, &ax, &ay, &az, &gx, &gy, &gz);
-  UNER_RegisterADCBuffer(adcAvg, 8);  // array adcValues[8]
-  UNER_RegisterMotorSpeed(&motorRightVelocity, &motorLeftVelocity);
-  UNER_RegisterAngle(&roll_deg, &pitch_deg);
-  UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &BETA_G_value, &BETA_A_value, &KV_brake_value);
-  UNER_RegisterSteering(&steering_adjustment);
-  UNER_RegisterFlags(NULL, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
-  UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_ANGLE, NULL);
-  UNER_RegisterManualControl(&manual_setpoint_cmd, &manual_steering_cmd, &manual_cmd_last_ms);
-  UNER_RegisterRobotState(&robot_state);
-
-  SSD1306_RegisterPlatform(&SSD1306_plat);
-  SSD1306_Init();
-
-  SSD1306_DrawBitmap(0, 0, unerLogo, 128, 64, SSD1306_COLOR_WHITE);
-  SSD1306_UpdateScreen_Blocking();
-
-  MPU6050_RegisterPlatform(&mpuPlat);
-  int status = MPU6050_Init();
-  if (status != MPU6050_OK) {
-   mpu_initialized = 0;
-      USB_Debug("ERROR MPU6050: NO SE HA PODIDO INICIALIZAR EL MODULO MPU6050\r\n");
-  } else {
-    mpu_initialized = 1;
-    MPU6050_Calibrate();		// Calibración
-    MPU6050_StartRead_DMA();	// Lanzo priemra lectura
-  }
-
-  tmo100ms = 10;
-  is10ms   = 0;
-  is250us  = 0;
-  mpu6050Counter = 0;
-  aliveCounter = 0;
-
-  motorRightVelocity = 0;
-  motorLeftVelocity  = 0;
-
-  esp01IwRx = 0;
-  esp01IrRx = 0;
-
-  KP_value = KP;
-  KD_value = KD;
-  KI_value = KI;
-  BETA_G_value = BETA_G;
-  BETA_A_value = BETA_A;
-  KV_brake_value = KV_BRAKE;
-
-  // Initialize DWT for micros()
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  DWT->CYCCNT = 0;
-  // Use raw bit 0 if DWT_CTRL_CYCCNT_Msk is not defined (standard for Cortex-M4)
-  DWT->CTRL |= 1;
-
-  HAL_Delay(500);
-  /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-
+	  }
 
 	  if(is10ms) {
 	      is10ms = 0;
@@ -2406,11 +2396,7 @@ int main(void)
 	              if (SSD1306_IsUpdateDone()) updateDisplay();
 	              break;
 	          case 2:
-	              if (UNER_ShouldSendAllSensors()) {
-                  HAL_NVIC_DisableIRQ(TIM5_IRQn);
-                  UNER_SendAllSensors();
-                  HAL_NVIC_EnableIRQ(TIM5_IRQn);
-              }
+	              if (UNER_ShouldSendAllSensors()) UNER_SendAllSensors();
 	              if (f_resetMassCenter && !i2c1_tx_busy) {
 	                  MPU6050_Calibrate();
 	                  f_resetMassCenter = 0;
@@ -2507,9 +2493,7 @@ int main(void)
 		  UNER_PushByte(b);
 	  }
 
-	  HAL_NVIC_DisableIRQ(TIM5_IRQn);
 	  UNER_Task(); 		// Procesa tramas UNER recibidas
-	  HAL_NVIC_EnableIRQ(TIM5_IRQn);
 	  usb_service_tx();
 	  SSD1306_UpdateScreen();
 
