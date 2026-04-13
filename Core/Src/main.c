@@ -93,7 +93,7 @@ typedef enum {
 #define KP     		3.100f
 #define KD     		0.180f
 #define KI    		0.010f
-#define BETA_G 		0.060f		 // LPF for Gyro
+#define BETA_G 		0.090f		 // LPF for Gyro
 #define BETA_A 		0.020f        // LPF for Accel
 
 #define MOTOR_GAIN 		2.5f
@@ -201,13 +201,13 @@ static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrant
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
 
-//const char *wifiSSID     = "FCAL";
-//const char *wifiPassword = "fcalconcordia.06-2019";
-//const char *wifiIp = "172.23.205.98";
+const char *wifiSSID     = "FCAL";
+const char *wifiPassword = "fcalconcordia.06-2019";
+const char *wifiIp = "172.23.205.98";
 
-const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-const char *wifiPassword = "djg19dlk";
-const char *wifiIp 		 = "192.168.100.5";
+//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+//const char *wifiPassword = "djg19dlk";
+//const char *wifiIp 		 = "192.168.100.5";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
@@ -245,7 +245,7 @@ static uint32_t log_counter = 0;
 static uint8_t  log_header_sent = 0;
 uint8_t f_send_csv_log = 0;
 uint8_t f_send_wifi_log = 0;
-uint8_t f_change_display = 1;
+uint8_t f_change_display = 0;
 
 static uint8_t f_wifi_connected = 0;
 static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
@@ -2017,22 +2017,24 @@ static void ControlStep2ms(void)
         float log_d_line = 0.0f;
 
         if (!f_fallen) {
-            if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
-                if (integral >  3.0f) integral =  3.0f;
-                if (integral < -3.0f) integral = -3.0f;
-            } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+            if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                 integral *= 0.970f;
-            } else if (robot_state != ROBOT_STATE_LINE_FOLLOWING &&
-                       robot_state != ROBOT_STATE_BALANCE_AND_SPEED) {
-                integral *= INTEGRAL_DECAY;
+            } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
+                // no decay, acumula libremente dentro de límites
+            } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+                // no decay aquí tampoco
             }
 
             p_term = KP_value * error;
             i_term = KI_value * integral;
-            d_term = -KD_value * gyro_f;
 
-            if (d_term >  8.0f) d_term =  8.0f;
-            if (d_term < -8.0f) d_term = -8.0f;
+            float gyro_for_d = gyro_f;
+            if (gyro_for_d >  150.0f) gyro_for_d =  150.0f;
+            if (gyro_for_d < -150.0f) gyro_for_d = -150.0f;
+            d_term = -KD_value * gyro_for_d;
+
+            if (d_term >  15.0f) d_term =  15.0f;
+            if (d_term < -15.0f) d_term = -15.0f;
 
             output = p_term + i_term + d_term;
 
@@ -2068,8 +2070,10 @@ static void ControlStep2ms(void)
                     pwm_step_max = 2.0f;
                 } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
                     pwm_step_max = 2.0f;
+                } else if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
+                    pwm_step_max = 8.0f;   // ← más rápido, el péndulo no espera
                 } else {
-                    pwm_step_max = 3.0f;
+                    pwm_step_max = 5.0f;
                 }
 
                 float pwm_delta = pwm_sat - pwm_sat_prev;
@@ -2083,7 +2087,7 @@ static void ControlStep2ms(void)
             if (robot_state != ROBOT_STATE_MANUAL_CONTROL) {
                 if (!late_cycle) {
                     if (fabsf(error) > 0.2f) {
-                        if (fabsf(pwm_cmd) <= pwm_limit) {
+                    	if (fabsf(pwm_sat) <= pwm_limit) {
                             integral += error * dt_ctrl;
                         } else {
                             if (pwm_cmd >  pwm_limit && error < 0) integral += error * dt_ctrl;
@@ -2095,7 +2099,7 @@ static void ControlStep2ms(void)
                 }
             }
 
-            sat_flag = (fabsf(pwm_cmd) > pwm_limit) ? 1 : 0;
+            sat_flag = (fabsf(pwm_sat) >= pwm_limit) ? 1 : 0;
 
             if (integral >  I_MAX) integral =  I_MAX;
             if (integral < -I_MAX) integral = -I_MAX;
