@@ -919,12 +919,10 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr) {
     p_motorLeftVel  = leftPtr;
 }
 
-void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *BETA_G_Ptr, float *BETA_A_Ptr, float *KV_BRAKE_Ptr) {
+void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *KV_BRAKE_Ptr) {
     p_KP  = kpPtr;
     p_KD  = kdPtr;
     p_KI  = kiPtr;
-    p_BETA_G = BETA_G_Ptr;
-	p_BETA_A = BETA_A_Ptr;
 	p_KV_BRAKE = KV_BRAKE_Ptr;
 }
 

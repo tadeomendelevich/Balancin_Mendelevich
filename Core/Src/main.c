@@ -93,8 +93,6 @@ typedef enum {
 #define KP     		3.100f
 #define KD     		0.180f
 #define KI    		0.010f
-#define BETA_G 		0.090f		 // LPF for Gyro
-#define BETA_A 		0.020f        // LPF for Accel
 
 #define MOTOR_GAIN 		2.5f
 #define SETPOINT_ANGLE 	0.0f
@@ -201,13 +199,13 @@ static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrant
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
 
-const char *wifiSSID     = "FCAL";
-const char *wifiPassword = "fcalconcordia.06-2019";
-const char *wifiIp = "172.23.205.98";
+//const char *wifiSSID     = "FCAL";
+//const char *wifiPassword = "fcalconcordia.06-2019";
+//const char *wifiIp = "172.23.205.98";
 
-//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-//const char *wifiPassword = "djg19dlk";
-//const char *wifiIp 		 = "192.168.100.5";
+const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+const char *wifiPassword = "djg19dlk";
+const char *wifiIp 		 = "192.168.100.5";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
@@ -224,10 +222,7 @@ static float integral = 0.0f;
 static float steering_adjustment = 0.0f;
 static float filtered_roll_deg = 0.0f;
 
-// New Control Variables
 static uint32_t last_ctrl_us = 0;
-static float gyro_f = 0.0f;
-static float accel_roll_f = 0.0f;
 
 uint8_t robot_state = ROBOT_STATE_IDLE; // Controls the main state machine of the robot
 
@@ -267,8 +262,6 @@ static float dynamic_setpoint_f = 0.0f;
 float KP_value;
 float KD_value;
 float KI_value;
-float BETA_G_value;
-float BETA_A_value;
 float KV_brake_value;
 
 // Line Follower Variables
@@ -304,6 +297,9 @@ static uint8_t uart_tx_byte = 0;
 static int16_t ax = 0, ay = 0, az = 0;
 static int16_t gx = 0, gy = 0, gz = 0;
 
+static float gyro_f = 0.0f;
+static float accel_roll_f = 0.0f;
+static float accel_roll_deg = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -1656,50 +1652,24 @@ static void ControlStep10ms(void)
         // ciclo tarde
         uint8_t late_cycle = (dt_real > (dt_fixed * 1.8f)) ? 1 : 0;
 
-        const float ANG_SIGN = +1.0f;
-
         // -------------------------------------------------------
         // FILTRO IMU
         // -------------------------------------------------------
-        float gyro_rate_dps = ANG_SIGN * ((float)gx / 100.0f);
+        const float ANG_SIGN = +1.0f;
 
+        float gyro_rate_dps = ANG_SIGN * ((float)gx / 100.0f);
         if (gyro_rate_dps >  250.0f) gyro_rate_dps =  250.0f;
         if (gyro_rate_dps < -250.0f) gyro_rate_dps = -250.0f;
 
-        gyro_f += BETA_G_value * (gyro_rate_dps - gyro_f);
-
+        gyro_f = gyro_rate_dps;
         if (gyro_f >  180.0f) gyro_f =  180.0f;
         if (gyro_f < -180.0f) gyro_f = -180.0f;
 
         float accel_ang_deg = ANG_SIGN * (atan2f((float)ay, (float)az) * (180.0f / M_PI));
 
-        float accel_mag = sqrtf((float)ax*(float)ax + (float)ay*(float)ay + (float)az*(float)az);
-        const float ONE_G = 981.0f;
-        float accel_ratio = accel_mag / ONE_G;
-        float beta_a_used;
-
-        if (accel_ratio >= 0.92f && accel_ratio <= 1.08f) {
-            beta_a_used = BETA_A_value;
-        } else if (accel_ratio < 0.75f || accel_ratio > 1.25f) {
-            beta_a_used = 0.0f;
-        } else {
-            float dist;
-            if (accel_ratio < 0.92f) {
-                dist = (accel_ratio - 0.75f) / (0.92f - 0.75f);
-            } else {
-                dist = (1.25f - accel_ratio) / (1.25f - 1.08f);
-            }
-
-            if (dist < 0.0f) dist = 0.0f;
-            if (dist > 1.0f) dist = 1.0f;
-
-            beta_a_used = BETA_A_value * dist;
-        }
-
-        accel_roll_f += beta_a_used * (accel_ang_deg - accel_roll_f);
-
-        filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_ctrl)
-                          + (1.0f - ALPHA) * accel_roll_f;
+        // Filtro complementario (fusión gyro + accel)
+        filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_fixed)
+                          + (1.0f - ALPHA) * accel_ang_deg;
 
         // -------------------------------------------------------
         // LINE FOLLOWER INPUTS
@@ -2475,7 +2445,7 @@ int main(void)
   UNER_RegisterADCBuffer(adcAvg, 8);  // array adcValues[8]
   UNER_RegisterMotorSpeed(&motorRightVelocity, &motorLeftVelocity);
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
-  UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &BETA_G_value, &BETA_A_value, &KV_brake_value);
+  UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &KV_brake_value);
   UNER_RegisterSteering(&steering_adjustment);
   UNER_RegisterFlags(NULL, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
   UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_ANGLE, NULL);
@@ -2514,8 +2484,6 @@ int main(void)
   KP_value = KP;
   KD_value = KD;
   KI_value = KI;
-  BETA_G_value = BETA_G;
-  BETA_A_value = BETA_A;
   KV_brake_value = KV_BRAKE;
 
   // Initialize DWT for micros()

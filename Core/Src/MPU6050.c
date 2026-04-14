@@ -66,6 +66,9 @@ int MPU6050_Init(void)
     data = 0x00;
     _platform->writeReg(_platform->ctx, MPU6050_ADDR, GYRO_CONFIG_REG, &data, 1);
 
+    // DLPF_CFG=3 → BW≈44Hz, delay≈4.9ms (filtra accel + gyro)
+    data = 0x03; _platform->writeReg(_platform->ctx, MPU6050_ADDR, CONFIG_REG, &data, 1);
+
     return MPU6050_OK;
 }
 

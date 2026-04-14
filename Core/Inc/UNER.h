@@ -212,7 +212,7 @@ void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr);
 
 void UNER_RegisterAngle(float *rollPtr, float *pitchPtr);
 
-void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *BETA_G_Ptr, float *BETA_A_Ptr, float *KV_BRAKE_Ptr);
+void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *KV_BRAKE_Ptr);
 
 void UNER_RegisterSteering(float *steeringPtr);
 
