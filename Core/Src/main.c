@@ -299,7 +299,6 @@ static int16_t gx = 0, gy = 0, gz = 0;
 
 static float gyro_f = 0.0f;
 static float accel_roll_f = 0.0f;
-static float accel_roll_deg = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -363,44 +362,6 @@ static inline uint32_t micros(void) {
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static char* fast_cat_int(char* buf, int32_t val) {
-    if (val < 0) {
-        *buf++ = '-';
-        val = -val;
-    }
-    char tmp[12];
-    int i = 0;
-    if (val == 0) {
-        tmp[i++] = '0';
-    } else {
-        while (val > 0) {
-            tmp[i++] = (val % 10) + '0';
-            val /= 10;
-        }
-    }
-    while (i > 0) {
-        *buf++ = tmp[--i];
-    }
-    return buf;
-}
-
-static char* fast_cat_uint(char* buf, uint32_t val) {
-    char tmp[12];
-    int i = 0;
-    if (val == 0) {
-        tmp[i++] = '0';
-    } else {
-        while (val > 0) {
-            tmp[i++] = (val % 10) + '0';
-            val /= 10;
-        }
-    }
-    while (i > 0) {
-        *buf++ = tmp[--i];
-    }
-    return buf;
-}
-
 SSD1306_Ctx_t ssd_ctx = {
   .hi2c      = &hi2c1,
   .busy_flag = &i2c1_tx_busy
