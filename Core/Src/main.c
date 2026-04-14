@@ -101,7 +101,7 @@ typedef enum {
 
 // Complementary Filter
 #define ALPHA 0.98f
-#define DT 0.002f
+#define DT 0.010f
 
 // LOGGING MACROS
 #define LOG_ENABLE 1
@@ -110,8 +110,8 @@ typedef enum {
 
 // Filter Control Parameters
 #define I_MAX  100.0f       // Max Integral Term
-#define DT_MIN 0.0005f      // Min valid DT (0.5ms)
-#define DT_MAX 0.01f        // Max valid DT (10ms)
+#define DT_MIN 0.005f       // Min valid DT (5ms)
+#define DT_MAX 0.05f        // Max valid DT (50ms)
 
 // Fall detection (hysteresis)
 #define FALL_ANGLE           60.0f
@@ -358,7 +358,7 @@ void appOnESP01ChangeState(_eESP01STATUS state);
 
 void ProcessEspRxLimited(void);
 
-static void ControlStep2ms(void);
+static void ControlStep10ms(void);
 
 static inline uint32_t micros(void) {
     return DWT->CYCCNT / (SystemCoreClock / 1000000);
@@ -1615,7 +1615,7 @@ void updateDisplay(void) {
     SSD1306_RequestUpdate();
 }
 
-static void ControlStep2ms(void)
+static void ControlStep10ms(void)
 {
 
     if (MPU6050_IsDataReady()) {
@@ -1628,7 +1628,7 @@ static void ControlStep2ms(void)
         // TIMING
         // -------------------------------------------------------
         uint32_t now_us = micros();
-        if (last_ctrl_us == 0) last_ctrl_us = now_us - 2000;
+        if (last_ctrl_us == 0) last_ctrl_us = now_us - 10000;
         float dt = (float)(now_us - last_ctrl_us) * 1e-6f;
         last_ctrl_us = now_us;
 
@@ -2537,11 +2537,11 @@ int main(void)
 
 	  while (tick2ms_count) {
 		  tick2ms_count--;
-		  ControlStep2ms();
 	  }
 
 	  if(is10ms) {
 	      is10ms = 0;
+		      ControlStep10ms();
 	      static uint8_t subtick = 0;
 	      subtick = (subtick + 1) % 4;
 
