@@ -2511,7 +2511,7 @@ int main(void)
 	      is10ms = 0;
 		      ControlStep10ms();
 	      static uint8_t subtick = 0;
-	      subtick = (subtick + 1) % 4;
+	      subtick = (subtick + 1) % 10;
 
 	      // Estas dos van siempre — son rápidas y críticas
 	      ESP01_Timeout10ms();
@@ -2523,25 +2523,32 @@ int main(void)
 	              ESP01_Task();
 	              break;
 	          case 1:
-	              if (SSD1306_IsUpdateDone()) updateDisplay();
+	              if (SSD1306_IsUpdateDone() && !i2c1_tx_busy) updateDisplay();
 	              break;
 	          case 2:
 	              if (UNER_ShouldSendAllSensors()) UNER_SendAllSensors();
+	              break;
+	          case 3:
 	              if (f_resetMassCenter && !i2c1_tx_busy) {
 	                  MPU6050_Calibrate();
 	                  f_resetMassCenter = 0;
+	                  if (mpu_initialized) MPU6050_StartRead_DMA();
 	              }
 	              break;
-	          case 3:
+	          case 4:
 	              tmo100ms--;
 	              if (tmo100ms == 0) {
 	                  tmo100ms = 10;
 	                  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
 	                  HAL_GPIO_TogglePin(INTEGRATED_LED_GPIO_Port, INTEGRATED_LED_Pin);
 	              }
+	              break;
+	          default:
+	              break;
+	      }
 
-	              // ── Botón KEY: simple / doble / triple / largo ──────────────────────────
-	              {
+	      // ── Botón KEY: simple / doble / triple / largo ──────────────────────────
+	      {
 	                  uint8_t key_now = HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin);
 	                  uint32_t now    = HAL_GetTick();
 
@@ -2612,14 +2619,14 @@ int main(void)
 
 	                  key_prev = key_now;
 	              }
-	              break;
-	      }
 	  }
 
 	  ProcessEspRxLimited();
 	  UNER_Task(); 		// Procesa tramas UNER recibidas
 	  usb_service_tx();
-	  SSD1306_UpdateScreen();
+	  if (!i2c1_tx_busy) {
+		  SSD1306_UpdateScreen();
+	  }
 
 	  if (dataTx && huart1.gState == HAL_UART_STATE_READY) {
 	      uart_tx_byte = dataTx;
