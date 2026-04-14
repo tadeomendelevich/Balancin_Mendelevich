@@ -286,8 +286,8 @@ static uint32_t key_last_ms = 0;
 static uint32_t key_click_time = 0;
 static uint8_t  key_click_count = 0;
 
-static float manual_setpoint_ramped = 0.0f;  // setpoint con rampa aplicada
-static float line_angle_ramped      = 0.0f;  // rampa del avance en line follower
+static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
+static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float pwm_sat_prev = 0.0f;
 
 volatile uint8_t tick2ms_count = 0;
@@ -298,6 +298,7 @@ static int16_t ax = 0, ay = 0, az = 0;
 static int16_t gx = 0, gy = 0, gz = 0;
 
 static float gyro_f = 0.0f;
+
 static float accel_roll_f = 0.0f;
 /* USER CODE END PV */
 
