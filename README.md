@@ -62,7 +62,7 @@ El enfoque principal fue lograr un control robusto frente a perturbaciones, opti
 ## 🖥️ Interfaz gráfica
 
 <p align="center">
-  <img src="assets/interfaz.png" width="700"/>
+  <img src="interfaz_QT.png" width="700"/>
 </p>
 
 El sistema incluye una aplicación desarrollada en Qt que permite:
