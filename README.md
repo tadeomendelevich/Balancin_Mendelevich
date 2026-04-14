@@ -11,7 +11,7 @@
 ## 🔧 Build del sistema
 
 <p align="center">
-  <img src="assets/build.png" width="600"/>
+  <img src="build.png" width="600"/>
 </p>
 
 ---
