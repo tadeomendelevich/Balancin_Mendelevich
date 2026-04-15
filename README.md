@@ -55,6 +55,9 @@ Robot de dos ruedas que se mantiene en equilibrio mediante control PID clásico.
 
 </div>
 
+---
+
+
 | Módulo | Descripción |
 |--------|-------------|
 | 🔵 **MPU6050** | Lee acelerómetro y giroscopio por I²C — datos crudos convertidos a unidades físicas en cada ciclo |
