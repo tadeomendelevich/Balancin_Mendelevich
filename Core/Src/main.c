@@ -339,6 +339,7 @@ int  mpu_readReg(void   *ctx, uint8_t devAddr, uint8_t regAddr, uint8_t *data, u
 int  mpu_readRegDMA(void   *ctx, uint8_t devAddr, uint8_t regAddr, uint8_t *data, uint16_t length);
 void mpu_delayMs(void    *ctx, uint32_t ms);
 void mpu_errorCb(void *ctx, int err);
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin);
 void MPU6050_RegisterPlatform(MPU6050_Platform_t *plat);
 void MPU6050_ProcessDMA(void);
 
@@ -404,9 +405,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
 
 void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c) {
-    if (hi2c->Instance != I2C1) return;
-    i2c1_tx_busy = 0;
-    MPU6050_ProcessDMA();
+	if (hi2c->Instance == I2C1) {
+		MPU6050_ProcessDMA();  // actualiza variables globales
+		i2c1_tx_busy = 0;
+	}
 }
 
 // I2C1 TX DMA completo (lo usa SSD1306 cuando transmite por DMA)
@@ -800,6 +802,18 @@ void mpu_errorCb(void *ctx, int err) {
         error_printed = 1;
         mpu_initialized = 0;  // impide futuras lecturas DMA
         USB_Debug("ERROR MPU6050: 0x%02X\r\n", err);
+    }
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == MPU_INT_Pin)
+    {
+        if (!i2c1_tx_busy)
+        {
+            i2c1_tx_busy = 1;
+            MPU6050_StartRead_DMA();
+        }
     }
 }
 
@@ -3134,6 +3148,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : MPU_INT_Pin */
+  GPIO_InitStruct.Pin = MPU_INT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(MPU_INT_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 

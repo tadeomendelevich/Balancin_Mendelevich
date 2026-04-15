@@ -61,6 +61,8 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define LED_BLINKER_Pin GPIO_PIN_10
 #define LED_BLINKER_GPIO_Port GPIOB
+#define MPU_INT_Pin GPIO_PIN_12
+#define MPU_INT_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

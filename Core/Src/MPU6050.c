@@ -46,28 +46,38 @@ static int32_t bias_gx, bias_gy, bias_gz;
 
 int MPU6050_Init(void)
 {
-	uint8_t who = 0;
-	_platform->readReg(_platform->ctx, MPU6050_ADDR, WHO_AM_I_REG, &who, 1);
-	if (who != 0x68) {
-		return MPU6050_ERROR;    // devuelve -1 si el sensor no responde con 0x68
-	}
+    uint8_t who = 0;
+    _platform->readReg(_platform->ctx, MPU6050_ADDR, WHO_AM_I_REG, &who, 1);
+    if (who != 0x68) {
+        return MPU6050_ERROR;
+    }
+
     uint8_t data;
 
-    // Salir del modo de bajo consumo (modo sleep)
-    // Escritura en el registro PWR_MGMT_1 (0x6B)
+    // 1️⃣ Wake up
     data = 0x00;
     _platform->writeReg(_platform->ctx, MPU6050_ADDR, PWR_MGMT_1_REG, &data, 1);
 
-    // Configurar acelerómetro con rango ±2g (registro ACCEL_CONFIG = 0x1C, valor 0x00)
-    data = 0x00;
-    _platform->writeReg(_platform->ctx, MPU6050_ADDR, ACCEL_CONFIG_REG, &data, 1);
+    // 2️⃣ DLPF
+    data = 0x03; // ~44 Hz
+    _platform->writeReg(_platform->ctx, MPU6050_ADDR, CONFIG_REG, &data, 1);
 
-    // Configurar giroscopio con rango ±250°/s (registro GYRO_CONFIG = 0x1B, valor 0x00)
+    // Sample Rate = 1 kHz / (1 + SMPLRT_DIV)
+    // 1 kHz / (1 + 4) = 200 Hz → 5 ms
+    uint8_t div = 4;
+    _platform->writeReg(_platform->ctx, MPU6050_ADDR, 0x19, &div, 1);
+
+    // 4️⃣ Gyro ±250 dps
     data = 0x00;
     _platform->writeReg(_platform->ctx, MPU6050_ADDR, GYRO_CONFIG_REG, &data, 1);
 
-    // DLPF_CFG=3 → BW≈44Hz, delay≈4.9ms (filtra accel + gyro)
-    data = 0x03; _platform->writeReg(_platform->ctx, MPU6050_ADDR, CONFIG_REG, &data, 1);
+    // 5️⃣ Accel ±2g
+    data = 0x00;
+    _platform->writeReg(_platform->ctx, MPU6050_ADDR, ACCEL_CONFIG_REG, &data, 1);
+
+    // 6️⃣ Interrupción DATA READY
+    data = 0x01;
+    _platform->writeReg(_platform->ctx, MPU6050_ADDR, 0x38, &data, 1);
 
     return MPU6050_OK;
 }
