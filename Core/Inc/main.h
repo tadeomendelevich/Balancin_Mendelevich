@@ -63,6 +63,7 @@ void Error_Handler(void);
 #define LED_BLINKER_GPIO_Port GPIOB
 #define MPU_INT_Pin GPIO_PIN_12
 #define MPU_INT_GPIO_Port GPIOB
+#define MPU_INT_EXTI_IRQn EXTI15_10_IRQn
 
 /* USER CODE BEGIN Private defines */
 
