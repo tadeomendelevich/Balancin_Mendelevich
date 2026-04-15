@@ -31,11 +31,27 @@ Robot de dos ruedas que se mantiene en equilibrio mediante control PID clásico.
 
 ### 🤖 Sistema en funcionamiento
 
+<br/>
+
 <img src="balancin.gif" width="400"/>
+
+<br/><br/>
 
 ### 🔧 Build del sistema
 
+<br/>
+
 <img src="build.png" width="600"/>
+
+<br/><br/>
+
+### 🖥️ Interfaz Qt — Dashboard en tiempo real
+
+<br/>
+
+<img src="interfaz_QT.png" width="700"/>
+
+<br/>
 
 </div>
 
