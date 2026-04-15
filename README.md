@@ -1,108 +1,151 @@
-# 🤖 Self-Balancing Robot (STM32)
+# Self-Balancing Robot · Control PID en Tiempo Real
 
-<p align="center">
-  <img src="balancin.gif" width="400"/>
-</p>
+<div align="center">
 
-🚀 Robot autobalanceado en tiempo real utilizando control PID y fusión de sensores.
+![Platform](https://img.shields.io/badge/Plataforma-STM32F411-03234B?style=for-the-badge&logo=stmicroelectronics&logoColor=white)
+![Language](https://img.shields.io/badge/Lenguaje-C-A8B9CC?style=for-the-badge&logo=c&logoColor=black)
+![Control](https://img.shields.io/badge/Control-PID_Tiempo_Real-FF4500?style=for-the-badge)
+![Status](https://img.shields.io/badge/Estado-Funcional-brightgreen?style=for-the-badge)
 
----
+<br/>
 
-## 🔧 Build del sistema
+> **Robot balancín completo sobre STM32F411 (Black Pill):**
+> fusión de sensores IMU, filtro complementario, control PID ajustable
+> y telemetría WiFi/USB en tiempo real —
+> **sin caídas · sin RTOS · sin compromisos.**
 
-<p align="center">
-  <img src="build.png" width="600"/>
-</p>
+<br/>
 
----
+[![LinkedIn](https://img.shields.io/badge/Tadeo_Mendelevich-0A66C2?style=for-the-badge&logo=data:image/svg%2bxml;base64,PHN2ZyByb2xlPSJpbWciIHZpZXdCb3g9IjAgMCAyNCAyNCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cGF0aCBmaWxsPSJ3aGl0ZSIgZD0iTTIwLjQ0NyAyMC40NTJoLTMuNTU0di01LjU2OWMwLTEuMzI4LS4wMjctMy4wMzctMS44NTItMy4wMzctMS44NTMgMC0yLjEzNiAxLjQ0NS0yLjEzNiAyLjkzOXY1LjY2N0g5LjM1MVY5aDMuNDE0djEuNTYxaC4wNDZjLjQ3Ny0uOSAxLjYzNy0xLjg1IDMuMzctMS44NSAzLjYwMSAwIDQuMjY3IDIuMzcgNC4yNjcgNS40NTV2Ni4yODZ6TTUuMzM3IDcuNDMzYTIuMDYyIDIuMDYyIDAgMCAxLTIuMDYzLTIuMDY1IDIuMDY0IDIuMDY0IDAgMSAxIDIuMDYzIDIuMDY1em0xLjc4MiAxMy4wMTlIMy41NTVWOWgzLjU2NHYxMS40NTJ6TTIyLjIyNSAwSDEuNzcxQy43OTIgMCAwIC43NzQgMCAxLjcyOXYyMC41NDJDMCAyMy4yMjcuNzkyIDI0IDEuNzcxIDI0aDIwLjQ1MUMyMy4yIDI0IDI0IDIzLjIyNyAyNCAyMi4yNzFWMS43MjlDMjQgLjc3NCAyMy4yIDAgMjIuMjIyIDBoLjAwM3oiLz48L3N2Zz4=&logoColor=white)](https://www.linkedin.com/in/tadeo-mendelevich/)
+[![GitHub](https://img.shields.io/badge/tadeomendelevich-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/tadeomendelevich)
 
-## 🧠 Descripción
-
-Este proyecto consiste en el desarrollo de un robot tipo “balancín” capaz de mantenerse en equilibrio sobre dos ruedas mediante técnicas de control clásico. El sistema combina adquisición de datos en tiempo real, fusión de sensores y control dinámico para estabilizar el ángulo del sistema.
-
-El enfoque principal fue lograr un control robusto frente a perturbaciones, optimizando el comportamiento mediante ajustes de PID y filtrado de señales.
-
----
-
-## ⚙️ Tecnologías utilizadas
-
-- Lenguaje: C  
-- Microcontrolador: STM32 (Black Pill - STM32F411)  
-- Sensores: MPU6050 (acelerómetro + giroscopio)  
-- Comunicación: I2C, UART/WiFi, USB CDC  
-- Control: PID en tiempo real  
-- Interfaz: aplicación en Qt para visualización de datos  
+</div>
 
 ---
 
-## 🚀 Características principales
+## ¿Qué hace este proyecto?
 
-- Estabilización en tiempo real del sistema  
-- Control PID ajustable  
-- Fusión de sensores (complementary filter)  
-- Filtrado de señales (low-pass)  
-- Manejo preciso del tiempo de muestreo (dt)  
-- Comunicación con PC para monitoreo en vivo  
-- Visualización de variables del sistema  
-- Registro de datos (CSV y WiFi)  
+Robot de dos ruedas que se mantiene en equilibrio mediante control PID clásico. El STM32F411 lee el IMU por I²C, fusiona acelerómetro y giroscopio con un filtro complementario, calcula el error de ángulo y corrige los motores — todo dentro de un loop determinístico con dt controlado al microsegundo.
 
----
+<div align="center">
 
-## 📊 Variables monitoreadas
+### 🤖 Sistema en funcionamiento
 
-- Ángulo del sistema (roll)  
-- Error de control  
-- Términos PID (P, I, D)  
-- Señales PWM (comando y saturación)  
-- Datos del MPU6050 (crudos y filtrados)  
-- Tiempo de ejecución del loop  
+<img src="balancin.gif" width="400"/>
 
----
+### 🔧 Build del sistema
 
-## 🖥️ Interfaz gráfica
+<img src="build.png" width="600"/>
 
-<p align="center">
-  <img src="interfaz_QT.png" width="700"/>
-</p>
+</div>
 
-El sistema incluye una aplicación desarrollada en Qt que permite:
-
-- Visualizar datos en tiempo real  
-- Analizar el comportamiento del sistema  
-- Ajustar parámetros de control  
-- Registrar datos para análisis posterior  
+| Módulo | Descripción |
+|--------|-------------|
+| 🔵 **MPU6050** | Lee acelerómetro y giroscopio por I²C — datos crudos convertidos a unidades físicas en cada ciclo |
+| 📐 **Filtro complementario** | Fusiona el ángulo del acelerómetro (lento, sin drift) con la integración del giroscopio (rápido, sin ruido) — α ajustable |
+| 🎛️ **Control PID** | Tres términos en tiempo real: P reacciona al error, I acumula offset estático, D amortigua oscilaciones — con anti-windup |
+| ⚙️ **Motores DC** | Comando PWM diferencial con saturación explícita — el robot nunca envía señales fuera de rango al driver |
+| 📡 **Telemetría** | Protocolo UNER sobre USB-CDC y WiFi UDP — envía ángulo, error, P/I/D, PWM y dt en cada ciclo |
+| 🖥️ **Interfaz Qt** | Dashboard en tiempo real: gráficos de ángulo y PID, ajuste de parámetros en caliente, exportación CSV |
 
 ---
 
-## 🧪 Desafíos técnicos
+## Arquitectura
 
-- Ajuste del control PID para evitar inestabilidades  
-- Manejo del tiempo de muestreo (dt) y jitter  
-- Filtrado de señales ruidosas  
-- Integración de sensores, control y comunicación  
-- Control de saturaciones y efecto del término integral  
+```
+Loop determinístico — dt controlado por timer hardware
+│
+├── MPU6050 ──► I²C ──► accel_raw + gyro_raw ──► unidades físicas
+│
+├── Filtro complementario
+│       ├── ángulo_accel = atan2(ax, az)
+│       └── ángulo_fusionado = α·(ángulo_prev + gyro·dt) + (1−α)·ángulo_accel
+│
+├── PID
+│       ├── error = setpoint − ángulo_fusionado
+│       ├── P = Kp · error
+│       ├── I = I_prev + Ki · error · dt  (con anti-windup)
+│       ├── D = Kd · (error − error_prev) / dt
+│       └── output = saturar(P + I + D)
+│
+├── Motores ──► PWM TIM ──► driver H-bridge ──► ruedas
+│
+└── Telemetría ──► UNER ──► USB-CDC / WiFi UDP ──► Qt Dashboard
+```
+
+> El dt se mide ciclo a ciclo con un timer de alta resolución.
+> Si el jitter supera el umbral, el término D se descarta para ese ciclo — sin picos espurios.
 
 ---
 
-## 🎯 Objetivos del proyecto
+## Lo más interesante del código
 
-- Desarrollar un sistema de control robusto en tiempo real  
-- Integrar hardware y software en una solución funcional  
-- Aplicar conceptos de control en un sistema físico real  
-- Mejorar la estabilidad frente a perturbaciones  
+#### 📐 Filtro complementario con α ajustable en runtime
+El balance entre acelerómetro y giroscopio se puede cambiar desde la interfaz Qt sin recompilar. Con α alto el robot confía más en el giroscopio (suave pero con drift); con α bajo confía en el acelerómetro (sin drift pero ruidoso). Ajustar esto en vivo sobre el robot físico es lo que permite sintonizar rápido.
+
+#### 🎛️ PID con anti-windup real
+El término integral tiene límites explícitos independientes del límite de salida. Si el robot está caído y no puede recuperarse, el integrador no acumula error indefinidamente — al volver al rango de control, la respuesta es limpia sin el "kick" integral que haría caer el robot al otro lado.
+
+#### ⏱️ Gestión del dt ciclo a ciclo
+El dt no es una constante fija en el código — se mide en cada iteración con un timer hardware. El término D usa el dt real, no el nominal. Esto hace que el control sea robusto ante interrupciones o picos de carga que alarguen ocasionalmente el ciclo.
+
+#### 📡 Telemetría sin impacto en el loop
+Los datos se arman en un buffer doble: el loop de control escribe en uno mientras la USART/WiFi transmite el otro. El tiempo de control nunca espera al canal de comunicación — el rendimiento del PID no depende del baudrate.
+
+#### 🖥️ Ajuste de parámetros en caliente
+Kp, Ki, Kd, setpoint y α se reciben por UNER desde Qt y se aplican en el siguiente ciclo. No hace falta detener el robot para sintonizar — se puede ajustar el PID mientras el sistema está balanceando.
 
 ---
 
-## 🔧 Posibles mejoras
+## Hardware
 
-- Implementación de control LQR o adaptativo  
-- Uso de filtros más avanzados (Kalman)  
-- Optimización del rendimiento  
-- Mejora de estabilidad en movimiento  
+| Componente | Detalle |
+|------------|---------|
+| MCU | STM32F411CEU6 (Black Pill) @ 100 MHz |
+| IMU | MPU6050 — ±2 g / ±250 °/s, I²C 400 kHz |
+| Motores | 2× DC con driver H-bridge, PWM diferencial |
+| Comunicación | USB-CDC (debug) + WiFi UDP (telemetría) |
+| Interfaz | Qt — gráficos en tiempo real, ajuste PID, exportación CSV |
 
 ---
 
-## 👨‍💻 Autor
+## Variables monitoreadas en tiempo real
 
-Tadeo Mendelevich  
-https://github.com/tadeomendelevich
+| Variable | Descripción |
+|----------|-------------|
+| `angle` | Ángulo fusionado (filtro complementario) |
+| `error` | Diferencia entre setpoint y ángulo actual |
+| `P / I / D` | Contribución de cada término al output |
+| `pwm_out` | Señal final al motor (pre y post saturación) |
+| `dt` | Tiempo real del ciclo — detecta jitter |
+| `gyro_raw / accel_raw` | Datos crudos del MPU6050 para diagnóstico |
+
+---
+
+## Estructura del proyecto
+
+```
+Core/Src/
+├── main.c        — Loop principal, control PID, gestión del dt
+├── MPU6050.c     — Driver IMU: I²C, conversión, calibración
+├── filter.c      — Filtro complementario con α configurable
+├── pid.c         — Controlador PID con anti-windup y saturación
+├── motors.c      — PWM diferencial y límites de salida
+└── uner.c        — Protocolo de telemetría binario
+
+qt_app/
+├── mainwindow.cpp   — Dashboard, gráficos en tiempo real
+├── serialworker.cpp — Hilo de comunicación serial/WiFi
+└── unerparser.cpp   — Parser de tramas UNER
+```
+
+---
+
+<div align="center">
+
+**Tadeo Mendelevich** · Ingeniería en Mecatrónica · UNER — Concordia, Entre Ríos
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Conectar-0A66C2?style=flat&logo=data:image/svg%2bxml;base64,PHN2ZyByb2xlPSJpbWciIHZpZXdCb3g9IjAgMCAyNCAyNCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cGF0aCBmaWxsPSJ3aGl0ZSIgZD0iTTIwLjQ0NyAyMC40NTJoLTMuNTU0di01LjU2OWMwLTEuMzI4LS4wMjctMy4wMzctMS44NTItMy4wMzctMS44NTMgMC0yLjEzNiAxLjQ0NS0yLjEzNiAyLjkzOXY1LjY2N0g5LjM1MVY5aDMuNDE0djEuNTYxaC4wNDZjLjQ3Ny0uOSAxLjYzNy0xLjg1IDMuMzctMS44NSAzLjYwMSAwIDQuMjY3IDIuMzcgNC4yNjcgNS40NTV2Ni4yODZ6TTUuMzM3IDcuNDMzYTIuMDYyIDIuMDYyIDAgMCAxLTIuMDYzLTIuMDY1IDIuMDY0IDIuMDY0IDAgMSAxIDIuMDYzIDIuMDY1em0xLjc4MiAxMy4wMTlIMy41NTVWOWgzLjU2NHYxMS40NTJ6TTIyLjIyNSAwSDEuNzcxQy43OTIgMCAwIC43NzQgMCAxLjcyOXYyMC41NDJDMCAyMy4yMjcuNzkyIDI0IDEuNzcxIDI0aDIwLjQ1MUMyMy4yIDI0IDI0IDIzLjIyNyAyNCAyMi4yNzFWMS43MjlDMjQgLjc3NCAyMy4yIDAgMjIuMjIyIDBoLjAwM3oiLz48L3N2Zz4=&logoColor=white)](https://www.linkedin.com/in/tadeo-mendelevich/)
+[![GitHub](https://img.shields.io/badge/GitHub-tadeomendelevich-181717?style=flat&logo=github)](https://github.com/tadeomendelevich)
+
+</div>
