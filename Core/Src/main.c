@@ -91,16 +91,22 @@ typedef enum {
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP     		3.100f
-#define KD     		0.180f
-#define KI    		0.010f
+#define KP     		7.750f   // Ganancia proporcional en PWM directo
+#define KD     		0.180f   // Ganancia derivativa en PWM/(deg/s)
+#define KI    		0.025f   // Ganancia integral en PWM/(deg*s)
 
-#define MOTOR_GAIN 		2.5f
 #define SETPOINT_ANGLE 	0.0f
 
-// Complementary Filter
+// Complementary Filter / PID timing
 #define ALPHA 0.98f
-#define DT 0.010f
+#define DT_CTRL_FIXED 0.010f
+
+#define BALANCE_HOLD_ENTER_ANGLE_DEG  0.40f
+#define BALANCE_HOLD_EXIT_ANGLE_DEG   0.90f
+#define BALANCE_HOLD_ENTER_GYRO_DPS   4.0f
+#define BALANCE_HOLD_EXIT_GYRO_DPS    10.0f
+#define BALANCE_SOFT_ZONE_ANGLE_DEG   1.50f
+#define BALANCE_SOFT_ZONE_MIN_SCALE   0.15f
 
 // LOGGING MACROS
 #define LOG_ENABLE 1
@@ -118,10 +124,6 @@ typedef enum {
 #define UPSIDE_DOWN_ANGLE    120.0f  // más agresivo para detectar boca abajo antes
 #define DEAD_ZONE_ANGLE      15.0f   // entre 35° y 120° → zona muerta, motores off
 
-// --- DT fijo calibrado ---
-#define DT_WARMUP_SAMPLES	200
-#define BETA_JITTER    		0.01f
-
 //#define KV_BRAKE         0.20f  // cuánto inclina el setpoint por velocidad estimada
 //#define VEL_DECAY        0.970f // decaimiento del estimado (1.0=sin decay, 0.99=decay rápido)
 #define KV_BRAKE         0.08f
@@ -133,6 +135,9 @@ typedef enum {
 #define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
 #define LINE_LOST_STEERING     12.0f // steering suave para cuando recién se pierde la línea
 #define LINE_ANGLE_MIN  	   0.00f
+
+#define DISPLAY_UPDATE_INTERVAL_IDLE_MS    100U
+#define DISPLAY_UPDATE_INTERVAL_ACTIVE_MS  500U
 
 /* USER CODE END PD */
 
@@ -247,14 +252,7 @@ uint8_t f_change_display = 0;
 static uint8_t f_wifi_connected = 0;
 static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
 
-static float    dt_fixed        = DT;          // arranca con el define como fallback
-static uint8_t  dt_calibrated   = 0;
-static uint32_t dt_warmup_count = 0;
-static double   dt_warmup_sum   = 0.0;
-
-static float dt_real        = 0.0f;		// Monitoreo de jitter
-static float dt_jitter_max  = 0.0f;
-static float dt_jitter_ema  = 0.0f;
+static float dt_real        = 0.0f;		// Monitoreo del perÃ­odo real entre muestras
 
 static float velocity_est     = 0.0f;  // velocidad lineal estimada (en "unidades gyro integradas")
 static float velocity_est_f   = 0.0f;  // versión filtrada para el setpoint
@@ -291,6 +289,7 @@ static uint8_t  key_click_count = 0;
 static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float pwm_sat_prev = 0.0f;
+static uint8_t balance_hold_active = 0;
 
 volatile uint8_t tick2ms_count = 0;
 
@@ -306,7 +305,7 @@ static float accel_roll_f = 0.0f;
 static uint32_t last_display_ms = 0;
 
 static volatile uint32_t mpu_irq_timestamp_us = 0;
-
+volatile uint8_t mpu_data_ready_for_ctrl = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -803,16 +802,14 @@ int mpu_readReg(void *ctx, uint8_t devAddr, uint8_t regAddr, uint8_t *data, uint
 
 static void mpu_dma_done_cb(void *context, HAL_StatusTypeDef status)
 {
-    (void)context;
     mpu_req_pending = 0;
-
     if (status == HAL_OK) {
         MPU6050_ProcessDMA();
+        mpu_data_ready_for_ctrl = 1;  // <-- flag para el main loop
     } else {
         mpu_errorCb(mpuPlat.ctx, status);
     }
-    // i2c1_tx_busy y Process() los maneja el main loop
-    // NO poner nada más acá
+    i2c_process_pending = 1;
 }
 
 int mpu_readRegDMA(void *ctx,
@@ -875,14 +872,11 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
         if (!f_resetMassCenter && mpu_initialized && !mpu_req_pending)
         {
-            __disable_irq();
-            if (!I2C_Manager_IsBusy()) {
-                mpu_req_pending = 1;
-                __enable_irq();
-                MPU6050_StartRead_DMA();
-            } else {
-                __enable_irq();
-            }
+            // La lectura del MPU siempre se encola con prioridad. Si el I2C
+            // estÃ¡ ocupado por OLED u otra tarea, la request del sensor queda
+            // primera en cola y se ejecuta apenas se libera el bus.
+            mpu_req_pending = 1;
+            MPU6050_StartRead_DMA();
         }
     }
 }
@@ -1659,27 +1653,32 @@ void updateDisplay(void) {
 
 static void ControlStep10ms(void)
 {
+		if (!MPU6050_IsDataReady()) return;
+		MPU6050_ClearDataReady();
 
-    if (MPU6050_IsDataReady()) {
-        MPU6050_ClearDataReady();
+		MPU6050_GetAccel(&ax, &ay, &az);
+		MPU6050_GetGyro(&gx, &gy, &gz);
 
-        MPU6050_GetAccel(&ax, &ay, &az);
-        MPU6050_GetGyro(&gx, &gy, &gz);
+		// -------------------------------------------------------
+		// TIMING — usar timestamp real del IRQ del MPU
+		// -------------------------------------------------------
+		static uint32_t last_mpu_us = 0;
 
-        // -------------------------------------------------------
-        // TIMING
-        // -------------------------------------------------------
-        // Solo para monitoreo
-        uint32_t now_us = micros();
-        if (last_ctrl_us != 0) {
-            dt_real = (float)(now_us - last_ctrl_us) * 1e-6f;
-        } else {
-            dt_real = DT;
-        }
-        last_ctrl_us = now_us;
+		uint32_t sample_us = mpu_irq_timestamp_us;
+		const float dt_ctrl = DT_CTRL_FIXED;
 
-        // DT fijo para todo el control
-        const float dt_ctrl = DT;
+		if (last_mpu_us == 0) {
+		    last_mpu_us = sample_us;
+		    dt_real = DT_CTRL_FIXED;
+		    return;   // primer ciclo: todavía no hay dt válido
+		}
+
+		uint32_t diff_us = sample_us - last_mpu_us;
+		last_mpu_us = sample_us;
+
+		dt_real = (float)diff_us * 1e-6f;
+
+        // El control usa un dt fijo para desacoplar el PID del jitter del sensor y de las latencias.
         const uint8_t late_cycle = 0;  // ya no tiene sentido detectar ciclos tardíos
 
         // -------------------------------------------------------
@@ -1698,7 +1697,7 @@ static void ControlStep10ms(void)
         float accel_ang_deg = ANG_SIGN * (atan2f((float)ay, (float)az) * (180.0f / M_PI));
 
         // Filtro complementario (fusión gyro + accel)
-        filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * DT)
+        filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_ctrl)
                           + (1.0f - ALPHA) * accel_ang_deg;
 
         if (filtered_roll_deg >  180.0f) filtered_roll_deg =  180.0f;
@@ -1789,6 +1788,7 @@ static void ControlStep10ms(void)
             dynamic_setpoint_f  = SETPOINT_ANGLE;
             line_lost_ms        = HAL_GetTick();
             line_angle_ramped     = 0.0f;
+            balance_hold_active   = 0;
         }
 
         if ((robot_state == ROBOT_STATE_BALANCE_ONLY ||
@@ -1803,6 +1803,7 @@ static void ControlStep10ms(void)
             dynamic_setpoint    = SETPOINT_ANGLE;
             dynamic_setpoint_f  = SETPOINT_ANGLE;
             pwm_sat_prev        = 0.0f;
+            balance_hold_active = 0;
 
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                 manual_setpoint_cmd    = 0.0f;
@@ -1976,6 +1977,7 @@ static void ControlStep10ms(void)
                 motorRightVelocity  = 0;
                 motorLeftVelocity   = 0;
                 pwm_sat_prev        = 0.0f;
+                balance_hold_active = 0;
             }
         } else {
             if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
@@ -1995,6 +1997,7 @@ static void ControlStep10ms(void)
                 fall_count          = 0;
                 dead_zone_count     = 0;
                 pwm_sat_prev        = 0.0f;
+                balance_hold_active = 0;
             } else {
                 motorRightVelocity = 0;
                 motorLeftVelocity  = 0;
@@ -2004,6 +2007,7 @@ static void ControlStep10ms(void)
 				velocity_est       = 0.0f;
 				velocity_est_f     = 0.0f;
 				steering_adjustment = 0.0f;
+                balance_hold_active = 0;
             }
         }
 
@@ -2011,6 +2015,7 @@ static void ControlStep10ms(void)
         // PID
         // -------------------------------------------------------
         float error   = dynamic_setpoint_f - filtered_roll_deg;
+        float control_error = error;
         float p_term  = 0.0f;
         float i_term  = 0.0f;
         float d_term  = 0.0f;
@@ -2018,12 +2023,50 @@ static void ControlStep10ms(void)
         float pwm_cmd = 0.0f;
         float pwm_sat = 0.0f;
         uint8_t sat_flag = 0;
+        float balance_pi_scale = 1.0f;
+        float balance_d_scale = 1.0f;
 
         float log_p_line = 0.0f;
         float log_i_line = 0.0f;
         float log_d_line = 0.0f;
 
         if (!f_fallen) {
+            const uint8_t is_balance_mode =
+                    (robot_state == ROBOT_STATE_BALANCE_ONLY) ||
+                    (robot_state == ROBOT_STATE_BALANCE_AND_SPEED);
+
+            if (is_balance_mode) {
+                float abs_error = fabsf(error);
+                float abs_gyro  = fabsf(gyro_f);
+
+                if (!balance_hold_active) {
+                    if ((abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG) &&
+                        (abs_gyro  <= BALANCE_HOLD_ENTER_GYRO_DPS)) {
+                        balance_hold_active = 1;
+                    }
+                } else {
+                    if ((abs_error >= BALANCE_HOLD_EXIT_ANGLE_DEG) ||
+                        (abs_gyro  >= BALANCE_HOLD_EXIT_GYRO_DPS)) {
+                        balance_hold_active = 0;
+                    }
+                }
+
+                if (balance_hold_active) {
+                    control_error = 0.0f;
+                    integral *= 0.98f;
+                } else if (abs_error < BALANCE_SOFT_ZONE_ANGLE_DEG) {
+                    float x = (abs_error - BALANCE_HOLD_ENTER_ANGLE_DEG) /
+                              (BALANCE_SOFT_ZONE_ANGLE_DEG - BALANCE_HOLD_ENTER_ANGLE_DEG);
+                    if (x < 0.0f) x = 0.0f;
+                    if (x > 1.0f) x = 1.0f;
+                    balance_pi_scale = BALANCE_SOFT_ZONE_MIN_SCALE +
+                                       (1.0f - BALANCE_SOFT_ZONE_MIN_SCALE) * (x * x);
+                    balance_d_scale = x * x * x;
+                }
+            } else {
+                balance_hold_active = 0;
+            }
+
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                 integral *= 0.970f;
             } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
@@ -2032,7 +2075,7 @@ static void ControlStep10ms(void)
                 // no decay aquí tampoco
             }
 
-            p_term = KP_value * error;
+            p_term = KP_value * control_error;
             i_term = KI_value * integral;
 
             float gyro_for_d = gyro_f;
@@ -2043,9 +2086,20 @@ static void ControlStep10ms(void)
             if (d_term >  15.0f) d_term =  15.0f;
             if (d_term < -15.0f) d_term = -15.0f;
 
-            output = p_term + i_term + d_term;
+            if (is_balance_mode) {
+                if (balance_hold_active) {
+                    output = 0.0f;
+                } else {
+                    p_term *= balance_pi_scale;
+                    i_term *= balance_pi_scale;
+                    d_term *= balance_d_scale;
+                    output = p_term + i_term + d_term;
+                }
+            } else {
+                output = p_term + i_term + d_term;
+            }
 
-            pwm_cmd = output * MOTOR_GAIN;
+            pwm_cmd = output;
             pwm_sat = pwm_cmd;
 
             if (pwm_sat >  100.0f) { pwm_sat =  100.0f; sat_flag = 1; }
@@ -2093,12 +2147,12 @@ static void ControlStep10ms(void)
 
             if (robot_state != ROBOT_STATE_MANUAL_CONTROL) {
                 if (!late_cycle) {
-                    if (fabsf(error) > 0.2f) {
+                    if (fabsf(control_error) > 0.2f) {
                     	if (fabsf(pwm_sat) <= pwm_limit) {
-                            integral += error * dt_ctrl;
+                            integral += control_error * dt_ctrl;
                         } else {
-                            if (pwm_cmd >  pwm_limit && error < 0) integral += error * dt_ctrl;
-                            else if (pwm_cmd < -pwm_limit && error > 0) integral += error * dt_ctrl;
+                            if (pwm_cmd >  pwm_limit && control_error < 0) integral += control_error * dt_ctrl;
+                            else if (pwm_cmd < -pwm_limit && control_error > 0) integral += control_error * dt_ctrl;
                         }
                     } else {
                         integral *= 0.95f;
@@ -2313,7 +2367,7 @@ static void ControlStep10ms(void)
             wlog.mR         = motorRightVelocity;
             wlog.mL         = motorLeftVelocity;
             wlog.dyn_sp     = dynamic_setpoint_f;
-            wlog.dt_ctrl_us = (uint32_t)(dt_real * 1000000.0f);
+            wlog.dt_ctrl_us = (uint32_t)(dt_ctrl * 1000000.0f);
 
             wlog.line_error          = line_error;
             wlog.p_line              = log_p_line;
@@ -2387,7 +2441,7 @@ static void ControlStep10ms(void)
                 USB_DebugSend((uint8_t*)buf, (uint16_t)len);
             }
         }
-    }
+
 
 
     if ((robot_state != ROBOT_STATE_IDLE) && !f_fallen) {
@@ -2542,9 +2596,20 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  // Control sincronizado con MPU — esto reemplaza el if(is10ms) del control
+	  if (mpu_data_ready_for_ctrl) {
+	      mpu_data_ready_for_ctrl = 0;
+	      ControlStep10ms();  // corre exactamente cuando hay dato, 100Hz estable
+	  }
+
+	  if (i2c_process_pending) {
+	      i2c_process_pending = 0;
+	      I2C_Manager_Process();
+	  }
+
 	  if(is10ms) {
 	      is10ms = 0;
-		      ControlStep10ms();
+
 	      static uint8_t subtick = 0;
 	      subtick = (subtick + 1) % 10;
 
@@ -2669,9 +2734,13 @@ int main(void)
 	  i2c1_tx_busy = I2C_Manager_IsBusy();
 	  SSD1306_UpdateScreen();
 
-	  if (SSD1306_IsUpdateDone() && !i2c1_tx_busy) {
+	  if (SSD1306_IsUpdateDone() && !i2c1_tx_busy && !mpu_req_pending && !mpu_data_ready_for_ctrl) {
 	      uint32_t now = HAL_GetTick();
-	      if ((now - last_display_ms) >= 50) {   // 50 ms
+	      uint32_t display_interval_ms =
+	              ((robot_state == ROBOT_STATE_IDLE) || f_fallen)
+	              ? DISPLAY_UPDATE_INTERVAL_IDLE_MS
+	              : DISPLAY_UPDATE_INTERVAL_ACTIVE_MS;
+	      if ((now - last_display_ms) >= display_interval_ms) {
 	          last_display_ms = now;
 	          updateDisplay();
 	      }

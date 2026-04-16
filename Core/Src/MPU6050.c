@@ -64,7 +64,7 @@ int MPU6050_Init(void)
 
     // Sample Rate = 1 kHz / (1 + SMPLRT_DIV)
     // 1 kHz / (1 + 4) = 200 Hz → 5 ms
-    uint8_t div = 4;
+    uint8_t div = 9;
     _platform->writeReg(_platform->ctx, MPU6050_ADDR, 0x19, &div, 1);
 
     // 4️⃣ Gyro ±250 dps
