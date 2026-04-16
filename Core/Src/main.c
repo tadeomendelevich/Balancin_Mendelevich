@@ -305,6 +305,8 @@ static float accel_roll_f = 0.0f;
 
 static uint32_t last_display_ms = 0;
 
+static volatile uint32_t mpu_irq_timestamp_us = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -427,7 +429,6 @@ void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
 void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
 {
     if (hi2c->Instance == I2C1) {
-        USB_Debug("HAL_I2C_ErrorCallback err=0x%X\r\n", hi2c->ErrorCode);
         I2C_Manager_OnError(hi2c);
         i2c1_tx_busy = I2C_Manager_IsBusy();
     }
@@ -584,7 +585,7 @@ void usb_service_tx(void) {
 }
 
 static int uart_send_byte(uint8_t byte) {
-    return (HAL_UART_Transmit(&huart1, &byte, 1, 100) == HAL_OK) ? 1 : 0;
+    return (HAL_UART_Transmit(&huart1, &byte, 1, 2) == HAL_OK) ? 1 : 0;
 }
 
 void PWM_init(void)
@@ -803,7 +804,6 @@ int mpu_readReg(void *ctx, uint8_t devAddr, uint8_t regAddr, uint8_t *data, uint
 static void mpu_dma_done_cb(void *context, HAL_StatusTypeDef status)
 {
     (void)context;
-
     mpu_req_pending = 0;
 
     if (status == HAL_OK) {
@@ -811,8 +811,8 @@ static void mpu_dma_done_cb(void *context, HAL_StatusTypeDef status)
     } else {
         mpu_errorCb(mpuPlat.ctx, status);
     }
-
-    i2c1_tx_busy = I2C_Manager_IsBusy();
+    // i2c1_tx_busy y Process() los maneja el main loop
+    // NO poner nada más acá
 }
 
 int mpu_readRegDMA(void *ctx,
@@ -833,21 +833,25 @@ int mpu_readRegDMA(void *ctx,
         .context    = NULL
     };
 
+    __disable_irq();
+    uint8_t enqueued;
     if (I2C_Manager_IsBusy()) {
-        if (!I2C_Manager_Enqueue(&req)) {
-            mpu_req_pending = 0;
-            return -1;
-        }
+        enqueued = I2C_Manager_Enqueue(&req);
     } else {
-        if (!I2C_Manager_EnqueuePriority(&req)) {
-            mpu_req_pending = 0;
-            return -1;
-        }
+        enqueued = I2C_Manager_EnqueuePriority(&req);
+    }
+    __enable_irq();
+
+    if (!enqueued) {
+        mpu_req_pending = 0;
+        return -1;
     }
 
-    I2C_Manager_Process();
-    i2c1_tx_busy = I2C_Manager_IsBusy();
+    // NO llamar Process() acá — solo marcar pending
+    // El main loop lo va a llamar
+    i2c_process_pending = 1;
 
+    i2c1_tx_busy = I2C_Manager_IsBusy();
     return 0;
 }
 
@@ -867,16 +871,18 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == MPU_INT_Pin)
     {
-        static uint32_t last_log = 0;
-        uint32_t now = HAL_GetTick();
+        mpu_irq_timestamp_us = micros();  // timestamp exacto del dato
 
-        if (!f_resetMassCenter && mpu_initialized && !mpu_req_pending) {
-            if (now - last_log > 500) {
-                last_log = now;
-                USB_Debug("MPU INT -> start DMA\r\n");
+        if (!f_resetMassCenter && mpu_initialized && !mpu_req_pending)
+        {
+            __disable_irq();
+            if (!I2C_Manager_IsBusy()) {
+                mpu_req_pending = 1;
+                __enable_irq();
+                MPU6050_StartRead_DMA();
+            } else {
+                __enable_irq();
             }
-            mpu_req_pending = 1;
-            MPU6050_StartRead_DMA();
         }
     }
 }
@@ -1663,34 +1669,18 @@ static void ControlStep10ms(void)
         // -------------------------------------------------------
         // TIMING
         // -------------------------------------------------------
+        // Solo para monitoreo
         uint32_t now_us = micros();
-        if (last_ctrl_us == 0) last_ctrl_us = now_us - 10000;
-        float dt = (float)(now_us - last_ctrl_us) * 1e-6f;
+        if (last_ctrl_us != 0) {
+            dt_real = (float)(now_us - last_ctrl_us) * 1e-6f;
+        } else {
+            dt_real = DT;
+        }
         last_ctrl_us = now_us;
 
-        if (dt < DT_MIN) dt = DT_MIN;
-        if (dt > DT_MAX) dt = DT_MAX;
-
-        dt_real = dt;
-
-        if (!dt_calibrated) {
-            dt_warmup_sum += dt_real;
-            dt_warmup_count++;
-            if (dt_warmup_count >= DT_WARMUP_SAMPLES) {
-                dt_fixed = (float)(dt_warmup_sum / dt_warmup_count);
-                dt_calibrated = 1;
-            }
-        }
-
-        float jitter = fabsf(dt_real - dt_fixed);
-        dt_jitter_ema = dt_jitter_ema + BETA_JITTER * (jitter - dt_jitter_ema);
-        if (jitter > dt_jitter_max) dt_jitter_max = jitter;
-
-        // dt fijo para control
-        const float dt_ctrl = dt_fixed;
-
-        // ciclo tarde
-        uint8_t late_cycle = (dt_real > (dt_fixed * 1.8f)) ? 1 : 0;
+        // DT fijo para todo el control
+        const float dt_ctrl = DT;
+        const uint8_t late_cycle = 0;  // ya no tiene sentido detectar ciclos tardíos
 
         // -------------------------------------------------------
         // FILTRO IMU
@@ -1708,8 +1698,11 @@ static void ControlStep10ms(void)
         float accel_ang_deg = ANG_SIGN * (atan2f((float)ay, (float)az) * (180.0f / M_PI));
 
         // Filtro complementario (fusión gyro + accel)
-        filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_fixed)
+        filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * DT)
                           + (1.0f - ALPHA) * accel_ang_deg;
+
+        if (filtered_roll_deg >  180.0f) filtered_roll_deg =  180.0f;
+        if (filtered_roll_deg < -180.0f) filtered_roll_deg = -180.0f;
 
         // -------------------------------------------------------
         // LINE FOLLOWER INPUTS
@@ -2007,6 +2000,10 @@ static void ControlStep10ms(void)
                 motorLeftVelocity  = 0;
                 gyro_f = 0.0f;
                 filtered_roll_deg = accel_ang_deg;
+                integral           = 0.0f;
+				velocity_est       = 0.0f;
+				velocity_est_f     = 0.0f;
+				steering_adjustment = 0.0f;
             }
         }
 
@@ -2495,8 +2492,6 @@ int main(void)
   MPU6050_RegisterPlatform(&mpuPlat);
   int status = MPU6050_Init();
 
-  USB_Debug("MPU init status=%d\r\n", status);
-
   if (status != MPU6050_OK) {
       mpu_initialized = 0;
       USB_Debug("MPU INIT FAIL\r\n");
@@ -2547,22 +2542,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  static uint32_t dbg_last_ms = 0;
-	  if (HAL_GetTick() - dbg_last_ms >= 5000) {
-	      dbg_last_ms = HAL_GetTick();
-
-	      USB_Debug("state: busy=%d pending=%d mpu_init=%d dataReady=%d\r\n",
-	                i2c1_tx_busy,
-	                mpu_req_pending,
-	                mpu_initialized,
-	                MPU6050_IsDataReady());
-	  }
-
-
-	  while (tick2ms_count) {
-		  tick2ms_count--;
-	  }
-
 	  if(is10ms) {
 	      is10ms = 0;
 		      ControlStep10ms();
@@ -2683,18 +2662,20 @@ int main(void)
 	  UNER_Task(); 		// Procesa tramas UNER recibidas
 	  usb_service_tx();
 
-	  I2C_Manager_Process();
+	  if (i2c_process_pending) {
+	      i2c_process_pending = 0;  // limpiar ANTES de llamar Process
+	      I2C_Manager_Process();
+	  }
 	  i2c1_tx_busy = I2C_Manager_IsBusy();
 	  SSD1306_UpdateScreen();
 
 	  if (SSD1306_IsUpdateDone() && !i2c1_tx_busy) {
 	      uint32_t now = HAL_GetTick();
-	      if ((now - last_display_ms) >= 30) {   // ~33 FPS
+	      if ((now - last_display_ms) >= 50) {   // 50 ms
 	          last_display_ms = now;
 	          updateDisplay();
 	      }
 	  }
-
 
 	  if (dataTx && huart1.gState == HAL_UART_STATE_READY) {
 	      uart_tx_byte = dataTx;
@@ -3186,13 +3167,13 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
   /* DMA1_Stream1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 2, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
@@ -3248,7 +3229,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(MPU_INT_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -3271,6 +3252,8 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
+      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+      for (volatile uint32_t i = 0; i < 300000; i++);
   }
   /* USER CODE END Error_Handler_Debug */
 }

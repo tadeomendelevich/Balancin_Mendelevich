@@ -9,6 +9,7 @@ static volatile uint8_t q_tail = 0;
 static volatile uint8_t i2c_busy = 0;
 static I2C_Request_t current_req;
 static volatile uint8_t current_valid = 0;
+volatile uint8_t i2c_process_pending = 0;
 
 static uint8_t queue_is_full(void)
 {
@@ -69,6 +70,8 @@ void I2C_Manager_Process(void)
 {
     HAL_StatusTypeDef st;
 
+    i2c_process_pending = 0;
+
     __disable_irq();
     if (i2c_busy || queue_is_empty()) {
         __enable_irq();
@@ -80,8 +83,6 @@ void I2C_Manager_Process(void)
     i2c_busy = 1;
     __enable_irq();
 
-    USB_Debug("I2C start type=%d dev=0x%X len=%d\r\n",
-              current_req.type, current_req.devAddr, current_req.len);
 
     switch (current_req.type) {
     case I2C_REQ_MEM_READ_DMA:
@@ -110,8 +111,6 @@ void I2C_Manager_Process(void)
     }
 
     if (st != HAL_OK) {
-        USB_Debug("I2C start FAIL st=%d\r\n", st);
-
         __disable_irq();
         i2c_busy = 0;
 
@@ -132,7 +131,6 @@ void I2C_Manager_Process(void)
         return;
     }
 
-    USB_Debug("I2C start OK\r\n");
 }
 
 static void complete_current(I2C_HandleTypeDef *hi2c, HAL_StatusTypeDef status)
@@ -157,10 +155,11 @@ static void complete_current(I2C_HandleTypeDef *hi2c, HAL_StatusTypeDef status)
     __enable_irq();
 
     if (cb) {
-        cb(ctx, status);
+        cb(ctx, status);  // el callback puede encolar más requests
     }
 
-    I2C_Manager_Process();
+    // En vez de llamar Process() recursivamente, marcar pending
+    i2c_process_pending = 1;
 }
 
 void I2C_Manager_OnMemRxCplt(I2C_HandleTypeDef *hi2c)
@@ -176,4 +175,15 @@ void I2C_Manager_OnMasterTxCplt(I2C_HandleTypeDef *hi2c)
 void I2C_Manager_OnError(I2C_HandleTypeDef *hi2c)
 {
     complete_current(hi2c, HAL_ERROR);
+}
+
+void I2C_Manager_ProcessFromISR(void)
+{
+    // Solo marca el pending, no ejecuta
+    // (el loop principal llama I2C_Manager_Process)
+    i2c_process_pending = 1;
+}
+
+uint8_t I2C_Manager_IsProcessPending(void) {
+    return i2c_process_pending;
 }

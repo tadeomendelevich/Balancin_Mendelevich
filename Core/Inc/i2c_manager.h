@@ -4,6 +4,8 @@
 #include "main.h"
 #include <stdint.h>
 
+extern volatile uint8_t i2c_process_pending;
+
 typedef enum {
     I2C_REQ_NONE = 0,
     I2C_REQ_MEM_READ_DMA,
@@ -33,5 +35,7 @@ void I2C_Manager_Process(void);
 void I2C_Manager_OnMemRxCplt(I2C_HandleTypeDef *hi2c);
 void I2C_Manager_OnMasterTxCplt(I2C_HandleTypeDef *hi2c);
 void I2C_Manager_OnError(I2C_HandleTypeDef *hi2c);
+void I2C_Manager_ProcessFromISR(void);  // versión no-recursiva para usar en callbacks
+uint8_t I2C_Manager_IsProcessPending(void);
 
 #endif
