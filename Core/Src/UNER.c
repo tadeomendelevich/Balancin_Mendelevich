@@ -75,6 +75,8 @@ static float *p_manual_sp_cmd = NULL;
 static float *p_manual_st_cmd = NULL;
 static uint32_t *p_manual_tmo = NULL;
 
+static float *p_setpoint_trim = NULL;
+
 static uint8_t last_manual_cmd = 0;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
@@ -784,6 +786,17 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
 			putByteOnTx(dataTx, unerTx->chk);
         	break;
+        case MODIFY_SETPOINT:
+            myWord.ui8[0] = getByteFromRx(dataRx, 1, 0);
+            myWord.ui8[1] = getByteFromRx(dataRx, 1, 0);
+            myWord.ui8[2] = getByteFromRx(dataRx, 1, 0);
+            myWord.ui8[3] = getByteFromRx(dataRx, 1, 0);
+            if (p_setpoint_trim) *p_setpoint_trim = myWord.f32;
+            putHeaderOnTx(dataTx, MODIFY_SETPOINT, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
         default:
             putHeaderOnTx(dataTx, (_eCmd)dataRx->buff[dataRx->indexData], 2);
             putByteOnTx(dataTx,UNKNOWN );
@@ -959,6 +972,10 @@ void UNER_RegisterManualControl(float *spCmdPtr, float *stCmdPtr, uint32_t *tmoP
     p_manual_sp_cmd = spCmdPtr;
     p_manual_st_cmd = stCmdPtr;
     p_manual_tmo = tmoPtr;
+}
+
+void UNER_RegisterSetpointTrim(float *trimPtr) {
+    p_setpoint_trim = trimPtr;
 }
 
 // Envía el ring-buffer por USB y por UDP

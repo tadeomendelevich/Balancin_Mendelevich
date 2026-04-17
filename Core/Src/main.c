@@ -91,8 +91,8 @@ typedef enum {
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP     		7.750f   // Ganancia proporcional en PWM directo
-#define KD     		0.180f   // Ganancia derivativa en PWM/(deg/s)
+#define KP     		5.10f   // Ganancia proporcional en PWM directo
+#define KD     		0.12f   // Ganancia derivativa en PWM/(deg/s)
 #define KI    		0.025f   // Ganancia integral en PWM/(deg*s)
 
 #define SETPOINT_ANGLE 	0.0f
@@ -137,7 +137,7 @@ typedef enum {
 #define LINE_ANGLE_MIN  	   0.00f
 
 #define DISPLAY_UPDATE_INTERVAL_IDLE_MS    100U
-#define DISPLAY_UPDATE_INTERVAL_ACTIVE_MS  500U
+#define DISPLAY_UPDATE_INTERVAL_ACTIVE_MS   60U
 
 /* USER CODE END PD */
 
@@ -184,7 +184,6 @@ static volatile uint8_t mpu_req_pending = 0;
 static float roll_deg = 0.0f;	// Ángulo de balanceo (eje Y, usado para el equilibrio)
 static float pitch_deg = 0.0f;	// Ángulo de inclinación (eje X)
 
-
 uint16_t adcValues[8];
 static uint32_t adcSum[BAR_COUNT] = {0};	// Sumas acumuladas de las últimas ADC_AVERAGE_SIZE muestras
 static uint16_t adcBuf[BAR_COUNT][ADC_AVERAGE_SIZE] = {{0}};		// Buffers circulares: [canal][posición en la ventana]
@@ -206,13 +205,13 @@ static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrant
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
 
-//const char *wifiSSID     = "FCAL";
-//const char *wifiPassword = "fcalconcordia.06-2019";
-//const char *wifiIp = "172.23.205.98";
+const char *wifiSSID     = "FCAL";
+const char *wifiPassword = "fcalconcordia.06-2019";
+const char *wifiIp = "172.23.205.98";
 
-const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-const char *wifiPassword = "djg19dlk";
-const char *wifiIp 		 = "192.168.100.5";
+//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+//const char *wifiPassword = "djg19dlk";
+//const char *wifiIp 		 = "192.168.100.5";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
@@ -229,13 +228,13 @@ static float integral = 0.0f;
 static float steering_adjustment = 0.0f;
 static float filtered_roll_deg = 0.0f;
 
-static uint32_t last_ctrl_us = 0;
-
 uint8_t robot_state = ROBOT_STATE_IDLE; // Controls the main state machine of the robot
 
 static uint32_t manual_cmd_last_ms = 0;
 static float manual_setpoint_cmd = 0.0f;
 static float manual_steering_cmd = 0.0f;
+
+static float setpoint_trim = 0.0f;
 
 static float line_error_prev = 0.0f;
 static float line_integral = 0.0f;
@@ -265,7 +264,7 @@ float KI_value;
 float KV_brake_value;
 
 // Line Follower Variables
-float KP_LINE = 10.0f;
+float KP_LINE = 5.0f;
 float KD_LINE = 0.0f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;
@@ -1000,54 +999,30 @@ void updateDisplay(void) {
             const uint16_t iy = 2;
 
             if (f_wifi_connected) {
-                for (int dy = 0; dy < 3; dy++)
-                    for (int dx = 0; dx < 3; dx++)
-                        SSD1306_DrawPixel(ix + 9 + dx, iy + 13 + dy, SSD1306_COLOR_WHITE);
-
-                SSD1306_DrawPixel(ix + 6,  iy + 10, SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 7,  iy + 9,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 8,  iy + 9,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 9,  iy + 9,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 10, iy + 9,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 11, iy + 9,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 12, iy + 10, SSD1306_COLOR_WHITE);
-
-                SSD1306_DrawPixel(ix + 3,  iy + 7,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 4,  iy + 6,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 5,  iy + 5,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 7,  iy + 4,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 8,  iy + 4,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 9,  iy + 4,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 10, iy + 4,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 11, iy + 4,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 13, iy + 5,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 14, iy + 6,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 15, iy + 7,  SSD1306_COLOR_WHITE);
-
-                SSD1306_DrawPixel(ix + 0,  iy + 6,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 1,  iy + 4,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 2,  iy + 3,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 3,  iy + 2,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 5,  iy + 1,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 6,  iy + 0,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 7,  iy + 0,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 8,  iy + 0,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 9,  iy + 0,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 10, iy + 0,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 11, iy + 0,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 12, iy + 0,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 13, iy + 1,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 15, iy + 2,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 16, iy + 3,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 17, iy + 4,  SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix + 18, iy + 6,  SSD1306_COLOR_WHITE);
-
+                // outer arc (13px wide, 4 rows)
+                SSD1306_DrawPixel(ix+3, iy+0,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+4, iy+0,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+5, iy+0,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+6, iy+0,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+7, iy+0,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+8, iy+0,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+9, iy+0,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+2, iy+1,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+10,iy+1,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+1, iy+2,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+11,iy+2,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+0, iy+3,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+12,iy+3,SSD1306_COLOR_WHITE);
+                // middle arc (9px wide)
+                SSD1306_DrawPixel(ix+4, iy+4,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+5, iy+4,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+6, iy+4,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+7, iy+4,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+8, iy+4,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+3, iy+5,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+9, iy+5,SSD1306_COLOR_WHITE);
+                // inner arc (5px wide)
+                SSD1306_DrawPixel(ix+5, iy+6,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+6, iy+6,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+7, iy+6,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+4, iy+7,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+8, iy+7,SSD1306_COLOR_WHITE);
+                // dot 2x2
+                SSD1306_DrawPixel(ix+5, iy+9,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+6, iy+9,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+5,iy+10,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+6,iy+10,SSD1306_COLOR_WHITE);
             } else {
-                for (int k = 0; k < 13; k++) {
-                    SSD1306_DrawPixel(ix + k,      iy + k,     SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + k + 1,  iy + k,     SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 12 - k, iy + k,     SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 13 - k, iy + k,     SSD1306_COLOR_WHITE);
+                for (int k = 0; k < 10; k++) {
+                    SSD1306_DrawPixel(ix + k,    iy + k,   SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix + 9-k,  iy + k,   SSD1306_COLOR_WHITE);
                 }
             }
         }
@@ -1227,6 +1202,44 @@ void updateDisplay(void) {
 			                x += Font_5x7.FontWidth + 1;
 			            }
 			        }
+
+			        // trim del setpoint a la derecha del angulo
+			        {
+			            x += 3;
+			            float tv = setpoint_trim;
+			            int32_t tv10 = (tv >= 0.0f)
+			                ? (int32_t)(tv * 10.0f + 0.5f)
+			                : (int32_t)(tv * 10.0f - 0.5f);
+			            int32_t tv_ent = tv10 / 10;
+			            int32_t tv_dec = tv10 % 10;
+			            if (tv_dec < 0) tv_dec = -tv_dec;
+
+			            if (tv_ent >  99) tv_ent =  99;
+			            if (tv_ent < -99) tv_ent = -99;
+			            char trimbuf[6];
+			            trimbuf[0] = (tv < 0) ? '-' : '+';
+			            trimbuf[1] = '0' + (char)(tv_ent < 0 ? -tv_ent : tv_ent);
+			            trimbuf[2] = '.';
+			            trimbuf[3] = '0' + (char)tv_dec;
+			            trimbuf[4] = '\0';
+
+			            for (char *q = trimbuf; *q && x < SCREEN_W - 4; q++) {
+			                if (*q == '-') {
+			                    SSD1306_DrawLine(x, y + 3, x + 3, y + 3, SSD1306_COLOR_WHITE);
+			                    x += 5;
+			                } else if (*q == '+') {
+			                    SSD1306_DrawLine(x,     y + 3, x + 4, y + 3, SSD1306_COLOR_WHITE);
+			                    SSD1306_DrawLine(x + 2, y + 1, x + 2, y + 5, SSD1306_COLOR_WHITE);
+			                    x += 6;
+			                } else if (*q == '.') {
+			                    SSD1306_DrawPixel(x + 1, y + 6, SSD1306_COLOR_WHITE);
+			                    x += 3;
+			                } else {
+			                    SSD1306_DrawChar5x7(*q, x, y);
+			                    x += Font_5x7.FontWidth + 1;
+			                }
+			            }
+			        }
 			    }
 			}
 		}
@@ -1308,107 +1321,133 @@ void updateDisplay(void) {
             const char *line_mode_str  = "OFF";
 
             switch (robot_state) {
-                case ROBOT_STATE_IDLE:
-                    robot_mode_str = "IDLE";
-                    break;
-                case ROBOT_STATE_BALANCE_ONLY:
-                    robot_mode_str = "BAL";
-                    break;
-                case ROBOT_STATE_BALANCE_AND_SPEED:
-                    robot_mode_str = "SPEED";
-                    break;
-                case ROBOT_STATE_LINE_FOLLOWING:
-                    robot_mode_str = "LINE";
-                    break;
-                case ROBOT_STATE_MANUAL_CONTROL:
-                    robot_mode_str = "MAN";
-                    break;
-                default:
-                    robot_mode_str = "UNK";
-                    break;
+                case ROBOT_STATE_IDLE:           robot_mode_str = "IDLE";  break;
+                case ROBOT_STATE_BALANCE_ONLY:   robot_mode_str = "BAL";   break;
+                case ROBOT_STATE_BALANCE_AND_SPEED: robot_mode_str = "SPEED"; break;
+                case ROBOT_STATE_LINE_FOLLOWING: robot_mode_str = "LINE";  break;
+                case ROBOT_STATE_MANUAL_CONTROL: robot_mode_str = "MAN";   break;
+                default:                         robot_mode_str = "UNK";   break;
             }
 
             if (robot_state != ROBOT_STATE_LINE_FOLLOWING) {
                 line_mode_str = "OFF";
             } else {
                 switch (line_state) {
-                    case LINE_STATE_FOLLOWING:
-                        line_mode_str = "FOLLOW";
-                        break;
-                    case LINE_STATE_LOST:
-                        line_mode_str = "LOST";
-                        break;
-                    case LINE_STATE_SEARCHING:
-                        line_mode_str = "SEARCH";
-                        break;
-                    default:
-                        line_mode_str = "UNK";
-                        break;
+                    case LINE_STATE_FOLLOWING: line_mode_str = "FOLLOW"; break;
+                    case LINE_STATE_LOST:      line_mode_str = "LOST";   break;
+                    case LINE_STATE_SEARCHING: line_mode_str = "SEARCH"; break;
+                    default:                   line_mode_str = "UNK";    break;
                 }
             }
 
-            // WiFi chico arriba a la derecha
-            {
-                const uint16_t ix = 112;
-                const uint16_t iy = 3;
-
-                if (f_wifi_connected) {
-                    SSD1306_DrawPixel(ix + 3, iy + 6, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 4, iy + 6, SSD1306_COLOR_WHITE);
-
-                    SSD1306_DrawPixel(ix + 2, iy + 5, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 3, iy + 4, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 4, iy + 4, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 5, iy + 5, SSD1306_COLOR_WHITE);
-
-                    SSD1306_DrawPixel(ix + 1, iy + 4, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 2, iy + 3, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 3, iy + 2, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 4, iy + 2, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 5, iy + 3, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 6, iy + 4, SSD1306_COLOR_WHITE);
-
-                    SSD1306_DrawPixel(ix + 0, iy + 3, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 1, iy + 2, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 2, iy + 1, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 3, iy + 0, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 4, iy + 0, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 5, iy + 1, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 6, iy + 2, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 7, iy + 3, SSD1306_COLOR_WHITE);
-                } else {
-                    SSD1306_DrawLine(ix + 1, iy + 1, ix + 6, iy + 6, SSD1306_COLOR_WHITE);
-                    SSD1306_DrawLine(ix + 6, iy + 1, ix + 1, iy + 6, SSD1306_COLOR_WHITE);
-                }
-            }
-
-            // línea separadora horizontal
-            SSD1306_DrawLine(62, 15, 123, 15, SSD1306_COLOR_WHITE);
-
-            // modo del auto grande en el centro
-            {
-                uint16_t title_w = strlen(robot_mode_str) * Font_7x10.FontWidth;
-                uint16_t title_x = 58 + (70 - title_w) / 2;
-
-                SSD1306_GotoXY(title_x, 20);
-                SSD1306_Puts(robot_mode_str, &Font_7x10, SSD1306_COLOR_WHITE);
-            }
-
-            // línea chica inferior
-            SSD1306_DrawLine(62, 47, 123, 47, SSD1306_COLOR_WHITE);
-
-            // modo del seguidor abajo, a la izquierda del spinner
+            // --- fila superior: modo (Font_5x7) + WiFi icon ---
             {
                 uint16_t x = 62;
-                uint16_t y = 50;
-
-                for (const char *p = line_mode_str; *p; p++) {
-                    SSD1306_DrawChar5x7(*p, x, y);
+                for (const char *p = robot_mode_str; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, 1);
                     x += Font_5x7.FontWidth + 1;
                 }
             }
 
-            // spinner abajo a la derecha
+            // WiFi icon arriba a la derecha (9x7)
+            {
+                const uint16_t ix = 119;
+                const uint16_t iy = 1;
+                if (f_wifi_connected) {
+                    // outer arc (9px wide)
+                    SSD1306_DrawPixel(ix+3,iy+0,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+4,iy+0,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+5,iy+0,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+2,iy+1,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+6,iy+1,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+1,iy+2,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+7,iy+2,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+0,iy+3,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+8,iy+3,SSD1306_COLOR_WHITE);
+                    // middle arc (5px wide)
+                    SSD1306_DrawPixel(ix+3,iy+3,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+4,iy+3,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+5,iy+3,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+2,iy+4,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+6,iy+4,SSD1306_COLOR_WHITE);
+                    // inner arc (3px)
+                    SSD1306_DrawPixel(ix+3,iy+5,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+4,iy+5,SSD1306_COLOR_WHITE);
+                    SSD1306_DrawPixel(ix+5,iy+5,SSD1306_COLOR_WHITE);
+                    // dot
+                    SSD1306_DrawPixel(ix+4,iy+6,SSD1306_COLOR_WHITE);
+                } else {
+                    SSD1306_DrawLine(ix+1, iy+1, ix+7, iy+5, SSD1306_COLOR_WHITE);
+                    SSD1306_DrawLine(ix+7, iy+1, ix+1, iy+5, SSD1306_COLOR_WHITE);
+                }
+            }
+
+            // --- separador superior ---
+            SSD1306_DrawLine(62, 10, 127, 10, SSD1306_COLOR_WHITE);
+
+            // --- SP: setpoint activo del balance PID ---
+            {
+                char buf[14];
+                float v = dynamic_setpoint_f;
+                uint8_t neg = (v < 0.0f);
+                if (neg) v = -v;
+                uint32_t vi = (uint32_t)v;
+                uint32_t vd = (uint32_t)((v - vi) * 100.0f + 0.5f);
+                if (vd >= 100) { vd = 0; vi++; }
+                snprintf(buf, sizeof(buf), "SP:%c%lu.%02lu", neg ? '-' : '+',
+                         (unsigned long)vi, (unsigned long)vd);
+                uint16_t x = 62;
+                for (char *p = buf; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, 13);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
+
+            // --- KP ---
+            {
+                char buf[14];
+                float v = KP_LINE;
+                uint32_t vi = (uint32_t)v;
+                uint32_t vd = (uint32_t)((v - vi) * 1000.0f + 0.5f);
+                if (vd >= 1000) { vd = 0; vi++; }
+                snprintf(buf, sizeof(buf), "KP:%lu.%03lu",
+                         (unsigned long)vi, (unsigned long)vd);
+                uint16_t x = 62;
+                for (char *p = buf; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, 22);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
+
+            // --- KD ---
+            {
+                char buf[14];
+                float v = KD_LINE;
+                uint32_t vi = (uint32_t)v;
+                uint32_t vd = (uint32_t)((v - vi) * 1000.0f + 0.5f);
+                if (vd >= 1000) { vd = 0; vi++; }
+                snprintf(buf, sizeof(buf), "KD:%lu.%03lu",
+                         (unsigned long)vi, (unsigned long)vd);
+                uint16_t x = 62;
+                for (char *p = buf; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, 31);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
+
+            // --- separador inferior ---
+            SSD1306_DrawLine(62, 41, 127, 41, SSD1306_COLOR_WHITE);
+
+            // --- modo línea abajo ---
+            {
+                uint16_t x = 62;
+                for (const char *p = line_mode_str; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, 44);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
+
+            // --- spinner abajo a la derecha ---
             {
                 const uint16_t sx = 118;
                 const uint16_t sy = 57;
@@ -1784,11 +1823,19 @@ static void ControlStep10ms(void)
             velocity_est        = 0.0f;
             velocity_est_f      = 0.0f;
             line_state          = LINE_STATE_FOLLOWING;
-            dynamic_setpoint    = SETPOINT_ANGLE;
-            dynamic_setpoint_f  = SETPOINT_ANGLE;
+            dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
+            dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
             line_lost_ms        = HAL_GetTick();
             line_angle_ramped     = 0.0f;
             balance_hold_active   = 0;
+        }
+
+        if (robot_state == ROBOT_STATE_IDLE && prev_robot_state != ROBOT_STATE_IDLE) {
+            integral            = 0.0f;
+            pwm_sat_prev        = 0.0f;
+            dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
+            dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
+            balance_hold_active = 0;
         }
 
         if ((robot_state == ROBOT_STATE_BALANCE_ONLY ||
@@ -1800,8 +1847,8 @@ static void ControlStep10ms(void)
             steering_adjustment = 0.0f;
             velocity_est        = 0.0f;
             velocity_est_f      = 0.0f;
-            dynamic_setpoint    = SETPOINT_ANGLE;
-            dynamic_setpoint_f  = SETPOINT_ANGLE;
+            dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
+            dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
             pwm_sat_prev        = 0.0f;
             balance_hold_active = 0;
 
@@ -1842,7 +1889,7 @@ static void ControlStep10ms(void)
                 }
             }
 
-            dynamic_setpoint = SETPOINT_ANGLE + line_angle_ramped;
+            dynamic_setpoint = SETPOINT_ANGLE + setpoint_trim + line_angle_ramped;
 
             if (dynamic_setpoint >  LINE_ANGLE) dynamic_setpoint =  LINE_ANGLE;
             if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
@@ -1878,7 +1925,7 @@ static void ControlStep10ms(void)
             const float RAMP_RATE_UP   = 0.01f;
             const float RAMP_RATE_DOWN = 0.008f;
 
-            float ramp_target = SETPOINT_ANGLE + scaled_cmd;
+            float ramp_target = SETPOINT_ANGLE + setpoint_trim + scaled_cmd;
             float ramp_delta  = ramp_target - manual_setpoint_ramped;
             float ramp_rate   = (ramp_delta > 0.0f) ? RAMP_RATE_UP : RAMP_RATE_DOWN;
 
@@ -1896,14 +1943,26 @@ static void ControlStep10ms(void)
             dynamic_setpoint = manual_setpoint_ramped - KV_brake_value * velocity_est_f;
 
         } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
-            dynamic_setpoint = SETPOINT_ANGLE;
+            dynamic_setpoint = SETPOINT_ANGLE + setpoint_trim;
         } else {
-            dynamic_setpoint = SETPOINT_ANGLE;
+            dynamic_setpoint = SETPOINT_ANGLE + setpoint_trim;
         }
 
         float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f : 5.0f;
         if (dynamic_setpoint >  sp_limit) dynamic_setpoint =  sp_limit;
         if (dynamic_setpoint < -sp_limit) dynamic_setpoint = -sp_limit;
+
+        {
+            static float prev_setpoint_trim = 0.0f;
+            float trim_delta = setpoint_trim - prev_setpoint_trim;
+            const float TRIM_STEP = 0.008f;
+            if (trim_delta >  TRIM_STEP) trim_delta =  TRIM_STEP;
+            if (trim_delta < -TRIM_STEP) trim_delta = -TRIM_STEP;
+            if (trim_delta != 0.0f) {
+                prev_setpoint_trim += trim_delta;
+                dynamic_setpoint_f += trim_delta;
+            }
+        }
 
         {
             float sp_step_max;
@@ -1990,8 +2049,8 @@ static void ControlStep10ms(void)
                 line_integral       = 0.0f;
                 line_error_prev     = 0.0f;
                 steering_adjustment = 0.0f;
-                dynamic_setpoint    = SETPOINT_ANGLE;
-                dynamic_setpoint_f  = SETPOINT_ANGLE;
+                dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
+                dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
                 upright_count       = 0;
                 upside_down_count   = 0;
                 fall_count          = 0;
@@ -2033,22 +2092,29 @@ static void ControlStep10ms(void)
         if (!f_fallen) {
             const uint8_t is_balance_mode =
                     (robot_state == ROBOT_STATE_BALANCE_ONLY) ||
-                    (robot_state == ROBOT_STATE_BALANCE_AND_SPEED);
+                    (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
+                    (robot_state == ROBOT_STATE_LINE_FOLLOWING) ||
+                    (robot_state == ROBOT_STATE_MANUAL_CONTROL);
 
             if (is_balance_mode) {
                 float abs_error = fabsf(error);
                 float abs_gyro  = fabsf(gyro_f);
 
-                if (!balance_hold_active) {
-                    if ((abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG) &&
-                        (abs_gyro  <= BALANCE_HOLD_ENTER_GYRO_DPS)) {
-                        balance_hold_active = 1;
+                // balance hold solo en modos sin tilt de avance continuo
+                if (robot_state != ROBOT_STATE_LINE_FOLLOWING) {
+                    if (!balance_hold_active) {
+                        if ((abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG) &&
+                            (abs_gyro  <= BALANCE_HOLD_ENTER_GYRO_DPS)) {
+                            balance_hold_active = 1;
+                        }
+                    } else {
+                        if ((abs_error >= BALANCE_HOLD_EXIT_ANGLE_DEG) ||
+                            (abs_gyro  >= BALANCE_HOLD_EXIT_GYRO_DPS)) {
+                            balance_hold_active = 0;
+                        }
                     }
                 } else {
-                    if ((abs_error >= BALANCE_HOLD_EXIT_ANGLE_DEG) ||
-                        (abs_gyro  >= BALANCE_HOLD_EXIT_GYRO_DPS)) {
-                        balance_hold_active = 0;
-                    }
+                    balance_hold_active = 0;
                 }
 
                 if (balance_hold_active) {
@@ -2535,6 +2601,7 @@ int main(void)
   UNER_RegisterFlags(NULL, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
   UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_ANGLE, NULL);
   UNER_RegisterManualControl(&manual_setpoint_cmd, &manual_steering_cmd, &manual_cmd_last_ms);
+  UNER_RegisterSetpointTrim(&setpoint_trim);
   UNER_RegisterRobotState(&robot_state);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);

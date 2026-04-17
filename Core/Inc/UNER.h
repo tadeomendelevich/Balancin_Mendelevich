@@ -123,6 +123,7 @@ typedef enum{
     ACTIVATE_LINE_FOLLOWING = 0xC5,
     ACTIVATE_POS_MAINTENANCE = 0xC6,
     ACTIVATE_MANUAL_CONTROL = 0xC7,
+    MODIFY_SETPOINT = 0xC8,
     MOVE_FORWARD = 0xD0,
     MOVE_BACKWARD = 0xD1,
     MOVE_LEFT = 0xD2,
@@ -221,6 +222,8 @@ void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3,
 void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLinePtr, float *thresPtr, float *speedPtr, uint8_t *lineFollowFlagPtr);
 
 void UNER_RegisterManualControl(float *spCmdPtr, float *stCmdPtr, uint32_t *tmoPtr);
+
+void UNER_RegisterSetpointTrim(float *trimPtr);
 
 void UNER_RegisterRobotState(uint8_t *robotStatePtr);
 
