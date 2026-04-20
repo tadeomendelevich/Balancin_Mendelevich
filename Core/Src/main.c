@@ -92,7 +92,7 @@ typedef enum {
 
 // PID
 #define KP     		5.10f   // Ganancia proporcional en PWM directo
-#define KD     		0.12f   // Ganancia derivativa en PWM/(deg/s)
+#define KD     		0.17f   // Ganancia derivativa en PWM/(deg/s)
 #define KI    		0.025f   // Ganancia integral en PWM/(deg*s)
 
 #define SETPOINT_ANGLE 	0.0f
@@ -104,7 +104,7 @@ typedef enum {
 #define BALANCE_HOLD_ENTER_ANGLE_DEG  0.40f
 #define BALANCE_HOLD_EXIT_ANGLE_DEG   0.90f
 #define BALANCE_HOLD_ENTER_GYRO_DPS   4.0f
-#define BALANCE_HOLD_EXIT_GYRO_DPS    10.0f
+#define BALANCE_HOLD_EXIT_GYRO_DPS    12.0f
 #define BALANCE_SOFT_ZONE_ANGLE_DEG   1.50f
 #define BALANCE_SOFT_ZONE_MIN_SCALE   0.15f
 
@@ -205,13 +205,13 @@ static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrant
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
 
-const char *wifiSSID     = "FCAL";
-const char *wifiPassword = "fcalconcordia.06-2019";
-const char *wifiIp = "172.23.205.98";
+//const char *wifiSSID     = "FCAL";
+//const char *wifiPassword = "fcalconcordia.06-2019";
+//const char *wifiIp = "172.23.205.98";
 
-//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-//const char *wifiPassword = "djg19dlk";
-//const char *wifiIp 		 = "192.168.100.5";
+const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+const char *wifiPassword = "djg19dlk";
+const char *wifiIp 		 = "192.168.100.5";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
@@ -1804,8 +1804,11 @@ static void ControlStep10ms(void)
                 if (velocity_est < -20.0f) velocity_est = -20.0f;
                 velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
             } else {
-                velocity_est = 0.0f;
-                velocity_est_f = 0.0f;
+                // BALANCE_ONLY: estimate velocity to correct post-push drift
+                velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_ctrl);
+                if (velocity_est >  20.0f) velocity_est =  20.0f;
+                if (velocity_est < -20.0f) velocity_est = -20.0f;
+                velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
             }
         }
 
@@ -1945,7 +1948,8 @@ static void ControlStep10ms(void)
         } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
             dynamic_setpoint = SETPOINT_ANGLE + setpoint_trim;
         } else {
-            dynamic_setpoint = SETPOINT_ANGLE + setpoint_trim;
+            // BALANCE_ONLY: tilt setpoint against velocity to brake post-push drift
+            dynamic_setpoint = SETPOINT_ANGLE + setpoint_trim - KV_brake_value * velocity_est_f;
         }
 
         float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f : 5.0f;
@@ -2127,7 +2131,7 @@ static void ControlStep10ms(void)
                     if (x > 1.0f) x = 1.0f;
                     balance_pi_scale = BALANCE_SOFT_ZONE_MIN_SCALE +
                                        (1.0f - BALANCE_SOFT_ZONE_MIN_SCALE) * (x * x);
-                    balance_d_scale = x * x * x;
+                    balance_d_scale = x;
                 }
             } else {
                 balance_hold_active = 0;
