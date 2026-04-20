@@ -91,8 +91,8 @@ typedef enum {
 #define ESP_USB_BUF_SIZE	512
 
 // PID
-#define KP     		5.10f   // Ganancia proporcional en PWM directo
-#define KD     		0.17f   // Ganancia derivativa en PWM/(deg/s)
+#define KP     		4.0f   // Ganancia proporcional en PWM directo
+#define KD     		0.12f   // Ganancia derivativa en PWM/(deg/s)
 #define KI    		0.025f   // Ganancia integral en PWM/(deg*s)
 
 #define SETPOINT_ANGLE 	0.0f
@@ -126,9 +126,15 @@ typedef enum {
 
 //#define KV_BRAKE         0.20f  // cuánto inclina el setpoint por velocidad estimada
 //#define VEL_DECAY        0.970f // decaimiento del estimado (1.0=sin decay, 0.99=decay rápido)
-#define KV_BRAKE         0.08f
-#define VEL_DECAY        0.970f
-#define VEL_LPF_BETA     0.06f
+#define KV_BRAKE         2.0f
+#define VEL_DECAY        0.990f
+#define VEL_LPF_BETA     0.14f
+#define BRAKE_VEL_DEADBAND      0.05f
+#define BRAKE_VEL_MAX           4.0f
+#define BRAKE_TILT_MAX          3.0f
+#define BRAKE_TILT_MAX_MANUAL   0.80f
+#define BRAKE_TILT_STEP_BAL     0.06f
+#define BRAKE_TILT_STEP_MAN     0.0015f
 #define INTEGRAL_DECAY   0.990f
 #define KV_LINE_BRAKE 	 0.10f
 
@@ -205,13 +211,13 @@ static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrant
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
 
-//const char *wifiSSID     = "FCAL";
-//const char *wifiPassword = "fcalconcordia.06-2019";
-//const char *wifiIp = "172.23.205.98";
+const char *wifiSSID     = "FCAL";
+const char *wifiPassword = "fcalconcordia.06-2019";
+const char *wifiIp = "172.23.205.98";
 
-const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-const char *wifiPassword = "djg19dlk";
-const char *wifiIp 		 = "192.168.100.5";
+//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+//const char *wifiPassword = "djg19dlk";
+//const char *wifiIp 		 = "192.168.100.5";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
@@ -257,6 +263,8 @@ static float velocity_est     = 0.0f;  // velocidad lineal estimada (en "unidade
 static float velocity_est_f   = 0.0f;  // versión filtrada para el setpoint
 static float dynamic_setpoint = 0.0f;  // setpoint variable calculado cada ciclo
 static float dynamic_setpoint_f = 0.0f;
+static float base_setpoint_f  = 0.0f;
+static float brake_setpoint_f = 0.0f;
 
 float KP_value;
 float KD_value;
@@ -289,6 +297,7 @@ static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float pwm_sat_prev = 0.0f;
 static uint8_t balance_hold_active = 0;
+static float prev_error = 0.0f;
 
 volatile uint8_t tick2ms_count = 0;
 
@@ -940,6 +949,87 @@ void ProcessEspRxLimited(void) {
     }
 }
 
+static float clampf_local(float value, float min_value, float max_value)
+{
+    if (value > max_value) return max_value;
+    if (value < min_value) return min_value;
+    return value;
+}
+
+static float apply_deadbandf(float value, float deadband)
+{
+    if (value > deadband) return value - deadband;
+    if (value < -deadband) return value + deadband;
+    return 0.0f;
+}
+
+static void UpdateVelocityEstimate(float gyro_rate_dps, float dt_ctrl)
+{
+    velocity_est = VEL_DECAY * (velocity_est + gyro_rate_dps * dt_ctrl);
+    velocity_est = clampf_local(velocity_est, -20.0f, 20.0f);
+    velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+}
+
+static float ComputeBrakeSetpointTarget(uint8_t state)
+{
+    if ((state == ROBOT_STATE_LINE_FOLLOWING) ||
+        (state == ROBOT_STATE_BALANCE_AND_SPEED)) {
+        return 0.0f;
+    }
+
+    float vel_for_brake = apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND);
+    vel_for_brake = clampf_local(vel_for_brake, -BRAKE_VEL_MAX, BRAKE_VEL_MAX);
+    float kv_brake = (KV_brake_value > 0.0f) ? KV_brake_value : 0.0f;
+
+    float brake_tilt_max = (state == ROBOT_STATE_MANUAL_CONTROL)
+                         ? BRAKE_TILT_MAX_MANUAL
+                         : BRAKE_TILT_MAX;
+    float abs_vel = fabsf(vel_for_brake);
+    float vel_norm = clampf_local(abs_vel / BRAKE_VEL_MAX, 0.0f, 1.0f);
+    float brake_mag = kv_brake * abs_vel;
+
+    if (vel_for_brake < 0.0f) {
+        brake_mag = -brake_mag;
+    }
+
+    return clampf_local(-brake_mag, -brake_tilt_max, brake_tilt_max);
+}
+
+static void FormatSignedFixed(char *buf, size_t buf_size, float value, uint8_t decimals)
+{
+    int32_t scale = 1;
+    for (uint8_t i = 0; i < decimals; i++) {
+        scale *= 10;
+    }
+
+    int32_t scaled = (value >= 0.0f)
+                   ? (int32_t)(value * (float)scale + 0.5f)
+                   : (int32_t)(value * (float)scale - 0.5f);
+
+    uint32_t abs_scaled = (scaled < 0) ? (uint32_t)(-scaled) : (uint32_t)scaled;
+    uint32_t int_part   = abs_scaled / (uint32_t)scale;
+    uint32_t frac_part  = abs_scaled % (uint32_t)scale;
+    char sign           = (scaled < 0) ? '-' : '+';
+
+    switch (decimals) {
+        case 0:
+            snprintf(buf, buf_size, "%c%lu", sign, (unsigned long)int_part);
+            break;
+        case 1:
+            snprintf(buf, buf_size, "%c%lu.%01lu", sign,
+                     (unsigned long)int_part, (unsigned long)frac_part);
+            break;
+        case 2:
+            snprintf(buf, buf_size, "%c%lu.%02lu", sign,
+                     (unsigned long)int_part, (unsigned long)frac_part);
+            break;
+        default:
+            snprintf(buf, buf_size, "%c%lu.%03lu", sign,
+                     (unsigned long)int_part, (unsigned long)frac_part);
+            break;
+    }
+}
+
 void updateDisplay(void) {
     SSD1306_Fill(SSD1306_COLOR_BLACK);
 
@@ -947,91 +1037,47 @@ void updateDisplay(void) {
         // -------------------------------------------------------
         // PANTALLA 0
         // -------------------------------------------------------
+        const uint16_t left_x  = 2;
+        const uint16_t right_x = SCREEN_W / 2 + 2;
+        char num_buf[16];
+        char line_buf[20];
+        const float balance_error = dynamic_setpoint_f - filtered_roll_deg;
 
         // Línea divisoria vertical
         SSD1306_DrawLine(SCREEN_W/2, 0, SCREEN_W/2, SCREEN_H - 1, SSD1306_COLOR_WHITE);
 
         // -------------------------------------------------------
-        // MPU6050: 6 filas pegadas al fondo, izquierda
+        // Mitad izquierda: métricas útiles de balance
         // -------------------------------------------------------
         {
-            const char* labels[6] = { "AX:", "AY:", "AZ:", "GX:", "GY:", "GZ:" };
-            int16_t     values[6];
-            MPU6050_GetAccel(&values[0], &values[1], &values[2]);
-            MPU6050_GetGyro (&values[3], &values[4], &values[5]);
+            const uint16_t rows_y[4] = { 2, 15, 28, 41 };
 
-            char buf[8];
-            const uint16_t y_start = SCREEN_H - 6 * 10 + 2;
+            FormatSignedFixed(num_buf, sizeof(num_buf), dynamic_setpoint_f, 1);
+            snprintf(line_buf, sizeof(line_buf), "SP:%s", num_buf);
+            SSD1306_GotoXY(left_x, rows_y[0]);
+            SSD1306_Puts(line_buf, &Font_7x10, SSD1306_COLOR_WHITE);
 
-            for (int i = 0; i < 6; i++) {
-                uint16_t y = y_start + i * 10;
-                uint16_t x = 2;
+            FormatSignedFixed(num_buf, sizeof(num_buf), balance_error, 1);
+            snprintf(line_buf, sizeof(line_buf), "ER:%s", num_buf);
+            SSD1306_GotoXY(left_x, rows_y[1]);
+            SSD1306_Puts(line_buf, &Font_7x10, SSD1306_COLOR_WHITE);
 
-                for (const char *p = labels[i]; *p; p++) {
-                    if (*p == ':') {
-                        SSD1306_DrawPixel(x + 1, y + 1, SSD1306_COLOR_WHITE);
-                        SSD1306_DrawPixel(x + 1, y + 4, SSD1306_COLOR_WHITE);
-                        x += 4;
-                    } else {
-                        SSD1306_DrawChar5x7(*p, x, y);
-                        x += Font_5x7.FontWidth + 1;
-                    }
-                }
+            FormatSignedFixed(num_buf, sizeof(num_buf), velocity_est_f, 1);
+            snprintf(line_buf, sizeof(line_buf), "VE:%s", num_buf);
+            SSD1306_GotoXY(left_x, rows_y[2]);
+            SSD1306_Puts(line_buf, &Font_7x10, SSD1306_COLOR_WHITE);
 
-                itoa(values[i], buf, 10);
-                for (char *p = buf; *p; p++) {
-                    if (*p == '-') {
-                        SSD1306_DrawLine(x, y + 3, x + 3, y + 3, SSD1306_COLOR_WHITE);
-                        x += 5;
-                    } else {
-                        SSD1306_DrawChar5x7(*p, x, y);
-                        x += Font_5x7.FontWidth + 1;
-                    }
-                }
-            }
-        }
-
-        // -------------------------------------------------------
-        // Zona superior izquierda: ícono WiFi grande
-        // -------------------------------------------------------
-        {
-            const uint16_t ix = 40;
-            const uint16_t iy = 2;
-
-            if (f_wifi_connected) {
-                // outer arc (13px wide, 4 rows)
-                SSD1306_DrawPixel(ix+3, iy+0,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+4, iy+0,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+5, iy+0,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+6, iy+0,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+7, iy+0,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+8, iy+0,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+9, iy+0,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+2, iy+1,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+10,iy+1,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+1, iy+2,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+11,iy+2,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+0, iy+3,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+12,iy+3,SSD1306_COLOR_WHITE);
-                // middle arc (9px wide)
-                SSD1306_DrawPixel(ix+4, iy+4,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+5, iy+4,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+6, iy+4,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+7, iy+4,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+8, iy+4,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+3, iy+5,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+9, iy+5,SSD1306_COLOR_WHITE);
-                // inner arc (5px wide)
-                SSD1306_DrawPixel(ix+5, iy+6,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+6, iy+6,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+7, iy+6,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+4, iy+7,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+8, iy+7,SSD1306_COLOR_WHITE);
-                // dot 2x2
-                SSD1306_DrawPixel(ix+5, iy+9,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+6, iy+9,SSD1306_COLOR_WHITE);
-                SSD1306_DrawPixel(ix+5,iy+10,SSD1306_COLOR_WHITE); SSD1306_DrawPixel(ix+6,iy+10,SSD1306_COLOR_WHITE);
-            } else {
-                for (int k = 0; k < 10; k++) {
-                    SSD1306_DrawPixel(ix + k,    iy + k,   SSD1306_COLOR_WHITE);
-                    SSD1306_DrawPixel(ix + 9-k,  iy + k,   SSD1306_COLOR_WHITE);
-                }
-            }
+            FormatSignedFixed(num_buf, sizeof(num_buf), brake_setpoint_f, 1);
+            snprintf(line_buf, sizeof(line_buf), "BR:%s", num_buf);
+            SSD1306_GotoXY(left_x, rows_y[3]);
+            SSD1306_Puts(line_buf, &Font_7x10, SSD1306_COLOR_WHITE);
         }
 
         // -------------------------------------------------------
 		// Mitad derecha: P, D, I + estado actual del robot
 		// -------------------------------------------------------
 		{
-			const uint16_t rx = SCREEN_W / 2 + 2;
+			const uint16_t rx = right_x;
 
 			// --- Filas 0-2: P, D, I con sus valores ---
 			const char *param_labels[3] = { "P:", "D:", "I:" };
@@ -1248,10 +1294,40 @@ void updateDisplay(void) {
         // Spinner
         // -------------------------------------------------------
         {
+            const uint16_t ix = 32;
+            const uint16_t iy = 52;
             const uint16_t sx = 48;
             const uint16_t sy = 56;
 
             static uint8_t spinPhase = 0;
+
+            if (f_wifi_connected) {
+                // outer arc (9px wide)
+                SSD1306_DrawPixel(ix+3,iy+0,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+4,iy+0,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+5,iy+0,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+2,iy+1,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+6,iy+1,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+1,iy+2,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+7,iy+2,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+0,iy+3,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+8,iy+3,SSD1306_COLOR_WHITE);
+                // middle arc (5px wide)
+                SSD1306_DrawPixel(ix+3,iy+3,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+4,iy+3,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+5,iy+3,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+2,iy+4,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+6,iy+4,SSD1306_COLOR_WHITE);
+                // inner arc (3px)
+                SSD1306_DrawPixel(ix+3,iy+5,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+4,iy+5,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+5,iy+5,SSD1306_COLOR_WHITE);
+                // dot
+                SSD1306_DrawPixel(ix+4,iy+6,SSD1306_COLOR_WHITE);
+            } else {
+                SSD1306_DrawLine(ix+1, iy+1, ix+7, iy+5, SSD1306_COLOR_WHITE);
+                SSD1306_DrawLine(ix+7, iy+1, ix+1, iy+5, SSD1306_COLOR_WHITE);
+            }
 
             static const int8_t spokes[8][4] = {
                 { 0, -4,  0, -3},
@@ -1753,10 +1829,7 @@ static void ControlStep10ms(void)
         const float ADC_BETA = 0.3f;
 
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-            velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_ctrl);
-            if (velocity_est >  20.0f) velocity_est =  20.0f;
-            if (velocity_est < -20.0f) velocity_est = -20.0f;
-            velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+            UpdateVelocityEstimate(gyro_f, dt_ctrl);
 
             adc_f[0] += ADC_BETA * ((float)adcValues[0] - adc_f[0]);
             adc_f[1] += ADC_BETA * ((float)adcValues[1] - adc_f[1]);
@@ -1797,19 +1870,9 @@ static void ControlStep10ms(void)
             if (line_angle_cmd > LINE_ANGLE) line_angle_cmd = LINE_ANGLE;
             if (line_angle_cmd < LINE_ANGLE_MIN) line_angle_cmd = LINE_ANGLE_MIN;
 
-        } else {
-            if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
-                velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_ctrl);
-                if (velocity_est >  20.0f) velocity_est =  20.0f;
-                if (velocity_est < -20.0f) velocity_est = -20.0f;
-                velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
-            } else {
-                // BALANCE_ONLY: estimate velocity to correct post-push drift
-                velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_ctrl);
-                if (velocity_est >  20.0f) velocity_est =  20.0f;
-                if (velocity_est < -20.0f) velocity_est = -20.0f;
-                velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
-            }
+        } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
+                   (robot_state == ROBOT_STATE_BALANCE_ONLY)) {
+            UpdateVelocityEstimate(gyro_f, dt_ctrl);
         }
 
         // -------------------------------------------------------
@@ -1828,6 +1891,8 @@ static void ControlStep10ms(void)
             line_state          = LINE_STATE_FOLLOWING;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
+            base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_f    = 0.0f;
             line_lost_ms        = HAL_GetTick();
             line_angle_ramped     = 0.0f;
             balance_hold_active   = 0;
@@ -1838,6 +1903,8 @@ static void ControlStep10ms(void)
             pwm_sat_prev        = 0.0f;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
+            base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_f    = 0.0f;
             balance_hold_active = 0;
         }
 
@@ -1852,6 +1919,8 @@ static void ControlStep10ms(void)
             velocity_est_f      = 0.0f;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
+            base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_f    = 0.0f;
             pwm_sat_prev        = 0.0f;
             balance_hold_active = 0;
 
@@ -1869,6 +1938,9 @@ static void ControlStep10ms(void)
         // -------------------------------------------------------
         // SETPOINT DINÁMICO
         // -------------------------------------------------------
+        float base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+        float brake_setpoint_target = 0.0f;
+
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
             float line_target_angle = 0.0f;
 
@@ -1892,10 +1964,8 @@ static void ControlStep10ms(void)
                 }
             }
 
-            dynamic_setpoint = SETPOINT_ANGLE + setpoint_trim + line_angle_ramped;
-
-            if (dynamic_setpoint >  LINE_ANGLE) dynamic_setpoint =  LINE_ANGLE;
-            if (dynamic_setpoint < -LINE_ANGLE) dynamic_setpoint = -LINE_ANGLE;
+            base_setpoint_target = SETPOINT_ANGLE + setpoint_trim + line_angle_ramped;
+            base_setpoint_target = clampf_local(base_setpoint_target, -LINE_ANGLE, LINE_ANGLE);
         } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
             if (HAL_GetTick() - manual_cmd_last_ms > 60) {
                 manual_setpoint_cmd *= 0.96f;
@@ -1938,21 +2008,25 @@ static void ControlStep10ms(void)
                 manual_setpoint_ramped += (ramp_delta > 0.0f) ? ramp_rate : -ramp_rate;
             }
 
-            velocity_est = VEL_DECAY * (velocity_est + gyro_f * dt_ctrl);
-            if (velocity_est >  20.0f) velocity_est =  20.0f;
-            if (velocity_est < -20.0f) velocity_est = -20.0f;
-            velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
-
-            dynamic_setpoint = manual_setpoint_ramped - KV_brake_value * velocity_est_f;
-
+            UpdateVelocityEstimate(gyro_f, dt_ctrl);
+            base_setpoint_target  = manual_setpoint_ramped;
+            brake_setpoint_target = ComputeBrakeSetpointTarget(robot_state);
         } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
-            dynamic_setpoint = SETPOINT_ANGLE + setpoint_trim;
-        } else {
+            base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
+        } else if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
             // BALANCE_ONLY: tilt setpoint against velocity to brake post-push drift
-            dynamic_setpoint = SETPOINT_ANGLE + setpoint_trim - KV_brake_value * velocity_est_f;
+            base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_target = ComputeBrakeSetpointTarget(robot_state);
+        } else {
+            base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
         }
 
         float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f : 5.0f;
+        base_setpoint_target = clampf_local(base_setpoint_target,
+                                            -sp_limit - brake_setpoint_target,
+                                             sp_limit - brake_setpoint_target);
+
+        dynamic_setpoint = base_setpoint_target + brake_setpoint_target;
         if (dynamic_setpoint >  sp_limit) dynamic_setpoint =  sp_limit;
         if (dynamic_setpoint < -sp_limit) dynamic_setpoint = -sp_limit;
 
@@ -1964,7 +2038,7 @@ static void ControlStep10ms(void)
             if (trim_delta < -TRIM_STEP) trim_delta = -TRIM_STEP;
             if (trim_delta != 0.0f) {
                 prev_setpoint_trim += trim_delta;
-                dynamic_setpoint_f += trim_delta;
+                base_setpoint_f += trim_delta;
             }
         }
 
@@ -1979,13 +2053,29 @@ static void ControlStep10ms(void)
                 sp_step_max = 0.0005f;
             }
 
-            float sp_delta = dynamic_setpoint - dynamic_setpoint_f;
+            float sp_delta = base_setpoint_target - base_setpoint_f;
 
             if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;
             if (sp_delta < -sp_step_max) sp_delta = -sp_step_max;
 
-            dynamic_setpoint_f += sp_delta;
+            base_setpoint_f += sp_delta;
         }
+
+        {
+            float brake_step_max = (robot_state == ROBOT_STATE_MANUAL_CONTROL)
+                                 ? BRAKE_TILT_STEP_MAN
+                                 : BRAKE_TILT_STEP_BAL;
+
+            float brake_delta = brake_setpoint_target - brake_setpoint_f;
+            if (brake_delta >  brake_step_max) brake_delta =  brake_step_max;
+            if (brake_delta < -brake_step_max) brake_delta = -brake_step_max;
+
+            brake_setpoint_f += brake_delta;
+        }
+
+        dynamic_setpoint_f = base_setpoint_f + brake_setpoint_f;
+        dynamic_setpoint_f = clampf_local(dynamic_setpoint_f, -sp_limit, sp_limit);
+        brake_setpoint_f   = dynamic_setpoint_f - base_setpoint_f;
 
         // -------------------------------------------------------
         // FALL DETECTION
@@ -2039,6 +2129,10 @@ static void ControlStep10ms(void)
                 gyro_f              = 0.0f;
                 motorRightVelocity  = 0;
                 motorLeftVelocity   = 0;
+                dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
+                dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
+                base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_f    = 0.0f;
                 pwm_sat_prev        = 0.0f;
                 balance_hold_active = 0;
             }
@@ -2055,12 +2149,15 @@ static void ControlStep10ms(void)
                 steering_adjustment = 0.0f;
                 dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
                 dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
+                base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_f    = 0.0f;
                 upright_count       = 0;
                 upside_down_count   = 0;
                 fall_count          = 0;
                 dead_zone_count     = 0;
                 pwm_sat_prev        = 0.0f;
                 balance_hold_active = 0;
+                prev_error          = 0.0f;
             } else {
                 motorRightVelocity = 0;
                 motorLeftVelocity  = 0;
@@ -2069,6 +2166,10 @@ static void ControlStep10ms(void)
                 integral           = 0.0f;
 				velocity_est       = 0.0f;
 				velocity_est_f     = 0.0f;
+                dynamic_setpoint   = SETPOINT_ANGLE + setpoint_trim;
+                dynamic_setpoint_f = SETPOINT_ANGLE + setpoint_trim;
+                base_setpoint_f    = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_f   = 0.0f;
 				steering_adjustment = 0.0f;
                 balance_hold_active = 0;
             }
@@ -2148,10 +2249,10 @@ static void ControlStep10ms(void)
             p_term = KP_value * control_error;
             i_term = KI_value * integral;
 
-            float gyro_for_d = gyro_f;
-            if (gyro_for_d >  150.0f) gyro_for_d =  150.0f;
-            if (gyro_for_d < -150.0f) gyro_for_d = -150.0f;
-            d_term = -KD_value * gyro_for_d;
+            float d_error = (control_error - prev_error) / dt_ctrl;
+            if (d_error >  500.0f) d_error =  500.0f;
+            if (d_error < -500.0f) d_error = -500.0f;
+            d_term = KD_value * d_error;
 
             if (d_term >  15.0f) d_term =  15.0f;
             if (d_term < -15.0f) d_term = -15.0f;
@@ -2169,11 +2270,12 @@ static void ControlStep10ms(void)
                 output = p_term + i_term + d_term;
             }
 
+            prev_error = control_error;
             pwm_cmd = output;
             pwm_sat = pwm_cmd;
 
-            if (pwm_sat >  100.0f) { pwm_sat =  100.0f; sat_flag = 1; }
-            if (pwm_sat < -100.0f) { pwm_sat = -100.0f; sat_flag = 1; }
+            if (pwm_sat >  50.0f) { pwm_sat =  50.0f; sat_flag = 1; }
+            if (pwm_sat < -50.0f) { pwm_sat = -50.0f; sat_flag = 1; }
 
             if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
                 if (pwm_sat >  40.0f) pwm_sat =  40.0f;
@@ -2202,7 +2304,7 @@ static void ControlStep10ms(void)
                 } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
                     pwm_step_max = 2.0f;
                 } else if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
-                    pwm_step_max = 8.0f;   // ← más rápido, el péndulo no espera
+                    pwm_step_max = 8.0f;
                 } else {
                     pwm_step_max = 5.0f;
                 }
@@ -2650,6 +2752,10 @@ int main(void)
   KD_value = KD;
   KI_value = KI;
   KV_brake_value = KV_BRAKE;
+  dynamic_setpoint = SETPOINT_ANGLE + setpoint_trim;
+  dynamic_setpoint_f = SETPOINT_ANGLE + setpoint_trim;
+  base_setpoint_f = SETPOINT_ANGLE + setpoint_trim;
+  brake_setpoint_f = 0.0f;
 
   // Initialize DWT for micros()
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;

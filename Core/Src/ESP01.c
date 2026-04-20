@@ -15,8 +15,8 @@
 
 extern void USB_Debug(const char *fmt, ...);
 
-#define SERVER_IP    		"192.168.100.5"	// Wifi Depto
-//#define SERVER_IP    		"172.23.205.98"	// Wifi Facultad
+//#define SERVER_IP    		"192.168.100.5"	// Wifi Depto
+#define SERVER_IP    		"172.23.205.98"	// Wifi Facultad
 #define SERVER_PORT  		30010
 #define LOCAL_PORT   		30000
 #define ALIVE_INTERVAL_FAST_MS 	5000
@@ -36,6 +36,8 @@ static enum {
 	ESP01ATCWMODE_RESPONSE,
 	ESP01ATCWDHCP_SET,
 	ESP01ATCWDHCP_RESPONSE,
+	ESP01ATCWAUTOCONN,
+	ESP01ATCWAUTOCONN_RESPONSE,
 	ESP01ATCWJAP,
 	ESP01CWJAPRESPONSE,
 	ESP01ATCIFSR,
@@ -783,7 +785,7 @@ static void ESP01DOConnection(){
     }
 
 
-	esp01TimeoutTask = 100;
+	esp01TimeoutTask = 10;  // 100ms default between AT states (was 1s)
 	switch(esp01ATSate){
 	case ESP01ATIDLE:
 		esp01TimeoutTask = 0;
@@ -804,7 +806,7 @@ static void ESP01DOConnection(){
 		if(aDbgStr != NULL)
 			aDbgStr("+&DBGESP01HARDRESET1\n");
 		esp01ATSate = ESP01ATHARDRSTSTOP;
-		esp01TimeoutTask = 500;
+		esp01TimeoutTask = 150;  // 1.5s — ESP8266 boots in ~1s
 		break;
 	case ESP01ATHARDRSTSTOP:
 		esp01ATSate = ESP01ATAT;
@@ -854,9 +856,21 @@ static void ESP01DOConnection(){
 
 	case ESP01ATCWDHCP_RESPONSE:
 	    if (esp01Flags.bit.ATRESPONSEOK) {
-	        esp01ATSate = ESP01ATCWJAP;
+	        esp01ATSate = ESP01ATCWAUTOCONN;
 	    }
 	    break;
+
+	case ESP01ATCWAUTOCONN:
+	    ESP01StrToBufTX("AT+CWAUTOCONN=1\r\n");
+	    esp01Flags.bit.ATRESPONSEOK = 0;
+	    esp01ATSate = ESP01ATCWAUTOCONN_RESPONSE;
+	    break;
+
+	case ESP01ATCWAUTOCONN_RESPONSE:
+	    // Advance whether OK or not — setting persists in flash from first success
+	    esp01ATSate = ESP01ATCWJAP;
+	    break;
+
 
 	case ESP01ATCIPMUX:
 	    if (strcmp(esp01PROTO, "TCP") == 0) {
