@@ -77,7 +77,7 @@ typedef enum {
 
 
 #define MPU_AVERAGE_SIZE 	10
-#define ADC_AVERAGE_SIZE 	40
+#define ADC_AVERAGE_SIZE 	15
 
 #define BAR_COUNT    		8
 #define BAR_SPACING  		2
@@ -132,9 +132,9 @@ typedef enum {
 #define BRAKE_VEL_DEADBAND      0.05f
 #define BRAKE_VEL_MAX           4.0f
 #define BRAKE_TILT_MAX          3.0f
-#define BRAKE_TILT_MAX_MANUAL   0.80f
+#define BRAKE_TILT_MAX_MANUAL   3.0f
 #define BRAKE_TILT_STEP_BAL     0.06f
-#define BRAKE_TILT_STEP_MAN     0.0015f
+#define BRAKE_TILT_STEP_MAN     0.06f
 #define INTEGRAL_DECAY   0.990f
 #define KV_LINE_BRAKE 	 0.10f
 
@@ -272,11 +272,11 @@ float KI_value;
 float KV_brake_value;
 
 // Line Follower Variables
-float KP_LINE = 5.0f;
-float KD_LINE = 0.0f;
+float KP_LINE = 15.0f;
+float KD_LINE = 2.0f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;
-float LINE_ANGLE = 1;  // Base inclination (degrees) for forward movement
+float LINE_ANGLE = 1.0f;  // Base inclination (degrees) for forward movement
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
@@ -985,7 +985,6 @@ static float ComputeBrakeSetpointTarget(uint8_t state)
                          ? BRAKE_TILT_MAX_MANUAL
                          : BRAKE_TILT_MAX;
     float abs_vel = fabsf(vel_for_brake);
-    float vel_norm = clampf_local(abs_vel / BRAKE_VEL_MAX, 0.0f, 1.0f);
     float brake_mag = kv_brake * abs_vel;
 
     if (vel_for_brake < 0.0f) {
@@ -1826,7 +1825,7 @@ static void ControlStep10ms(void)
         uint8_t line_detected = 0;
         float w_sum = 0.0f;
         static float adc_f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        const float ADC_BETA = 0.3f;
+        const float ADC_BETA = 0.8f;
 
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
             UpdateVelocityEstimate(gyro_f, dt_ctrl);
@@ -1945,17 +1944,27 @@ static void ControlStep10ms(void)
             float line_target_angle = 0.0f;
 
             if (line_state == LINE_STATE_FOLLOWING && line_detected) {
-                line_target_angle = line_angle_cmd;
+                float speed_brake = KV_LINE_BRAKE * velocity_est_f;
+                // error=0 → +LINE_ANGLE, error=0.5 → 0, error=1.0 → -LINE_ANGLE (frena activo)
+                line_target_angle = line_angle_cmd * (1.0f - 2.0f * fabsf(line_error)) - speed_brake;
+                if (line_target_angle < -LINE_ANGLE) line_target_angle = -LINE_ANGLE;
             } else {
                 line_target_angle = 0.0f;
             }
 
             {
-                const float LINE_RAMP_UP   = 0.001f;
-                const float LINE_RAMP_DOWN = 0.0008f;
+                const float LINE_RAMP_FAST = 3.0f;   // instantáneo cuando ve la línea
+                const float LINE_RAMP_LOST = 0.005f; // lento solo cuando la pierde
 
                 float ramp_delta = line_target_angle - line_angle_ramped;
-                float ramp_rate  = (ramp_delta > 0.0f) ? LINE_RAMP_UP : LINE_RAMP_DOWN;
+                float ramp_rate;
+                if (ramp_delta > 0.0f) {
+                    ramp_rate = LINE_RAMP_FAST;
+                } else if (line_detected) {
+                    ramp_rate = LINE_RAMP_FAST; // baja rápido si ve la línea pero error grande
+                } else {
+                    ramp_rate = LINE_RAMP_LOST; // baja lento si perdió la línea
+                }
 
                 if (fabsf(ramp_delta) <= ramp_rate) {
                     line_angle_ramped = line_target_angle;
@@ -2046,11 +2055,11 @@ static void ControlStep10ms(void)
             float sp_step_max;
 
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                sp_step_max = 0.004f;
+                sp_step_max = 0.1f;
             } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-                sp_step_max = 0.0015f;
+                sp_step_max = 0.75f;
             } else {
-                sp_step_max = 0.0005f;
+                sp_step_max = 0.1f;
             }
 
             float sp_delta = base_setpoint_target - base_setpoint_f;
@@ -2238,9 +2247,7 @@ static void ControlStep10ms(void)
                 balance_hold_active = 0;
             }
 
-            if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                integral *= 0.970f;
-            } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
+            if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
                 // no decay, acumula libremente dentro de límites
             } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
                 // no decay aquí tampoco
@@ -2299,14 +2306,10 @@ static void ControlStep10ms(void)
             {
                 float pwm_step_max;
 
-                if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                    pwm_step_max = 2.0f;
-                } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-                    pwm_step_max = 2.0f;
-                } else if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
+                if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
                     pwm_step_max = 8.0f;
                 } else {
-                    pwm_step_max = 5.0f;
+                    pwm_step_max = 8.0f;
                 }
 
                 float pwm_delta = pwm_sat - pwm_sat_prev;
@@ -2317,18 +2320,16 @@ static void ControlStep10ms(void)
                 pwm_sat_prev = pwm_sat;
             }
 
-            if (robot_state != ROBOT_STATE_MANUAL_CONTROL) {
-                if (!late_cycle) {
-                    if (fabsf(control_error) > 0.2f) {
-                    	if (fabsf(pwm_sat) <= pwm_limit) {
-                            integral += control_error * dt_ctrl;
-                        } else {
-                            if (pwm_cmd >  pwm_limit && control_error < 0) integral += control_error * dt_ctrl;
-                            else if (pwm_cmd < -pwm_limit && control_error > 0) integral += control_error * dt_ctrl;
-                        }
+            if (!late_cycle) {
+                if (fabsf(control_error) > 0.2f) {
+                    if (fabsf(pwm_sat) <= pwm_limit) {
+                        integral += control_error * dt_ctrl;
                     } else {
-                        integral *= 0.95f;
+                        if (pwm_cmd >  pwm_limit && control_error < 0) integral += control_error * dt_ctrl;
+                        else if (pwm_cmd < -pwm_limit && control_error > 0) integral += control_error * dt_ctrl;
                     }
+                } else {
+                    integral *= 0.95f;
                 }
             }
 
@@ -2343,8 +2344,8 @@ static void ControlStep10ms(void)
             }
 
             if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-                if (integral >  2.0f) integral =  2.0f;
-                if (integral < -2.0f) integral = -2.0f;
+                if (integral >  8.0f) integral =  8.0f;
+                if (integral < -8.0f) integral = -8.0f;
             }
 
             if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
@@ -2353,8 +2354,8 @@ static void ControlStep10ms(void)
             }
 
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                if (integral >  1.5f) integral =  1.5f;
-                if (integral < -1.5f) integral = -1.5f;
+                if (integral >  8.0f) integral =  8.0f;
+                if (integral < -8.0f) integral = -8.0f;
             }
 
             if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
@@ -2363,12 +2364,10 @@ static void ControlStep10ms(void)
                 switch (line_state) {
                     case LINE_STATE_FOLLOWING:
                     {
-                        uint8_t line_detected_robust = line_detected && (w_sum > LINE_THRESHOLD * 0.5f);
-
-                        if (line_detected_robust) {
+                        if (line_detected) {
                             line_lost_ms = HAL_GetTick();
 
-                            float p_line = KP_LINE * line_error * fabsf(line_error);
+                            float p_line = KP_LINE * line_error;
 
                             if (!late_cycle) {
                                 line_integral += line_error * dt_ctrl;
@@ -2391,13 +2390,7 @@ static void ControlStep10ms(void)
                             line_error_prev = line_error_f_d;
 
                             float steering_target = p_line + i_line + d_line;
-                            float steering_delta = steering_target - steering_adjustment;
-                            float steering_rate_limit = 2.0f;
-
-                            if (steering_delta >  steering_rate_limit) steering_delta =  steering_rate_limit;
-                            if (steering_delta < -steering_rate_limit) steering_delta = -steering_rate_limit;
-
-                            steering_adjustment += steering_delta;
+                            steering_adjustment = steering_target;
 
                             log_p_line = p_line;
                             log_i_line = i_line;
