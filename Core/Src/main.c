@@ -43,7 +43,8 @@ typedef enum {
     ROBOT_STATE_BALANCE_ONLY,
     ROBOT_STATE_BALANCE_AND_SPEED,
     ROBOT_STATE_LINE_FOLLOWING,
-    ROBOT_STATE_MANUAL_CONTROL
+    ROBOT_STATE_MANUAL_CONTROL,
+    ROBOT_STATE_MOTOR_TEST
 } eRobotState;
 
 // --- Line Search & Loss Control ---
@@ -97,16 +98,13 @@ typedef enum {
 
 #define SETPOINT_ANGLE 	0.0f
 
+#define SOFT_ZONE_ANGLE_DEG   1.50f   // error a partir del cual el PID va al 100%
+#define SOFT_ZONE_MIN_SCALE   0.15f   // escala mínima cuando el error es ~0
+
 // Complementary Filter / PID timing
 #define ALPHA 0.98f
 #define DT_CTRL_FIXED 0.010f
 
-#define BALANCE_HOLD_ENTER_ANGLE_DEG  0.40f
-#define BALANCE_HOLD_EXIT_ANGLE_DEG   0.90f
-#define BALANCE_HOLD_ENTER_GYRO_DPS   4.0f
-#define BALANCE_HOLD_EXIT_GYRO_DPS    12.0f
-#define BALANCE_SOFT_ZONE_ANGLE_DEG   1.50f
-#define BALANCE_SOFT_ZONE_MIN_SCALE   0.15f
 
 // LOGGING MACROS
 #define LOG_ENABLE 1
@@ -119,24 +117,28 @@ typedef enum {
 #define DT_MAX 0.05f        // Max valid DT (50ms)
 
 // Fall detection (hysteresis)
-#define FALL_ANGLE           60.0f
-#define RECOVER_ANGLE        2.0f
-#define UPSIDE_DOWN_ANGLE    120.0f  // más agresivo para detectar boca abajo antes
-#define DEAD_ZONE_ANGLE      15.0f   // entre 35° y 120° → zona muerta, motores off
+#define FALL_ANGLE           	60.0f
+#define RECOVER_ANGLE        	2.0f
+#define UPSIDE_DOWN_ANGLE    	120.0f  // más agresivo para detectar boca abajo antes
+#define DEAD_ZONE_ANGLE      	15.0f   // entre 35° y 120° → zona muerta, motores off
 
-//#define KV_BRAKE         0.20f  // cuánto inclina el setpoint por velocidad estimada
-//#define VEL_DECAY        0.970f // decaimiento del estimado (1.0=sin decay, 0.99=decay rápido)
-#define KV_BRAKE         2.0f
-#define VEL_DECAY        0.990f
-#define VEL_LPF_BETA     0.14f
+#define MOTOR_RIGHT_DEADBAND  	1   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
+#define KV_BRAKE                0.0f  // ganancia base (velocidad baja)
+#define KV_BRAKE_STRONG         30.0f  // ganancia extra por encima del umbral
+#define BRAKE_VEL_THRESHOLD     2.0f  // velocidad a partir de la cual se aplica el freno fuerte
+#define VEL_DECAY        		0.999f
+#define VEL_DECAY_ACCEL  		0.97f   // decay del integrador del acelerómetro
+#define VEL_CF_ALPHA     		0.0f    // peso del giroscopio en el filtro complementario (1=solo gyro, 0=solo accel)
+#define VEL_ACCEL_SCALE  		30.0f   // escala para igualar m/s del accel con unidades del gyro
+#define VEL_LPF_BETA     		0.35f
 #define BRAKE_VEL_DEADBAND      0.05f
 #define BRAKE_VEL_MAX           4.0f
-#define BRAKE_TILT_MAX          3.0f
+#define BRAKE_TILT_MAX          6.0f
 #define BRAKE_TILT_MAX_MANUAL   3.0f
-#define BRAKE_TILT_STEP_BAL     0.06f
-#define BRAKE_TILT_STEP_MAN     0.06f
-#define INTEGRAL_DECAY   0.990f
-#define KV_LINE_BRAKE 	 0.10f
+#define BRAKE_TILT_STEP_BAL     0.5f
+#define BRAKE_TILT_STEP_MAN     0.3f
+#define INTEGRAL_DECAY   		0.990f
+#define KV_LINE_BRAKE 	 		0.10f
 
 #define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
 #define LINE_LOST_STEERING     12.0f // steering suave para cuando recién se pierde la línea
@@ -259,8 +261,9 @@ static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
 
 static float dt_real        = 0.0f;		// Monitoreo del perÃ­odo real entre muestras
 
-static float velocity_est     = 0.0f;  // velocidad lineal estimada (en "unidades gyro integradas")
+static float velocity_est     = 0.0f;  // velocidad estimada fusionada (gyro + accel)
 static float velocity_est_f   = 0.0f;  // versión filtrada para el setpoint
+static float vel_from_accel   = 0.0f;  // velocidad integrada del acelerómetro (m/s)
 static float dynamic_setpoint = 0.0f;  // setpoint variable calculado cada ciclo
 static float dynamic_setpoint_f = 0.0f;
 static float base_setpoint_f  = 0.0f;
@@ -296,7 +299,6 @@ static uint8_t  key_click_count = 0;
 static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float pwm_sat_prev = 0.0f;
-static uint8_t balance_hold_active = 0;
 static float prev_error = 0.0f;
 
 volatile uint8_t tick2ms_count = 0;
@@ -963,10 +965,29 @@ static float apply_deadbandf(float value, float deadband)
     return 0.0f;
 }
 
-static void UpdateVelocityEstimate(float gyro_rate_dps, float dt_ctrl)
+static void UpdateVelocityEstimate(float gyro_rate_dps, float dt_ctrl, float roll_rad, int16_t ay_val)
 {
-    velocity_est = VEL_DECAY * (velocity_est + gyro_rate_dps * dt_ctrl);
+    // 1. Aceleración lineal horizontal: quita el componente de gravedad del ay
+    //    ay_val está en cm/s² (981 = 1g). A velocidad cte y ángulo cte: a_lin ≈ 0.
+    //    Durante frenada el acelerómetro ve desaceleración real → vel_from_accel baja activamente.
+    float a_lin_ms2 = ((float)ay_val - 981.0f * sinf(roll_rad)) * 0.01f;  // cm/s² → m/s²
+
+    // Deadband: filtra bias residual de la compensación de gravedad
+    if (fabsf(a_lin_ms2) < 0.07f) a_lin_ms2 = 0.0f;
+
+    // 2. Integrar aceleración para obtener velocidad lineal (m/s)
+    vel_from_accel = VEL_DECAY_ACCEL * vel_from_accel + a_lin_ms2 * dt_ctrl;
+    vel_from_accel = clampf_local(vel_from_accel, -5.0f, 5.0f);
+
+    // 3. Giroscopio: captura transitorios rápidos
+    float vel_gyro = VEL_DECAY * (velocity_est + gyro_rate_dps * dt_ctrl);
+
+    // 4. Filtro complementario: gyro domina AC, accel aporta DC (velocidad sostenida)
+    velocity_est = VEL_CF_ALPHA * vel_gyro
+                 + (1.0f - VEL_CF_ALPHA) * (vel_from_accel * VEL_ACCEL_SCALE);
     velocity_est = clampf_local(velocity_est, -20.0f, 20.0f);
+
+    // 5. LPF para suavizar el setpoint de freno
     velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
 }
 
@@ -986,12 +1007,13 @@ static float ComputeBrakeSetpointTarget(uint8_t state)
                          : BRAKE_TILT_MAX;
     float abs_vel = fabsf(vel_for_brake);
     float brake_mag = kv_brake * abs_vel;
+    if (abs_vel > BRAKE_VEL_THRESHOLD)
+        brake_mag += KV_BRAKE_STRONG * (abs_vel - BRAKE_VEL_THRESHOLD);
 
-    if (vel_for_brake < 0.0f) {
+    if (vel_for_brake < 0.0f)
         brake_mag = -brake_mag;
-    }
 
-    return clampf_local(-brake_mag, -brake_tilt_max, brake_tilt_max);
+    return clampf_local(brake_mag, -brake_tilt_max, brake_tilt_max);
 }
 
 static void FormatSignedFixed(char *buf, size_t buf_size, float value, uint8_t decimals)
@@ -1189,6 +1211,9 @@ void updateDisplay(void) {
 			            break;
                     case ROBOT_STATE_MANUAL_CONTROL:
                         mode_str = "MANUAL";
+                        break;
+                    case ROBOT_STATE_MOTOR_TEST:
+                        mode_str = "TEST";
                         break;
 			        default:
 			            mode_str = "UNK";
@@ -1401,6 +1426,7 @@ void updateDisplay(void) {
                 case ROBOT_STATE_BALANCE_AND_SPEED: robot_mode_str = "SPEED"; break;
                 case ROBOT_STATE_LINE_FOLLOWING: robot_mode_str = "LINE";  break;
                 case ROBOT_STATE_MANUAL_CONTROL: robot_mode_str = "MAN";   break;
+                case ROBOT_STATE_MOTOR_TEST:     robot_mode_str = "TEST";  break;
                 default:                         robot_mode_str = "UNK";   break;
             }
 
@@ -1828,7 +1854,7 @@ static void ControlStep10ms(void)
         const float ADC_BETA = 0.8f;
 
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-            UpdateVelocityEstimate(gyro_f, dt_ctrl);
+            UpdateVelocityEstimate(gyro_f, dt_ctrl, filtered_roll_deg * ((float)M_PI / 180.0f), ay);
 
             adc_f[0] += ADC_BETA * ((float)adcValues[0] - adc_f[0]);
             adc_f[1] += ADC_BETA * ((float)adcValues[1] - adc_f[1]);
@@ -1871,7 +1897,7 @@ static void ControlStep10ms(void)
 
         } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
                    (robot_state == ROBOT_STATE_BALANCE_ONLY)) {
-            UpdateVelocityEstimate(gyro_f, dt_ctrl);
+            UpdateVelocityEstimate(gyro_f, dt_ctrl, filtered_roll_deg * ((float)M_PI / 180.0f), ay);
         }
 
         // -------------------------------------------------------
@@ -1887,6 +1913,7 @@ static void ControlStep10ms(void)
             steering_adjustment = 0.0f;
             velocity_est        = 0.0f;
             velocity_est_f      = 0.0f;
+            vel_from_accel      = 0.0f;
             line_state          = LINE_STATE_FOLLOWING;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
@@ -1894,7 +1921,6 @@ static void ControlStep10ms(void)
             brake_setpoint_f    = 0.0f;
             line_lost_ms        = HAL_GetTick();
             line_angle_ramped     = 0.0f;
-            balance_hold_active   = 0;
         }
 
         if (robot_state == ROBOT_STATE_IDLE && prev_robot_state != ROBOT_STATE_IDLE) {
@@ -1904,7 +1930,6 @@ static void ControlStep10ms(void)
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
             base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
             brake_setpoint_f    = 0.0f;
-            balance_hold_active = 0;
         }
 
         if ((robot_state == ROBOT_STATE_BALANCE_ONLY ||
@@ -1916,12 +1941,12 @@ static void ControlStep10ms(void)
             steering_adjustment = 0.0f;
             velocity_est        = 0.0f;
             velocity_est_f      = 0.0f;
+            vel_from_accel      = 0.0f;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
             base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
             brake_setpoint_f    = 0.0f;
             pwm_sat_prev        = 0.0f;
-            balance_hold_active = 0;
 
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                 manual_setpoint_cmd    = 0.0f;
@@ -2017,7 +2042,7 @@ static void ControlStep10ms(void)
                 manual_setpoint_ramped += (ramp_delta > 0.0f) ? ramp_rate : -ramp_rate;
             }
 
-            UpdateVelocityEstimate(gyro_f, dt_ctrl);
+            UpdateVelocityEstimate(gyro_f, dt_ctrl, filtered_roll_deg * ((float)M_PI / 180.0f), ay);
             base_setpoint_target  = manual_setpoint_ramped;
             brake_setpoint_target = ComputeBrakeSetpointTarget(robot_state);
         } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
@@ -2132,6 +2157,7 @@ static void ControlStep10ms(void)
                 integral            = 0.0f;
                 velocity_est        = 0.0f;
                 velocity_est_f      = 0.0f;
+                vel_from_accel      = 0.0f;
                 line_integral       = 0.0f;
                 line_error_prev     = 0.0f;
                 steering_adjustment = 0.0f;
@@ -2143,7 +2169,6 @@ static void ControlStep10ms(void)
                 base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
                 brake_setpoint_f    = 0.0f;
                 pwm_sat_prev        = 0.0f;
-                balance_hold_active = 0;
             }
         } else {
             if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
@@ -2153,6 +2178,7 @@ static void ControlStep10ms(void)
                 integral            = 0.0f;
                 velocity_est        = 0.0f;
                 velocity_est_f      = 0.0f;
+                vel_from_accel      = 0.0f;
                 line_integral       = 0.0f;
                 line_error_prev     = 0.0f;
                 steering_adjustment = 0.0f;
@@ -2165,7 +2191,6 @@ static void ControlStep10ms(void)
                 fall_count          = 0;
                 dead_zone_count     = 0;
                 pwm_sat_prev        = 0.0f;
-                balance_hold_active = 0;
                 prev_error          = 0.0f;
             } else {
                 motorRightVelocity = 0;
@@ -2175,12 +2200,12 @@ static void ControlStep10ms(void)
                 integral           = 0.0f;
 				velocity_est       = 0.0f;
 				velocity_est_f     = 0.0f;
+				vel_from_accel     = 0.0f;
                 dynamic_setpoint   = SETPOINT_ANGLE + setpoint_trim;
                 dynamic_setpoint_f = SETPOINT_ANGLE + setpoint_trim;
                 base_setpoint_f    = SETPOINT_ANGLE + setpoint_trim;
                 brake_setpoint_f   = 0.0f;
 				steering_adjustment = 0.0f;
-                balance_hold_active = 0;
             }
         }
 
@@ -2196,63 +2221,12 @@ static void ControlStep10ms(void)
         float pwm_cmd = 0.0f;
         float pwm_sat = 0.0f;
         uint8_t sat_flag = 0;
-        float balance_pi_scale = 1.0f;
-        float balance_d_scale = 1.0f;
 
         float log_p_line = 0.0f;
         float log_i_line = 0.0f;
         float log_d_line = 0.0f;
 
         if (!f_fallen) {
-            const uint8_t is_balance_mode =
-                    (robot_state == ROBOT_STATE_BALANCE_ONLY) ||
-                    (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
-                    (robot_state == ROBOT_STATE_LINE_FOLLOWING) ||
-                    (robot_state == ROBOT_STATE_MANUAL_CONTROL);
-
-            if (is_balance_mode) {
-                float abs_error = fabsf(error);
-                float abs_gyro  = fabsf(gyro_f);
-
-                // balance hold solo en modos sin tilt de avance continuo
-                if (robot_state != ROBOT_STATE_LINE_FOLLOWING) {
-                    if (!balance_hold_active) {
-                        if ((abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG) &&
-                            (abs_gyro  <= BALANCE_HOLD_ENTER_GYRO_DPS)) {
-                            balance_hold_active = 1;
-                        }
-                    } else {
-                        if ((abs_error >= BALANCE_HOLD_EXIT_ANGLE_DEG) ||
-                            (abs_gyro  >= BALANCE_HOLD_EXIT_GYRO_DPS)) {
-                            balance_hold_active = 0;
-                        }
-                    }
-                } else {
-                    balance_hold_active = 0;
-                }
-
-                if (balance_hold_active) {
-                    control_error = 0.0f;
-                    integral *= 0.98f;
-                } else if (abs_error < BALANCE_SOFT_ZONE_ANGLE_DEG) {
-                    float x = (abs_error - BALANCE_HOLD_ENTER_ANGLE_DEG) /
-                              (BALANCE_SOFT_ZONE_ANGLE_DEG - BALANCE_HOLD_ENTER_ANGLE_DEG);
-                    if (x < 0.0f) x = 0.0f;
-                    if (x > 1.0f) x = 1.0f;
-                    balance_pi_scale = BALANCE_SOFT_ZONE_MIN_SCALE +
-                                       (1.0f - BALANCE_SOFT_ZONE_MIN_SCALE) * (x * x);
-                    balance_d_scale = x;
-                }
-            } else {
-                balance_hold_active = 0;
-            }
-
-            if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
-                // no decay, acumula libremente dentro de límites
-            } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-                // no decay aquí tampoco
-            }
-
             p_term = KP_value * control_error;
             i_term = KI_value * integral;
 
@@ -2264,18 +2238,16 @@ static void ControlStep10ms(void)
             if (d_term >  15.0f) d_term =  15.0f;
             if (d_term < -15.0f) d_term = -15.0f;
 
-            if (is_balance_mode) {
-                if (balance_hold_active) {
-                    output = 0.0f;
-                } else {
-                    p_term *= balance_pi_scale;
-                    i_term *= balance_pi_scale;
-                    d_term *= balance_d_scale;
-                    output = p_term + i_term + d_term;
-                }
-            } else {
-                output = p_term + i_term + d_term;
+            {
+                float x = fabsf(control_error) / SOFT_ZONE_ANGLE_DEG;
+                if (x > 1.0f) x = 1.0f;
+                float soft_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;
+                p_term *= soft_scale;
+                d_term *= soft_scale;
+                // i_term sin escalar: siempre actúa al 100% para corregir deriva
             }
+
+            output = p_term + i_term + d_term;
 
             prev_error = control_error;
             pwm_cmd = output;
@@ -2321,15 +2293,11 @@ static void ControlStep10ms(void)
             }
 
             if (!late_cycle) {
-                if (fabsf(control_error) > 0.2f) {
-                    if (fabsf(pwm_sat) <= pwm_limit) {
-                        integral += control_error * dt_ctrl;
-                    } else {
-                        if (pwm_cmd >  pwm_limit && control_error < 0) integral += control_error * dt_ctrl;
-                        else if (pwm_cmd < -pwm_limit && control_error > 0) integral += control_error * dt_ctrl;
-                    }
+                if (fabsf(pwm_sat) <= pwm_limit) {
+                    integral += control_error * dt_ctrl;
                 } else {
-                    integral *= 0.95f;
+                    if (pwm_cmd >  pwm_limit && control_error < 0) integral += control_error * dt_ctrl;
+                    else if (pwm_cmd < -pwm_limit && control_error > 0) integral += control_error * dt_ctrl;
                 }
             }
 
@@ -2489,7 +2457,7 @@ static void ControlStep10ms(void)
                 motorRightVelocity = -(int16_t)mL;
                 motorLeftVelocity  = -(int16_t)mR;
 
-            } else {
+            } else if (robot_state != ROBOT_STATE_MOTOR_TEST) {
                 line_integral       = 0.0f;
                 line_error_prev     = 0.0f;
                 steering_adjustment = 0.0f;
@@ -2509,9 +2477,7 @@ static void ControlStep10ms(void)
                 motorRightVelocity = -(int16_t)mL;
                 motorLeftVelocity  = -(int16_t)mR;
             }
-        } else {
-            motorRightVelocity = 0;
-            motorLeftVelocity  = 0;
+            // ROBOT_STATE_MOTOR_TEST: SETMOTORSPEED controla directamente
         }
 
         roll_deg = filtered_roll_deg;
@@ -2609,8 +2575,16 @@ static void ControlStep10ms(void)
 
 
 
-    if ((robot_state != ROBOT_STATE_IDLE) && !f_fallen) {
+    if (robot_state == ROBOT_STATE_MOTOR_TEST) {
+        // Modo test: SETMOTORSPEED controla directamente, sin PID ni compensación
         MotorControl(motorRightVelocity, motorLeftVelocity);
+    } else if ((robot_state != ROBOT_STATE_IDLE) && !f_fallen) {
+        int16_t mR_comp = motorRightVelocity;
+        if      (mR_comp > 0)  mR_comp = (int16_t)( mR_comp + MOTOR_RIGHT_DEADBAND);
+        else if (mR_comp < 0)  mR_comp = (int16_t)( mR_comp - MOTOR_RIGHT_DEADBAND);
+        if (mR_comp >  100) mR_comp =  100;
+        if (mR_comp < -100) mR_comp = -100;
+        MotorControl(mR_comp, motorLeftVelocity);
     } else {
         MotorControl(0, 0);
     }
@@ -2810,7 +2784,7 @@ int main(void)
 	          case 4:
 	              tmo100ms--;
 	              if (tmo100ms == 0) {
-	                  tmo100ms = 10;
+	                  tmo100ms = 4;
 	                  HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
 	                  HAL_GPIO_TogglePin(INTEGRATED_LED_GPIO_Port, INTEGRATED_LED_Pin);
 	              }
@@ -2878,11 +2852,17 @@ int main(void)
 	                          } else {
 	                              robot_state = ROBOT_STATE_BALANCE_AND_SPEED;
 	                          }
-	                      } else if (key_click_count >= 4) {
+	                      } else if (key_click_count == 4) {
                               if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                                   robot_state = ROBOT_STATE_IDLE;
                               } else {
                                   robot_state = ROBOT_STATE_MANUAL_CONTROL;
+                              }
+                          } else if (key_click_count >= 5) {
+                              if (robot_state == ROBOT_STATE_MOTOR_TEST) {
+                                  robot_state = ROBOT_STATE_IDLE;
+                              } else {
+                                  robot_state = ROBOT_STATE_MOTOR_TEST;
                               }
                           }
 
