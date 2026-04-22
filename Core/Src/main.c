@@ -124,8 +124,8 @@ typedef enum {
 
 #define MOTOR_RIGHT_DEADBAND  	1   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
 #define KV_BRAKE                0.0f  // ganancia base (velocidad baja)
-#define KV_BRAKE_STRONG         30.0f  // ganancia extra por encima del umbral
-#define BRAKE_VEL_THRESHOLD     2.0f  // velocidad a partir de la cual se aplica el freno fuerte
+#define KV_BRAKE_STRONG         20.0f  // ganancia extra por encima del umbral
+#define BRAKE_VEL_THRESHOLD     1.5f  // velocidad a partir de la cual se aplica el freno fuerte
 #define VEL_DECAY        		0.999f
 #define VEL_DECAY_ACCEL  		0.97f   // decay del integrador del acelerómetro
 #define VEL_CF_ALPHA     		0.0f    // peso del giroscopio en el filtro complementario (1=solo gyro, 0=solo accel)
@@ -212,18 +212,18 @@ static uint16_t esp01IwRx = 0;
 static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrante */
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
-
-const char *wifiSSID     = "FCAL";
-const char *wifiPassword = "fcalconcordia.06-2019";
-const char *wifiIp = "172.23.205.98";
+//
+//const char *wifiSSID     = "FCAL";
+//const char *wifiPassword = "fcalconcordia.06-2019";
+//const char *wifiIp = "172.23.205.98";
 
 //const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
 //const char *wifiPassword = "djg19dlk";
 //const char *wifiIp 		 = "192.168.100.5";
 
-//const char *wifiSSID     = "Delco_Mendelevich";
-//const char *wifiPassword = "toyotakia";
-//const char *wifiIp = "192.168.1.36";
+const char *wifiSSID     = "Delco_Mendelevich";
+const char *wifiPassword = "toyotakia";
+const char *wifiIp = "192.168.1.55";
 
 //const char *wifiSSID     = "Wifi Habitaciones";
 //const char *wifiPassword = "toyotakia";

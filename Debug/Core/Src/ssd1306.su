@@ -38,3 +38,4 @@
 ../Core/Src/ssd1306.c:749:6:SSD1306_ClearError	4	static
 ../Core/Src/ssd1306.c:756:6:SSD1306_ResetUpdateState	4	static
 ../Core/Src/ssd1306.c:762:6:SSD1306_DrawDigit5x7	32	static
+../Core/Src/ssd1306.c:776:6:SSD1306_DrawChar5x7	32	static

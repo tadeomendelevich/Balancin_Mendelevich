@@ -45,7 +45,8 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Middlewares/ST/STM32_USB_Device_Library/Core/Inc/usbd_ioreq.h \
  ../Middlewares/ST/STM32_USB_Device_Library/Core/Inc/usbd_ctlreq.h \
  ../Core/Inc/ssd1306.h ../Core/Inc/fonts.h ../Core/Inc/fonts.h \
- ../Core/Inc/MPU6050.h ../Core/Inc/ESP01.h ../Core/Inc/UNER.h
+ ../Core/Inc/MPU6050.h ../Core/Inc/ESP01.h ../Core/Inc/UNER.h \
+ ../Core/Inc/i2c_manager.h ../Core/Inc/main.h
 ../Core/Inc/main.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h:
 ../Core/Inc/stm32f4xx_hal_conf.h:
@@ -99,3 +100,5 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Core/Inc/MPU6050.h:
 ../Core/Inc/ESP01.h:
 ../Core/Inc/UNER.h:
+../Core/Inc/i2c_manager.h:
+../Core/Inc/main.h:
