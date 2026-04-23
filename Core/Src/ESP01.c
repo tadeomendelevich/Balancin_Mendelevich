@@ -536,12 +536,13 @@ static void ESP01ATDecode(){
 		        case 2: // OK
 		            if (   esp01ATSate == ESP01ATRESPONSE
 		                || esp01ATSate == ESP01ATCWMODE_RESPONSE
-		                || esp01ATSate == ESP01ATCWDHCP_RESPONSE
-		                || esp01ATSate == ESP01CWJAPRESPONSE ) {
+		                || esp01ATSate == ESP01ATCWDHCP_RESPONSE) {
 		                aDbgStr(">>> DEBUG: marcando ATRESPONSEOK = 1\n");
 		                esp01TimeoutTask = 0;
 		                esp01Flags.bit.ATRESPONSEOK = 1;
 		            }
+		            // CWJAPRESPONSE: OK = comando recibido, no WiFi conectado.
+		            // No avanzamos aqui — esperamos WIFI GOT IP (case 4) que pone WIFICONNECTED=1.
 		            else if (esp01ATSate == ESP01CIPSTARTRESPONSE && strcmp(esp01PROTO, "UDP") == 0) {
 		                esp01Flags.bit.ATRESPONSEOK = 1;
 		                ESP01_NotifyStateChange(ESP01_UDPTCP_CONNECTED);
@@ -556,10 +557,9 @@ static void ESP01ATDecode(){
 					}
 					break;
 				case 4://WIFI GOT IP
-					esp01TimeoutTask = 0;
-					if(esp01ATSate == ESP01CWJAPRESPONSE)
-						esp01Flags.bit.ATRESPONSEOK = 1;
+					esp01TimeoutTask = 0;  // dispara DOConnection → CWJAPRESPONSE ve WIFICONNECTED=1
 					esp01Flags.bit.WIFICONNECTED = 1;
+					aDbgStr(">>> WIFI GOT IP: avanzando a CIFSR\n");
 					ESP01_NotifyStateChange(ESP01_WIFI_CONNECTED);
 					break;
 				case 5://WIFI CONNECTED
@@ -925,12 +925,13 @@ static void ESP01DOConnection(){
 		esp01TimeoutTask = 2000;
 		break;
 	case ESP01CWJAPRESPONSE:
-		if(esp01Flags.bit.ATRESPONSEOK){
+		if(esp01Flags.bit.WIFICONNECTED){
+			// WIFI GOT IP recibido: la conexion es real
 			esp01ATSate = ESP01ATCIFSR;
 			esp01TriesAT = 4;
 		}
 		else
-			esp01ATSate = ESP01ATAT;
+			esp01ATSate = ESP01ATAT;  // timeout de 20s sin WIFI GOT IP: reintenta
 		break;
 	case ESP01ATCIFSR:
 		esp01LocalIP[0] = '\0';

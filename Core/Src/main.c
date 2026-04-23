@@ -100,6 +100,11 @@ typedef enum {
 
 #define SOFT_ZONE_ANGLE_DEG   1.50f   // error a partir del cual el PID va al 100%
 #define SOFT_ZONE_MIN_SCALE   0.15f   // escala mínima cuando el error es ~0
+// Zona de hold con histéresis: silencia PID en el punto dulce de equilibrio
+#define BALANCE_HOLD_ENTER_ANGLE_DEG  0.50f  // entra en hold si |error| <= este valor
+#define BALANCE_HOLD_EXIT_ANGLE_DEG   0.90f  // sale de hold si |error| >= este valor
+#define BALANCE_HOLD_ENTER_GYRO_DPS   4.0f   // entra en hold si |gyro| <= este valor
+#define BALANCE_HOLD_EXIT_GYRO_DPS    10.0f  // sale de hold si |gyro| >= este valor
 
 // Complementary Filter / PID timing
 #define ALPHA 0.98f
@@ -128,6 +133,7 @@ typedef enum {
 #define BRAKE_VEL_THRESHOLD     1.5f  // velocidad a partir de la cual se aplica el freno fuerte
 #define VEL_DECAY        		0.999f
 #define VEL_DECAY_ACCEL  		0.97f   // decay del integrador del acelerómetro
+
 #define VEL_CF_ALPHA     		0.0f    // peso del giroscopio en el filtro complementario (1=solo gyro, 0=solo accel)
 #define VEL_ACCEL_SCALE  		30.0f   // escala para igualar m/s del accel con unidades del gyro
 #define VEL_LPF_BETA     		0.35f
@@ -300,6 +306,7 @@ static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float pwm_sat_prev = 0.0f;
 static float prev_error = 0.0f;
+static uint8_t balance_hold_active = 0;
 
 volatile uint8_t tick2ms_count = 0;
 
@@ -1000,15 +1007,13 @@ static float ComputeBrakeSetpointTarget(uint8_t state)
 
     float vel_for_brake = apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND);
     vel_for_brake = clampf_local(vel_for_brake, -BRAKE_VEL_MAX, BRAKE_VEL_MAX);
-    float kv_brake = (KV_brake_value > 0.0f) ? KV_brake_value : 0.0f;
-
     float brake_tilt_max = (state == ROBOT_STATE_MANUAL_CONTROL)
                          ? BRAKE_TILT_MAX_MANUAL
                          : BRAKE_TILT_MAX;
     float abs_vel = fabsf(vel_for_brake);
-    float brake_mag = kv_brake * abs_vel;
+    float brake_mag = KV_BRAKE * abs_vel;
     if (abs_vel > BRAKE_VEL_THRESHOLD)
-        brake_mag += KV_BRAKE_STRONG * (abs_vel - BRAKE_VEL_THRESHOLD);
+        brake_mag += KV_brake_value * (abs_vel - BRAKE_VEL_THRESHOLD);
 
     if (vel_for_brake < 0.0f)
         brake_mag = -brake_mag;
@@ -1784,6 +1789,93 @@ void updateDisplay(void) {
             spinPhase3 = (spinPhase3 + 1) % 8;
         }
 
+    } else if (f_change_display == 5) {
+        // -------------------------------------------------------
+        // PANTALLA 5: Valores MPU grandes + estado WiFi
+        // Izquierda: giroscopio (gx, gy, gz)
+        // Derecha:   acelerometro (ax, ay, az)
+        // Abajo:     gyro filtrado | WiFi
+        // -------------------------------------------------------
+        char buf[12];
+
+        // Divisor vertical entre gyro y accel
+        SSD1306_DrawLine(63, 0, 63, 36, SSD1306_COLOR_WHITE);
+        // Divisor horizontal para fila de WiFi
+        SSD1306_DrawLine(0, 37, SCREEN_W - 1, 37, SSD1306_COLOR_WHITE);
+
+        // Etiquetas columna izquierda (Font_5x7 para ahorrar espacio)
+        SSD1306_DrawChar5x7('G', 0, 1);
+        SSD1306_DrawChar5x7('Y', 6, 1);
+        SSD1306_DrawChar5x7('G', 0, 13);
+        SSD1306_DrawChar5x7('X', 6, 13);
+        SSD1306_DrawChar5x7('G', 0, 25);
+        SSD1306_DrawChar5x7('Z', 6, 25);
+
+        // Valores giroscopio (Font_7x10)
+        snprintf(buf, sizeof(buf), "%+6d", (int)gy);
+        SSD1306_GotoXY(13, 1);
+        SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+
+        snprintf(buf, sizeof(buf), "%+6d", (int)gx);
+        SSD1306_GotoXY(13, 13);
+        SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+
+        snprintf(buf, sizeof(buf), "%+6d", (int)gz);
+        SSD1306_GotoXY(13, 25);
+        SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+
+        // Etiquetas columna derecha
+        SSD1306_DrawChar5x7('A', 65, 1);
+        SSD1306_DrawChar5x7('Y', 71, 1);
+        SSD1306_DrawChar5x7('A', 65, 13);
+        SSD1306_DrawChar5x7('X', 71, 13);
+        SSD1306_DrawChar5x7('A', 65, 25);
+        SSD1306_DrawChar5x7('Z', 71, 25);
+
+        // Valores acelerometro (Font_7x10)
+        snprintf(buf, sizeof(buf), "%+6d", (int)ay);
+        SSD1306_GotoXY(78, 1);
+        SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+
+        snprintf(buf, sizeof(buf), "%+6d", (int)ax);
+        SSD1306_GotoXY(78, 13);
+        SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+
+        snprintf(buf, sizeof(buf), "%+6d", (int)az);
+        SSD1306_GotoXY(78, 25);
+        SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+
+        // Fila inferior izquierda: gyro filtrado en deg/s
+        snprintf(buf, sizeof(buf), "w%+6.1f", (double)gyro_f);
+        SSD1306_GotoXY(0, 41);
+        SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+
+        // Fila inferior derecha: estado WiFi con icono
+        {
+            const uint16_t ix = 119;
+            const uint16_t iy = 41;
+            if (f_wifi_connected) {
+                SSD1306_DrawPixel(ix+3,iy+0,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+0,iy+2,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+6,iy+2,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+1,iy+4,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+5,iy+4,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+2,iy+6,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+4,iy+6,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+3,iy+8,SSD1306_COLOR_WHITE);
+            } else {
+                SSD1306_DrawPixel(ix+0,iy+0,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+6,iy+0,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+1,iy+1,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+5,iy+1,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+2,iy+2,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+4,iy+2,SSD1306_COLOR_WHITE);
+                SSD1306_DrawPixel(ix+3,iy+3,SSD1306_COLOR_WHITE);
+            }
+            SSD1306_GotoXY(65, 53);
+            SSD1306_Puts(f_wifi_connected ? "CONECTADO" : "SIN WIFI ", &Font_5x7, SSD1306_COLOR_WHITE);
+        }
+
     } else {
         SSD1306_GotoXY(30, 25);
         SSD1306_Puts("DISPLAY?", &Font_7x10, SSD1306_COLOR_WHITE);
@@ -2155,10 +2247,11 @@ static void ControlStep10ms(void)
             if (fall_by_angle || fall_upside_down || in_dead_zone) {
                 f_fallen = 1;
                 integral            = 0.0f;
+                balance_hold_active = 0;
                 velocity_est        = 0.0f;
                 velocity_est_f      = 0.0f;
                 vel_from_accel      = 0.0f;
-                line_integral       = 0.0f;
+                    line_integral       = 0.0f;
                 line_error_prev     = 0.0f;
                 steering_adjustment = 0.0f;
                 gyro_f              = 0.0f;
@@ -2176,10 +2269,11 @@ static void ControlStep10ms(void)
                 accel_roll_f      = accel_ang_deg;
                 filtered_roll_deg = accel_ang_deg;
                 integral            = 0.0f;
+                balance_hold_active = 0;
                 velocity_est        = 0.0f;
                 velocity_est_f      = 0.0f;
                 vel_from_accel      = 0.0f;
-                line_integral       = 0.0f;
+                    line_integral       = 0.0f;
                 line_error_prev     = 0.0f;
                 steering_adjustment = 0.0f;
                 dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
@@ -2239,12 +2333,50 @@ static void ControlStep10ms(void)
             if (d_term < -15.0f) d_term = -15.0f;
 
             {
-                float x = fabsf(control_error) / SOFT_ZONE_ANGLE_DEG;
-                if (x > 1.0f) x = 1.0f;
-                float soft_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;
-                p_term *= soft_scale;
-                d_term *= soft_scale;
-                // i_term sin escalar: siempre actúa al 100% para corregir deriva
+                const uint8_t is_balance_mode =
+                    (robot_state == ROBOT_STATE_BALANCE_ONLY) ||
+                    (robot_state == ROBOT_STATE_BALANCE_AND_SPEED);
+                float balance_pi_scale = 1.0f;
+                float balance_d_scale  = 1.0f;
+
+                if (is_balance_mode) {
+                    float abs_error = fabsf(error);
+                    float abs_gyro  = fabsf(gyro_f);
+
+                    if (!balance_hold_active) {
+                        if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
+                            abs_gyro  <= BALANCE_HOLD_ENTER_GYRO_DPS)
+                            balance_hold_active = 1;
+                    } else {
+                        if (abs_error >= BALANCE_HOLD_EXIT_ANGLE_DEG ||
+                            abs_gyro  >= BALANCE_HOLD_EXIT_GYRO_DPS)
+                            balance_hold_active = 0;
+                    }
+
+                    if (balance_hold_active) {
+                        // Zona muerta: silencia P y D, drena I suavemente
+                        balance_pi_scale = 0.0f;
+                        balance_d_scale  = 0.0f;
+                        integral *= 0.98f;
+                    } else {
+                        // Zona de transición suave hacia PID completo
+                        float x = abs_error / SOFT_ZONE_ANGLE_DEG;
+                        if (x > 1.0f) x = 1.0f;
+                        balance_pi_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;
+                        balance_d_scale  = balance_pi_scale;
+                    }
+                } else {
+                    balance_hold_active = 0;
+                    // Modos sin hold: soft zone estándar
+                    float x = fabsf(control_error) / SOFT_ZONE_ANGLE_DEG;
+                    if (x > 1.0f) x = 1.0f;
+                    balance_pi_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;
+                    balance_d_scale  = balance_pi_scale;
+                }
+
+                p_term *= balance_pi_scale;
+                d_term *= balance_d_scale;
+                // i_term sin escalar en output (solo se drena arriba cuando hold_active)
             }
 
             output = p_term + i_term + d_term;
@@ -2718,7 +2850,7 @@ int main(void)
   KP_value = KP;
   KD_value = KD;
   KI_value = KI;
-  KV_brake_value = KV_BRAKE;
+  KV_brake_value = KV_BRAKE_STRONG;
   dynamic_setpoint = SETPOINT_ANGLE + setpoint_trim;
   dynamic_setpoint_f = SETPOINT_ANGLE + setpoint_trim;
   base_setpoint_f = SETPOINT_ANGLE + setpoint_trim;
@@ -2805,7 +2937,7 @@ int main(void)
 
 	                  // Click largo: detectar mientras está presionado, sin esperar soltar
 	                  if (key_now == 0 && key_last_ms != 0 && (now - key_last_ms) > 800) {
-	                      f_change_display = (f_change_display + 1) % 5;
+	                      f_change_display = (f_change_display + 1) % 6;
 	                      key_last_ms = 0;   // ← evita que se dispare repetidamente
 	                  }
 
