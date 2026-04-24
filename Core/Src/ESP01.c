@@ -568,6 +568,7 @@ static void ESP01ATDecode(){
 				case 7://WIFI DISCONNECTED
 					esp01Flags.bit.UDPTCPCONNECTED = 0;
 					esp01Flags.bit.WIFICONNECTED = 0;
+					ESP01_NotifyStateChange(ESP01_UDPTCP_DISCONNECTED);
 					ESP01_NotifyStateChange(ESP01_WIFI_DISCONNECTED);
 					ESP01_NotifyStateChange(ESP01_WIFI_RECONNECTING);
 					if(esp01ATSate != ESP01CWJAPRESPONSE) {
@@ -576,6 +577,7 @@ static void ESP01ATDecode(){
 					break;
 				case 8://DISCONNECTED
 					esp01Flags.bit.UDPTCPCONNECTED = 0;
+					ESP01_NotifyStateChange(ESP01_UDPTCP_DISCONNECTED);
 					break;
 				case 9://SEND OK
 					esp01Flags.bit.SENDINGDATA = 0;
@@ -593,6 +595,7 @@ static void ESP01ATDecode(){
 					break;
 				case 11://CLOSED
 					esp01Flags.bit.UDPTCPCONNECTED = 0;
+					ESP01_NotifyStateChange(ESP01_UDPTCP_DISCONNECTED);
 					break;
 				case 13://busy
 					esp01Flags.bit.UDPTCPCONNECTED = 0;
@@ -773,9 +776,15 @@ static void ESP01DOConnection(){
     // 2a) Si antes estábamos en ATCONNECTED pero ahora UDPTCPCONNECTED o WIFICONNECTED cayeron, relanzamos la conexión.
     if (esp01ATSate == ESP01ATCONNECTED && (!esp01Flags.bit.UDPTCPCONNECTED || !esp01Flags.bit.WIFICONNECTED)) {
         aDbgStr(">>> Conexión perdida, reintentando...\r\n");
-        esp01ATSate     = ESP01ATRECONNECT;
-        esp01TimeoutTask = 0; // Iniciar reconexión inmediatamente
-        ESP01_NotifyStateChange(ESP01_WIFI_RECONNECTING);
+        if (!esp01Flags.bit.WIFICONNECTED) {
+            // WiFi caído: hay que re-autenticar desde el principio
+            esp01ATSate = ESP01ATRECONNECT;
+            ESP01_NotifyStateChange(ESP01_WIFI_RECONNECTING);
+        } else {
+            // WiFi vivo pero UDP caído: reabrir socket directamente
+            esp01ATSate = (strcmp(esp01PROTO, "UDP") == 0) ? ESP01ATPREPUDP : ESP01ATCIPCLOSE;
+        }
+        esp01TimeoutTask = 0;
         return;
     }
     // 2b) Si seguimos vivos, sólo esperamos antes de chequear de nuevo
@@ -942,9 +951,12 @@ static void ESP01DOConnection(){
 		esp01ATSate = ESP01CIFSRRESPONSE;
 		break;
 	case ESP01CIFSRRESPONSE:
-		if(esp01Flags.bit.ATRESPONSEOK)
-			esp01ATSate = ESP01ATCIPCLOSE;
-		else{
+		if(esp01Flags.bit.ATRESPONSEOK) {
+			if (strcmp(esp01PROTO, "UDP") == 0)
+				esp01ATSate = ESP01ATPREPUDP;
+			else
+				esp01ATSate = ESP01ATCIPCLOSE;
+		} else {
 			esp01TriesAT--;
 			if(esp01TriesAT == 0){
 				esp01ATSate = ESP01ATAT;
@@ -1010,16 +1022,14 @@ static void ESP01DOConnection(){
 		break;
 
 	case ESP01ATCONNECTED:
-		// <<< debug: máquina en ESP01ATCONNECTED con UDP >>>
-		if (strcmp(esp01PROTO, "UDP")==0 && aDbgStr) {
-			aDbgStr(">>> DEBUG: DOConnection en ESP01ATCONNECTED (UDP vivo)\r\n");
-		}
-
 		// si perdimos wifi o la conexión UDP, reintenta
 		if (!esp01Flags.bit.WIFICONNECTED) {
 			esp01ATSate = ESP01ATAT;
 		} else if (!esp01Flags.bit.UDPTCPCONNECTED) {
-			esp01ATSate = ESP01ATCIPCLOSE;
+			if (strcmp(esp01PROTO, "UDP") == 0)
+				esp01ATSate = ESP01ATPREPUDP;
+			else
+				esp01ATSate = ESP01ATCIPCLOSE;
 		} else {
 			esp01TimeoutTask = 0;
 		}

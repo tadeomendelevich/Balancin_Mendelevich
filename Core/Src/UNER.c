@@ -562,7 +562,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
         case CHANGE_DISPLAY:
             if (p_change_display != NULL) {
-                *p_change_display = (*p_change_display + 1) % 5;
+                *p_change_display = (*p_change_display + 1) % 6;
                 putHeaderOnTx(dataTx, CHANGE_DISPLAY, 2);
                 putByteOnTx(dataTx, ACK);
                 putByteOnTx(dataTx, dataTx->chk);

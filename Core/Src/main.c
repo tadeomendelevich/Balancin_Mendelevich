@@ -110,7 +110,6 @@ typedef enum {
 #define ALPHA 0.98f
 #define DT_CTRL_FIXED 0.010f
 
-
 // LOGGING MACROS
 #define LOG_ENABLE 1
 #define LOG_DECIM  5		// Frecuencia de envio de log csv mediante USB
@@ -144,7 +143,11 @@ typedef enum {
 #define BRAKE_TILT_STEP_BAL     0.5f
 #define BRAKE_TILT_STEP_MAN     0.3f
 #define INTEGRAL_DECAY   		0.990f
-#define KV_LINE_BRAKE 	 		0.10f
+#define KV_LINE_BRAKE 	 		10.0f
+#define LINE_DECAY_THRESHOLD    0.15f  // error por debajo del cual se considera "buen seguimiento"
+#define LINE_DECAY_STEP_DOWN    0.09f // reducción por ciclo (~3.5s de 1.0 a 0.3 a 100Hz)
+#define LINE_DECAY_STEP_UP      0.020f // recuperación por ciclo (~0.35s de 0.3 a 1.0)
+#define LINE_DECAY_MIN_SCALE    -0.30f  // escala mínima permitida (30% del ángulo máximo)
 
 #define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
 #define LINE_LOST_STEERING     12.0f // steering suave para cuando recién se pierde la línea
@@ -285,7 +288,7 @@ float KP_LINE = 15.0f;
 float KD_LINE = 2.0f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;
-float LINE_ANGLE = 1.0f;  // Base inclination (degrees) for forward movement
+float LINE_ANGLE = 0.7f;  // Base inclination (degrees) for forward movement
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
@@ -304,6 +307,8 @@ static uint8_t  key_click_count = 0;
 
 static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
+static float line_speed_scale       = 1.0f;  // decaimiento de velocidad por buen seguimiento
+static float line_error_disp        = 0.0f;  // último error de línea, para mostrar en pantalla
 static float pwm_sat_prev = 0.0f;
 static float prev_error = 0.0f;
 static uint8_t balance_hold_active = 0;
@@ -1553,6 +1558,24 @@ void updateDisplay(void) {
                 }
             }
 
+            // --- error de línea ---
+            {
+                char buf[10];
+                float v = line_error_disp;
+                uint8_t neg = (v < 0.0f);
+                if (neg) v = -v;
+                uint32_t vi = (uint32_t)v;
+                uint32_t vd = (uint32_t)((v - vi) * 100.0f + 0.5f);
+                if (vd >= 100) { vd = 0; vi++; }
+                snprintf(buf, sizeof(buf), "LE:%c%lu.%02lu", neg ? '-' : '+',
+                         (unsigned long)vi, (unsigned long)vd);
+                uint16_t x = 62;
+                for (char *p = buf; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, 52);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
+
             // --- spinner abajo a la derecha ---
             {
                 const uint16_t sx = 118;
@@ -1975,6 +1998,7 @@ static void ControlStep10ms(void)
                     last_line_dir = -1.0f;
                 }
             }
+            line_error_disp = line_error;
 
             float abs_line_error = fabsf(line_error);
             float forward_factor = 1.0f - (abs_line_error / 0.5f);
@@ -1986,6 +2010,15 @@ static void ControlStep10ms(void)
 
             if (line_angle_cmd > LINE_ANGLE) line_angle_cmd = LINE_ANGLE;
             if (line_angle_cmd < LINE_ANGLE_MIN) line_angle_cmd = LINE_ANGLE_MIN;
+
+            if (fabsf(line_error) < LINE_DECAY_THRESHOLD) {
+                line_speed_scale -= LINE_DECAY_STEP_DOWN;
+                if (line_speed_scale < LINE_DECAY_MIN_SCALE) line_speed_scale = LINE_DECAY_MIN_SCALE;
+            } else {
+                line_speed_scale += LINE_DECAY_STEP_UP;
+                if (line_speed_scale > 1.0f) line_speed_scale = 1.0f;
+            }
+            line_angle_cmd *= line_speed_scale;
 
         } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
                    (robot_state == ROBOT_STATE_BALANCE_ONLY)) {
@@ -2012,7 +2045,8 @@ static void ControlStep10ms(void)
             base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
             brake_setpoint_f    = 0.0f;
             line_lost_ms        = HAL_GetTick();
-            line_angle_ramped     = 0.0f;
+            line_angle_ramped   = 0.0f;
+            line_speed_scale    = 1.0f;
         }
 
         if (robot_state == ROBOT_STATE_IDLE && prev_robot_state != ROBOT_STATE_IDLE) {
@@ -2333,42 +2367,27 @@ static void ControlStep10ms(void)
             if (d_term < -15.0f) d_term = -15.0f;
 
             {
-                const uint8_t is_balance_mode =
-                    (robot_state == ROBOT_STATE_BALANCE_ONLY) ||
-                    (robot_state == ROBOT_STATE_BALANCE_AND_SPEED);
+                float abs_error = fabsf(error);
+                float abs_gyro  = fabsf(gyro_f);
                 float balance_pi_scale = 1.0f;
                 float balance_d_scale  = 1.0f;
 
-                if (is_balance_mode) {
-                    float abs_error = fabsf(error);
-                    float abs_gyro  = fabsf(gyro_f);
-
-                    if (!balance_hold_active) {
-                        if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
-                            abs_gyro  <= BALANCE_HOLD_ENTER_GYRO_DPS)
-                            balance_hold_active = 1;
-                    } else {
-                        if (abs_error >= BALANCE_HOLD_EXIT_ANGLE_DEG ||
-                            abs_gyro  >= BALANCE_HOLD_EXIT_GYRO_DPS)
-                            balance_hold_active = 0;
-                    }
-
-                    if (balance_hold_active) {
-                        // Zona muerta: silencia P y D, drena I suavemente
-                        balance_pi_scale = 0.0f;
-                        balance_d_scale  = 0.0f;
-                        integral *= 0.98f;
-                    } else {
-                        // Zona de transición suave hacia PID completo
-                        float x = abs_error / SOFT_ZONE_ANGLE_DEG;
-                        if (x > 1.0f) x = 1.0f;
-                        balance_pi_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;
-                        balance_d_scale  = balance_pi_scale;
-                    }
+                if (!balance_hold_active) {
+                    if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
+                        abs_gyro  <= BALANCE_HOLD_ENTER_GYRO_DPS)
+                        balance_hold_active = 1;
                 } else {
-                    balance_hold_active = 0;
-                    // Modos sin hold: soft zone estándar
-                    float x = fabsf(control_error) / SOFT_ZONE_ANGLE_DEG;
+                    if (abs_error >= BALANCE_HOLD_EXIT_ANGLE_DEG ||
+                        abs_gyro  >= BALANCE_HOLD_EXIT_GYRO_DPS)
+                        balance_hold_active = 0;
+                }
+
+                if (balance_hold_active) {
+                    balance_pi_scale = 0.0f;
+                    balance_d_scale  = 0.0f;
+                    integral *= 0.98f;
+                } else {
+                    float x = abs_error / SOFT_ZONE_ANGLE_DEG;
                     if (x > 1.0f) x = 1.0f;
                     balance_pi_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;
                     balance_d_scale  = balance_pi_scale;
@@ -2376,7 +2395,6 @@ static void ControlStep10ms(void)
 
                 p_term *= balance_pi_scale;
                 d_term *= balance_d_scale;
-                // i_term sin escalar en output (solo se drena arriba cuando hold_active)
             }
 
             output = p_term + i_term + d_term;
@@ -2532,8 +2550,8 @@ static void ControlStep10ms(void)
                             line_lost_ms    = HAL_GetTick();
                             line_state      = LINE_STATE_FOLLOWING;
                         } else {
-                            float target = last_line_dir * 6.0f;
-                            steering_adjustment += 0.02f * (target - steering_adjustment);
+                            steering_adjustment *= 0.85f;
+                            if (fabsf(steering_adjustment) < 0.1f) steering_adjustment = 0.0f;
                         }
                         break;
                 }
