@@ -101,8 +101,8 @@ typedef enum {
 #define SOFT_ZONE_ANGLE_DEG   1.50f   // error a partir del cual el PID va al 100%
 #define SOFT_ZONE_MIN_SCALE   0.15f   // escala mínima cuando el error es ~0
 // Zona de hold con histéresis: silencia PID en el punto dulce de equilibrio
-#define BALANCE_HOLD_ENTER_ANGLE_DEG  0.60f  // entra en hold si |error| <= este valor
-#define BALANCE_HOLD_EXIT_ANGLE_DEG   0.50f  // sale de hold si |error| >= este valor
+#define BALANCE_HOLD_ENTER_ANGLE_DEG  0.50f  // entra en hold si |error| <= este valor
+#define BALANCE_HOLD_EXIT_ANGLE_DEG   0.90f  // sale de hold si |error| >= este valor
 #define BALANCE_HOLD_ENTER_GYRO_DPS   4.0f   // entra en hold si |gyro| <= este valor
 #define BALANCE_HOLD_EXIT_GYRO_DPS    10.0f  // sale de hold si |gyro| >= este valor
 
@@ -128,26 +128,26 @@ typedef enum {
 
 #define MOTOR_RIGHT_DEADBAND  	1   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
 #define KV_BRAKE                0.0f  // ganancia base (velocidad baja)
-#define KV_BRAKE_STRONG         3.0f  // ganancia extra por encima del umbral
+#define KV_BRAKE_STRONG         8.0f  // ganancia extra por encima del umbral
 #define BRAKE_VEL_THRESHOLD     1.5f  // velocidad a partir de la cual se aplica el freno fuerte
 #define VEL_DECAY        		0.999f
 #define VEL_DECAY_ACCEL  		0.97f   // decay del integrador del acelerómetro
 
 #define VEL_CF_ALPHA     		0.0f    // peso del giroscopio en el filtro complementario (1=solo gyro, 0=solo accel)
 #define VEL_ACCEL_SCALE  		30.0f   // escala para igualar m/s del accel con unidades del gyro
-#define VEL_LPF_BETA     		0.15f   // más filtrado → menos spikes de velocidad
+#define VEL_LPF_BETA     		0.35f
 #define BRAKE_VEL_DEADBAND      0.05f
 #define BRAKE_VEL_MAX           4.0f
-#define BRAKE_TILT_MAX          1.0f
+#define BRAKE_TILT_MAX          3.0f
 #define BRAKE_TILT_MAX_MANUAL   3.0f
-#define BRAKE_TILT_STEP_BAL     0.1f  // rampa lenta → sin patada
+#define BRAKE_TILT_STEP_BAL     0.5f
 #define BRAKE_TILT_STEP_MAN     0.3f
 #define INTEGRAL_DECAY   		0.990f
 #define KV_LINE_BRAKE 	 		10.0f
 #define LINE_DECAY_THRESHOLD    0.4f  // error por debajo del cual se considera "buen seguimiento"
 #define LINE_DECAY_STEP_DOWN    0.09f // reducción por ciclo (~3.5s de 1.0 a 0.3 a 100Hz)
 #define LINE_DECAY_STEP_UP      0.020f // decaimiento extra por ciclo cuando el error es grande
-#define LINE_DECAY_MIN_SCALE    0.3f    // escala mínima: mantiene 30% del ángulo de avance al seguir bien la línea
+#define LINE_DECAY_MIN_SCALE    -0.10f  // escala mínima permitida (30% del ángulo máximo)
 
 #define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
 #define LINE_LOST_STEERING     12.0f // steering suave para cuando recién se pierde la línea
