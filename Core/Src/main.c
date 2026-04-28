@@ -94,7 +94,7 @@ typedef enum {
 // PID
 #define KP     		4.0f   // Ganancia proporcional en PWM directo
 #define KD     		0.12f   // Ganancia derivativa en PWM/(deg/s)
-#define KI    		0.025f   // Ganancia integral en PWM/(deg*s)
+#define KI    		0.1f   // Ganancia integral en PWM/(deg*s)
 
 #define SETPOINT_ANGLE 	0.0f
 
@@ -128,7 +128,7 @@ typedef enum {
 
 #define MOTOR_RIGHT_DEADBAND  	1   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
 #define KV_BRAKE                0.0f  // ganancia base (velocidad baja)
-#define KV_BRAKE_STRONG         20.0f  // ganancia extra por encima del umbral
+#define KV_BRAKE_STRONG         8.0f  // ganancia extra por encima del umbral
 #define BRAKE_VEL_THRESHOLD     1.5f  // velocidad a partir de la cual se aplica el freno fuerte
 #define VEL_DECAY        		0.999f
 #define VEL_DECAY_ACCEL  		0.97f   // decay del integrador del acelerómetro
@@ -138,16 +138,16 @@ typedef enum {
 #define VEL_LPF_BETA     		0.35f
 #define BRAKE_VEL_DEADBAND      0.05f
 #define BRAKE_VEL_MAX           4.0f
-#define BRAKE_TILT_MAX          6.0f
+#define BRAKE_TILT_MAX          3.0f
 #define BRAKE_TILT_MAX_MANUAL   3.0f
 #define BRAKE_TILT_STEP_BAL     0.5f
 #define BRAKE_TILT_STEP_MAN     0.3f
 #define INTEGRAL_DECAY   		0.990f
 #define KV_LINE_BRAKE 	 		10.0f
-#define LINE_DECAY_THRESHOLD    0.15f  // error por debajo del cual se considera "buen seguimiento"
+#define LINE_DECAY_THRESHOLD    0.4f  // error por debajo del cual se considera "buen seguimiento"
 #define LINE_DECAY_STEP_DOWN    0.09f // reducción por ciclo (~3.5s de 1.0 a 0.3 a 100Hz)
-#define LINE_DECAY_STEP_UP      0.020f // recuperación por ciclo (~0.35s de 0.3 a 1.0)
-#define LINE_DECAY_MIN_SCALE    -0.30f  // escala mínima permitida (30% del ángulo máximo)
+#define LINE_DECAY_STEP_UP      0.020f // decaimiento extra por ciclo cuando el error es grande
+#define LINE_DECAY_MIN_SCALE    -0.10f  // escala mínima permitida (30% del ángulo máximo)
 
 #define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
 #define LINE_LOST_STEERING     12.0f // steering suave para cuando recién se pierde la línea
@@ -155,6 +155,19 @@ typedef enum {
 
 #define DISPLAY_UPDATE_INTERVAL_IDLE_MS    100U
 #define DISPLAY_UPDATE_INTERVAL_ACTIVE_MS   60U
+
+// Bias hardcodeado del MPU — descomenta MPU_USE_FIXED_BIAS y reemplaza los valores
+// con los que imprimió "BIAS ax=... ay=... az=... gx=... gy=... gz=..." por USB.
+// Mientras esté comentado, el robot calibra en cada arranque (requiere estar en balance).
+#define MPU_USE_FIXED_BIAS
+#ifdef MPU_USE_FIXED_BIAS
+#define FIXED_BIAS_AX    -46
+#define FIXED_BIAS_AY    4400	//4650
+#define FIXED_BIAS_AZ    1980
+#define FIXED_BIAS_GX    -441
+#define FIXED_BIAS_GY    -107
+#define FIXED_BIAS_GZ    -54
+#endif
 
 /* USER CODE END PD */
 
@@ -226,13 +239,13 @@ volatile uint16_t espUSBBufIw, espUSBBufIr;
 //const char *wifiPassword = "fcalconcordia.06-2019";
 //const char *wifiIp = "172.23.205.98";
 
-//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-//const char *wifiPassword = "djg19dlk";
-//const char *wifiIp 		 = "192.168.100.5";
+const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+const char *wifiPassword = "djg19dlk";
+const char *wifiIp 		 = "192.168.100.5";
 
-const char *wifiSSID     = "Delco_Mendelevich";
-const char *wifiPassword = "toyotakia";
-const char *wifiIp = "192.168.1.55";
+//const char *wifiSSID     = "Delco_Mendelevich";
+//const char *wifiPassword = "toyotakia";
+//const char *wifiIp = "192.168.1.55";
 
 //const char *wifiSSID     = "Wifi Habitaciones";
 //const char *wifiPassword = "toyotakia";
@@ -288,7 +301,7 @@ float KP_LINE = 15.0f;
 float KD_LINE = 2.0f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;
-float LINE_ANGLE = 0.7f;  // Base inclination (degrees) for forward movement
+float LINE_ANGLE = 0.5f;  // Base inclination (degrees) for forward movement
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
@@ -1951,6 +1964,13 @@ static void ControlStep10ms(void)
 
         float accel_ang_deg = ANG_SIGN * (atan2f((float)ay, (float)az) * (180.0f / M_PI));
 
+        // Inicialización del filtro en la primera muestra — evita que arranque en 0°
+        static uint8_t filter_init = 0;
+        if (!filter_init) {
+            filtered_roll_deg = accel_ang_deg;
+            filter_init = 1;
+        }
+
         // Filtro complementario (fusión gyro + accel)
         filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_ctrl)
                           + (1.0f - ALPHA) * accel_ang_deg;
@@ -2013,11 +2033,10 @@ static void ControlStep10ms(void)
 
             if (fabsf(line_error) < LINE_DECAY_THRESHOLD) {
                 line_speed_scale -= LINE_DECAY_STEP_DOWN;
-                if (line_speed_scale < LINE_DECAY_MIN_SCALE) line_speed_scale = LINE_DECAY_MIN_SCALE;
             } else {
-                line_speed_scale += LINE_DECAY_STEP_UP;
-                if (line_speed_scale > 1.0f) line_speed_scale = 1.0f;
+                line_speed_scale -= LINE_DECAY_STEP_UP;
             }
+            if (line_speed_scale < LINE_DECAY_MIN_SCALE) line_speed_scale = LINE_DECAY_MIN_SCALE;
             line_angle_cmd *= line_speed_scale;
 
         } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
@@ -2538,8 +2557,8 @@ static void ControlStep10ms(void)
                         } else if ((HAL_GetTick() - line_lost_ms) > LINE_LOST_TIMEOUT_MS) {
                             line_state = LINE_STATE_SEARCHING;
                         } else {
-                            float target = last_line_dir * 4.0f;
-                            steering_adjustment += 0.02f * (target - steering_adjustment);
+                            float target = last_line_dir * 2.0f;
+                            steering_adjustment += 0.008f * (target - steering_adjustment);
                         }
                         break;
 
@@ -2550,8 +2569,8 @@ static void ControlStep10ms(void)
                             line_lost_ms    = HAL_GetTick();
                             line_state      = LINE_STATE_FOLLOWING;
                         } else {
-                            steering_adjustment *= 0.85f;
-                            if (fabsf(steering_adjustment) < 0.1f) steering_adjustment = 0.0f;
+                            float target = last_line_dir * 6.0f;
+                            steering_adjustment += 0.02f * (target - steering_adjustment);
                         }
                         break;
                 }
@@ -2843,8 +2862,24 @@ int main(void)
       mpu_initialized = 1;
       USB_Debug("MPU INIT OK\r\n");
 
+#ifdef MPU_USE_FIXED_BIAS
+      MPU6050_SetBias(FIXED_BIAS_AX, FIXED_BIAS_AY, FIXED_BIAS_AZ,
+                      FIXED_BIAS_GX, FIXED_BIAS_GY, FIXED_BIAS_GZ);
+      USB_Debug("MPU BIAS FIJO OK\r\n");
+#else
+      HAL_Delay(500); // Espera que se estabilice el movimiento del switch de encendido
       MPU6050_Calibrate();
       USB_Debug("MPU CAL OK\r\n");
+      {
+          int32_t b_ax, b_ay, b_az, b_gx, b_gy, b_gz;
+          MPU6050_GetBias(&b_ax, &b_ay, &b_az, &b_gx, &b_gy, &b_gz);
+          char bias_buf[80];
+          int blen = snprintf(bias_buf, sizeof(bias_buf),
+              "BIAS ax=%ld ay=%ld az=%ld gx=%ld gy=%ld gz=%ld\r\n",
+              b_ax, b_ay, b_az, b_gx, b_gy, b_gz);
+          if (blen > 0) USB_DebugSend((uint8_t*)bias_buf, (uint16_t)blen);
+      }
+#endif
 
       mpu_req_pending = 1;
       USB_Debug("MPU first read request\r\n");
@@ -2880,7 +2915,6 @@ int main(void)
   // Use raw bit 0 if DWT_CTRL_CYCCNT_Msk is not defined (standard for Cortex-M4)
   DWT->CTRL |= 1;
 
-  HAL_Delay(500);
   /* USER CODE END 2 */
 
   /* Infinite loop */

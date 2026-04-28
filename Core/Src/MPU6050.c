@@ -15,7 +15,7 @@
 #define GYRO_SENS         131     // LSB por °/s
 #define ACCEL_SCALE_C     981     // 9.81 m/s² × 100 (centésimas)
 #define GYRO_SCALE_C      100     // 1.00 °/s × 100
-#define CALIB_SAMPLES  	  500
+#define CALIB_SAMPLES  	  30
 // Puntero a la implementación de plataforma
 static const MPU6050_Platform_t *_platform = NULL;
 
@@ -157,36 +157,48 @@ void MPU6050_Calibrate(void) {
     int32_t sum_gx=0, sum_gy=0, sum_gz=0;
     int16_t raw_ax, raw_ay, raw_az;
     int16_t raw_gx, raw_gy, raw_gz;
-    uint8_t buf[14]; // 14 bytes: 6 accel + 2 temp + 6 gyro
+    uint8_t buf[14];
 
     for (int i = 0; i < CALIB_SAMPLES; ++i) {
-        // 1) Lee acelerómetro, temp y giroscopio RAW en una sola transacción I2C
         _platform->readReg(_platform->ctx, MPU6050_ADDR, ACCEL_XOUT_H_REG, buf, 14);
-
         raw_ax = (int16_t)(buf[0]<<8 | buf[1]);
         raw_ay = (int16_t)(buf[2]<<8 | buf[3]);
         raw_az = (int16_t)(buf[4]<<8 | buf[5]);
         sum_ax += raw_ax;
         sum_ay += raw_ay;
         sum_az += raw_az;
-
-        // bytes 6 y 7 son temperatura (se ignoran)
-
         raw_gx = (int16_t)(buf[8]<<8 | buf[9]);
         raw_gy = (int16_t)(buf[10]<<8 | buf[11]);
         raw_gz = (int16_t)(buf[12]<<8 | buf[13]);
         sum_gx += raw_gx;
         sum_gy += raw_gy;
         sum_gz += raw_gz;
-
         _platform->delayMs(_platform->ctx, 1);
     }
-    // 2) Guarda sesgos promedio (en LSB)
     bias_ax = sum_ax / CALIB_SAMPLES;
     bias_ay = sum_ay / CALIB_SAMPLES;
-    // Para Z restamos 1g en LSB:
     bias_az = sum_az / CALIB_SAMPLES - ACCEL_SENS;
     bias_gx = sum_gx / CALIB_SAMPLES;
     bias_gy = sum_gy / CALIB_SAMPLES;
     bias_gz = sum_gz / CALIB_SAMPLES;
+}
+
+void MPU6050_GetBias(int32_t *bax, int32_t *bay, int32_t *baz,
+                     int32_t *bgx, int32_t *bgy, int32_t *bgz) {
+    if (bax) *bax = bias_ax;
+    if (bay) *bay = bias_ay;
+    if (baz) *baz = bias_az;
+    if (bgx) *bgx = bias_gx;
+    if (bgy) *bgy = bias_gy;
+    if (bgz) *bgz = bias_gz;
+}
+
+void MPU6050_SetBias(int32_t bax, int32_t bay, int32_t baz,
+                     int32_t bgx, int32_t bgy, int32_t bgz) {
+    bias_ax = bax;
+    bias_ay = bay;
+    bias_az = baz;
+    bias_gx = bgx;
+    bias_gy = bgy;
+    bias_gz = bgz;
 }

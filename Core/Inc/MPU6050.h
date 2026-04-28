@@ -124,4 +124,10 @@ void MPU6050_RegisterPlatform(MPU6050_Platform_t *plat);
 
 void MPU6050_Calibrate(void);
 
+void MPU6050_GetBias(int32_t *bax, int32_t *bay, int32_t *baz,
+                     int32_t *bgx, int32_t *bgy, int32_t *bgz);
+
+void MPU6050_SetBias(int32_t bax, int32_t bay, int32_t baz,
+                     int32_t bgx, int32_t bgy, int32_t bgz);
+
 #endif /* MPU6050_H_ */
