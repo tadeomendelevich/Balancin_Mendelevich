@@ -143,6 +143,13 @@ typedef enum {
 #define BRAKE_TILT_STEP_BAL     0.5f
 #define BRAKE_TILT_STEP_MAN     0.3f
 #define INTEGRAL_DECAY   		0.990f
+
+// Steering PID (lazo cerrado por encoders)
+#define STEER_KP        5.0f    // ajustar según respuesta real
+#define STEER_KI        0.2f
+#define STEER_KD        0.1f
+#define STEER_I_MAX    15.0f
+#define STEER_OUT_MAX  20.0f
 #define KV_LINE_BRAKE 	 		10.0f
 #define LINE_DECAY_THRESHOLD    0.4f  // error por debajo del cual se considera "buen seguimiento"
 #define LINE_DECAY_STEP_DOWN    0.09f // reducción por ciclo (~3.5s de 1.0 a 0.3 a 100Hz)
@@ -341,6 +348,13 @@ static uint32_t last_display_ms = 0;
 
 static volatile uint32_t mpu_irq_timestamp_us = 0;
 volatile uint8_t mpu_data_ready_for_ctrl = 0;
+
+volatile int32_t encoder_right = 0;
+volatile int32_t encoder_left  = 0;
+
+uint8_t steer_pid_enabled    = 0;     // 0 = open-loop (gyro Z), 1 = lazo cerrado encoders
+static float steer_pid_integral   = 0.0f;
+static float steer_pid_prev_error = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -397,6 +411,8 @@ void appOnESP01ChangeState(_eESP01STATUS state);
 void ProcessEspRxLimited(void);
 
 static void ControlStep10ms(void);
+static float ComputeSteeringPID(float speed_r, float speed_l, float sp);
+static void  SteeringPID_Reset(void);
 
 static inline uint32_t micros(void) {
     return DWT->CYCCNT / (SystemCoreClock / 1000000);
@@ -914,6 +930,24 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
             MPU6050_StartRead_DMA();
         }
     }
+
+    // Encoder RIGHT — PA8 es canal A
+    if (GPIO_Pin == GPIO_PIN_8)
+    {
+        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13);
+        uint8_t a = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
+        if (a == b) encoder_right++;
+        else        encoder_right--;
+    }
+
+    // Encoder LEFT — PB14 es canal A
+    if (GPIO_Pin == GPIO_PIN_14)
+    {
+        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_15);
+        uint8_t a = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14);
+        if (a == b) encoder_left++;
+        else        encoder_left--;
+    }
 }
 
 void calculate_tilt(int16_t ax, int16_t ay, int16_t az,
@@ -1037,6 +1071,36 @@ static float ComputeBrakeSetpointTarget(uint8_t state)
         brake_mag = -brake_mag;
 
     return clampf_local(brake_mag, -brake_tilt_max, brake_tilt_max);
+}
+
+static void SteeringPID_Reset(void)
+{
+    steer_pid_integral   = 0.0f;
+    steer_pid_prev_error = 0.0f;
+}
+
+// Calcula corrección de steering por lazo cerrado de encoders.
+// sp: diferencia de velocidad deseada en rps (0 = ir recto, >0 = girar a la derecha).
+// Retorna el valor de corrección equivalente a steering_adjustment / yaw_correction.
+// Convención de signo: positivo → rueda derecha más lenta → gira a la derecha.
+static float ComputeSteeringPID(float speed_r, float speed_l, float sp)
+{
+    float error = sp - (speed_r - speed_l);
+
+    float p = STEER_KP * error;
+
+    steer_pid_integral += error * DT_CTRL_FIXED;
+    if (steer_pid_integral >  STEER_I_MAX) steer_pid_integral =  STEER_I_MAX;
+    if (steer_pid_integral < -STEER_I_MAX) steer_pid_integral = -STEER_I_MAX;
+    float i = STEER_KI * steer_pid_integral;
+
+    float d = STEER_KD * (error - steer_pid_prev_error) / DT_CTRL_FIXED;
+    steer_pid_prev_error = error;
+
+    float out = p + i + d;
+    if (out >  STEER_OUT_MAX) out =  STEER_OUT_MAX;
+    if (out < -STEER_OUT_MAX) out = -STEER_OUT_MAX;
+    return out;
 }
 
 static void FormatSignedFixed(char *buf, size_t buf_size, float value, uint8_t decimals)
@@ -1927,6 +1991,38 @@ static void ControlStep10ms(void)
 		MPU6050_GetAccel(&ax, &ay, &az);
 		MPU6050_GetGyro(&gx, &gy, &gz);
 
+		// Encoder speed — leer y resetear conteos cada ciclo de control
+		static int32_t enc_right_prev = 0;
+		static int32_t enc_left_prev  = 0;
+		__disable_irq();
+		int32_t enc_r = encoder_right;
+		int32_t enc_l = encoder_left;
+		__enable_irq();
+		int32_t delta_right = enc_r - enc_right_prev;
+		int32_t delta_left  = enc_l - enc_left_prev;
+		enc_right_prev = enc_r;
+		enc_left_prev  = enc_l;
+		#define ENC_CPR       12     // conteos por revolución — ajustar al encoder usado
+		#define ENC_VEL_SCALE  0.17750f  // 2π × r_rueda = 2π × 0.02825 m (diámetro 5.65 cm) → m/s
+		float speed_right_rps = (float)delta_right / (ENC_CPR * DT_CTRL_FIXED);
+		float speed_left_rps  = (float)delta_left  / (ENC_CPR * DT_CTRL_FIXED);
+
+		// Velocidad real promedio de ambas ruedas → reemplaza la estimación accel+gyro
+		float vel_enc = ((speed_right_rps + speed_left_rps) * 0.5f) * ENC_VEL_SCALE;
+		vel_enc = clampf_local(vel_enc, -20.0f, 20.0f);
+		velocity_est    = vel_enc;
+		velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+
+		// Steering PID de lazo cerrado: disponible mientras speed_r/l están en scope.
+		// steer_correction se usa en la sección de motores BALANCE más adelante.
+		static float steer_correction = 0.0f;
+		if (steer_pid_enabled) {
+		    steer_correction = ComputeSteeringPID(speed_right_rps, speed_left_rps, 0.0f);
+		} else {
+		    steer_correction = 0.0f;
+		    SteeringPID_Reset();
+		}
+
 		// -------------------------------------------------------
 		// TIMING — usar timestamp real del IRQ del MPU
 		// -------------------------------------------------------
@@ -1989,7 +2085,7 @@ static void ControlStep10ms(void)
         const float ADC_BETA = 0.8f;
 
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-            UpdateVelocityEstimate(gyro_f, dt_ctrl, filtered_roll_deg * ((float)M_PI / 180.0f), ay);
+            // velocity_est ya actualizado desde encoders al inicio del ciclo
 
             adc_f[0] += ADC_BETA * ((float)adcValues[0] - adc_f[0]);
             adc_f[1] += ADC_BETA * ((float)adcValues[1] - adc_f[1]);
@@ -2041,7 +2137,7 @@ static void ControlStep10ms(void)
 
         } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
                    (robot_state == ROBOT_STATE_BALANCE_ONLY)) {
-            UpdateVelocityEstimate(gyro_f, dt_ctrl, filtered_roll_deg * ((float)M_PI / 180.0f), ay);
+            // velocity_est ya actualizado desde encoders al inicio del ciclo
         }
 
         // -------------------------------------------------------
@@ -2187,7 +2283,7 @@ static void ControlStep10ms(void)
                 manual_setpoint_ramped += (ramp_delta > 0.0f) ? ramp_rate : -ramp_rate;
             }
 
-            UpdateVelocityEstimate(gyro_f, dt_ctrl, filtered_roll_deg * ((float)M_PI / 180.0f), ay);
+            // velocity_est ya actualizado desde encoders al inicio del ciclo
             base_setpoint_target  = manual_setpoint_ramped;
             brake_setpoint_target = ComputeBrakeSetpointTarget(robot_state);
         } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
@@ -2633,10 +2729,14 @@ static void ControlStep10ms(void)
                 line_state          = LINE_STATE_FOLLOWING;
 
                 float gz_dps = (float)gz / 131.0f;
-                float yaw_correction = -gz_dps * 0.3f;
+                // steer_pid_enabled=0: corrección open-loop por giroscopio Z (comportamiento original)
+                // steer_pid_enabled=1: corrección de lazo cerrado por encoders
+                float correction = steer_pid_enabled
+                                 ? steer_correction
+                                 : (-gz_dps * 0.3f);
 
-                float mR = pwm_sat + yaw_correction;
-                float mL = pwm_sat - yaw_correction;
+                float mR = pwm_sat + correction;
+                float mL = pwm_sat - correction;
 
                 if (mR >  100.0f) mR =  100.0f;
                 if (mR < -100.0f) mR = -100.0f;
@@ -3636,6 +3736,35 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* Encoder RIGHT — Canal A: PA8 (EXTI RISING+FALLING), Canal B: PB13 (input only) */
+  GPIO_InitStruct.Pin   = GPIO_PIN_8;
+  GPIO_InitStruct.Mode  = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull  = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin   = GPIO_PIN_13;
+  GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull  = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* Encoder LEFT — Canal A: PB14 (EXTI RISING+FALLING), Canal B: PB15 (input only) */
+  GPIO_InitStruct.Pin   = GPIO_PIN_14;
+  GPIO_InitStruct.Mode  = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull  = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin   = GPIO_PIN_15;
+  GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull  = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI9_5_IRQn para PA8 (encoder derecho canal A) */
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+  /* EXTI15_10_IRQn ya habilitado para MPU_INT (PB12) — también cubre PB14 (encoder izq canal A) */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }

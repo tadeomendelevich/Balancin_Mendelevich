@@ -216,6 +216,9 @@ Balancin_Mendelevich/
 | Fecha | Archivo(s) modificado(s) | Cambio realizado | Motivo / Observación |
 |-------|--------------------------|------------------|----------------------|
 | 2026-05-04 | CLAUDE.md | Lectura inicial completa del proyecto: hardware, periféricos, PID, protocolo UNER, arquitectura real de archivos | Primera documentación desde el código fuente |
+| 2026-05-07 | Core/Src/main.c | Agregado soporte de encoders por cuadratura vía EXTI: variables `encoder_right/left`, GPIO init PA8/PB13/PB14/PB15, callbacks EXTI y cálculo de `speed_right/left_rps` en `ControlStep10ms` | Medición real de velocidad de ruedas con encoders físicos |
+| 2026-05-07 | Core/Src/main.c | `velocity_est`/`velocity_est_f` ahora alimentados desde encoders (`vel_enc = promedio(speed_right_rps, speed_left_rps) × ENC_VEL_SCALE`). Eliminadas las 3 llamadas a `UpdateVelocityEstimate` (accel+gyro). Display "VE:" ya mostraba `velocity_est_f` sin cambios. `ENC_VEL_SCALE=0.17750f` (radio 2.825 cm). | Velocidad real de ruedas en lugar de estimación por fusión inercial |
+| 2026-05-07 | Core/Src/main.c | Agregada infraestructura para steering de lazo cerrado por encoders: `ComputeSteeringPID()`, `SteeringPID_Reset()`, flag `steer_pid_enabled`. Por defecto deshabilitado (=0, comportamiento idéntico al anterior con corrección por gyro Z). Activar con `steer_pid_enabled=1` y ajustar `STEER_KP/KI/KD`. | Base para control de dirección preciso usando diferencia de velocidades de encoders |
 
 ---
 
