@@ -150,15 +150,19 @@ typedef enum {
 #define STEER_KD        0.1f
 #define STEER_I_MAX    15.0f
 #define STEER_OUT_MAX  20.0f
-#define KV_LINE_BRAKE 	 		10.0f
-#define LINE_DECAY_THRESHOLD    0.4f  // error por debajo del cual se considera "buen seguimiento"
-#define LINE_DECAY_STEP_DOWN    0.09f // reducción por ciclo (~3.5s de 1.0 a 0.3 a 100Hz)
-#define LINE_DECAY_STEP_UP      0.020f // decaimiento extra por ciclo cuando el error es grande
-#define LINE_DECAY_MIN_SCALE    -0.10f  // escala mínima permitida (30% del ángulo máximo)
+// Velocity PI (lazo externo de velocidad en seguimiento de línea)
+#define LINE_VEL_KP             2.5f   // ganancia proporcional vel PI
+#define LINE_VEL_KI             0.8f   // ganancia integral vel PI
+#define LINE_VEL_I_MAX          3.0f   // anti-windup vel PI
+// Inner steering PI (lazo cerrado con encoder diferencial)
+#define LINE_STEER_ENC_SCALE    0.12f  // escala steering_cmd [PWM] → diff_sp [rps]
+#define LINE_STEER_MAX_RPS      2.0f   // límite del setpoint diferencial
+#define LINE_STEER_FB_KP        5.0f   // inner steering PI — P
+#define LINE_STEER_FB_KI        0.2f   // inner steering PI — I
+#define LINE_STEER_FB_I_MAX     8.0f   // anti-windup inner steering
 
-#define LINE_LOST_TIMEOUT_MS   2000// ms sin línea antes de entrar en búsqueda
-#define LINE_LOST_STEERING     12.0f // steering suave para cuando recién se pierde la línea
-#define LINE_ANGLE_MIN  	   0.00f
+#define LINE_LOST_TIMEOUT_MS   2000    // ms sin línea antes de entrar en búsqueda
+#define LINE_LOST_STEERING     12.0f   // steering suave para cuando recién se pierde la línea
 
 #define DISPLAY_UPDATE_INTERVAL_IDLE_MS    100U
 #define DISPLAY_UPDATE_INTERVAL_ACTIVE_MS   60U
@@ -169,7 +173,7 @@ typedef enum {
 #define MPU_USE_FIXED_BIAS
 #ifdef MPU_USE_FIXED_BIAS
 #define FIXED_BIAS_AX    -46
-#define FIXED_BIAS_AY    4850	//4650
+#define FIXED_BIAS_AY    4950	// + = adelante, - = atras
 #define FIXED_BIAS_AZ    1980
 #define FIXED_BIAS_GX    -441
 #define FIXED_BIAS_GY    -107
@@ -308,7 +312,8 @@ float KP_LINE = 15.0f;
 float KD_LINE = 2.0f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;
-float LINE_ANGLE = 0.5f;  // Base inclination (degrees) for forward movement
+float LINE_ANGLE = 0.5f;        // inclinación máxima (°) para avanzar en seguimiento de línea
+float LINE_SPEED_TARGET = 0.8f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
@@ -327,7 +332,10 @@ static uint8_t  key_click_count = 0;
 
 static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
-static float line_speed_scale       = 1.0f;  // decaimiento de velocidad por buen seguimiento
+static float line_vel_integral      = 0.0f;  // integral del PI de velocidad (idea 1)
+static float line_steer_fb_int      = 0.0f;  // integral del inner steering PI (idea 2)
+static float speed_right_rps_s      = 0.0f;  // velocidad rueda derecha, accesible fuera del bloque encoder
+static float speed_left_rps_s       = 0.0f;  // velocidad rueda izquierda, accesible fuera del bloque encoder
 static float line_error_disp        = 0.0f;  // último error de línea, para mostrar en pantalla
 static float pwm_sat_prev = 0.0f;
 static float prev_error = 0.0f;
@@ -2028,6 +2036,8 @@ static void ControlStep10ms(void)
 		vel_enc = clampf_local(vel_enc, -20.0f, 20.0f);
 		velocity_est    = vel_enc;
 		velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+		speed_right_rps_s = speed_right_rps;
+		speed_left_rps_s  = speed_left_rps;
 
 		// Steering PID de lazo cerrado: disponible mientras speed_r/l están en scope.
 		// steer_correction se usa en la sección de motores BALANCE más adelante.
@@ -2132,24 +2142,20 @@ static void ControlStep10ms(void)
             }
             line_error_disp = line_error;
 
-            float abs_line_error = fabsf(line_error);
-            float forward_factor = 1.0f - (abs_line_error / 0.5f);
+            // Idea 3: velocidad deseada cae cuadráticamente con el error de línea
+            // — frenada agresiva al entrar en curva, recuperación suave al salir
+            float speed_factor = fmaxf(0.0f, 1.0f - fabsf(line_error) / 0.45f);
+            speed_factor *= speed_factor;
+            float desired_vel = line_detected ? (LINE_SPEED_TARGET * speed_factor) : 0.0f;
 
-            if (forward_factor > 1.0f) forward_factor = 1.0f;
-            if (forward_factor < 0.0f) forward_factor = 0.0f;
-
-            line_angle_cmd = LINE_ANGLE_MIN + (LINE_ANGLE - LINE_ANGLE_MIN) * forward_factor;
-
-            if (line_angle_cmd > LINE_ANGLE) line_angle_cmd = LINE_ANGLE;
-            if (line_angle_cmd < LINE_ANGLE_MIN) line_angle_cmd = LINE_ANGLE_MIN;
-
-            if (fabsf(line_error) < LINE_DECAY_THRESHOLD) {
-                line_speed_scale -= LINE_DECAY_STEP_DOWN;
-            } else {
-                line_speed_scale -= LINE_DECAY_STEP_UP;
-            }
-            if (line_speed_scale < LINE_DECAY_MIN_SCALE) line_speed_scale = LINE_DECAY_MIN_SCALE;
-            line_angle_cmd *= line_speed_scale;
+            // Idea 1: PI de velocidad → inclinación de avance
+            float vel_error = desired_vel - velocity_est_f;
+            line_vel_integral += vel_error * DT_CTRL_FIXED;
+            line_vel_integral = clampf_local(line_vel_integral, -LINE_VEL_I_MAX, LINE_VEL_I_MAX);
+            line_angle_cmd = clampf_local(
+                LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral,
+                -LINE_ANGLE, LINE_ANGLE
+            );
 
         } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
                    (robot_state == ROBOT_STATE_BALANCE_ONLY)) {
@@ -2170,6 +2176,10 @@ static void ControlStep10ms(void)
             velocity_est        = 0.0f;
             velocity_est_f      = 0.0f;
             vel_from_accel      = 0.0f;
+            line_vel_integral   = 0.0f;
+            line_steer_fb_int   = 0.0f;
+            speed_right_rps_s   = 0.0f;
+            speed_left_rps_s    = 0.0f;
             line_state          = LINE_STATE_FOLLOWING;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
@@ -2177,7 +2187,6 @@ static void ControlStep10ms(void)
             brake_setpoint_f    = 0.0f;
             line_lost_ms        = HAL_GetTick();
             line_angle_ramped   = 0.0f;
-            line_speed_scale    = 1.0f;
         }
 
         if (robot_state == ROBOT_STATE_IDLE && prev_robot_state != ROBOT_STATE_IDLE) {
@@ -2226,10 +2235,8 @@ static void ControlStep10ms(void)
             float line_target_angle = 0.0f;
 
             if (line_state == LINE_STATE_FOLLOWING && line_detected) {
-                float speed_brake = KV_LINE_BRAKE * velocity_est_f;
-                // error=0 → +LINE_ANGLE, error=0.5 → 0, error=1.0 → -LINE_ANGLE (frena activo)
-                line_target_angle = line_angle_cmd * (1.0f - 2.0f * fabsf(line_error)) - speed_brake;
-                if (line_target_angle < -LINE_ANGLE) line_target_angle = -LINE_ANGLE;
+                // Idea 1: el PI de velocidad ya regula la inclinación correcta
+                line_target_angle = line_angle_cmd;
             } else {
                 line_target_angle = 0.0f;
             }
@@ -2639,8 +2646,27 @@ static void ControlStep10ms(void)
                             }
                             line_error_prev = line_error_f_d;
 
-                            float steering_target = p_line + i_line + d_line;
-                            steering_adjustment = steering_target;
+                            float steering_cmd = p_line + i_line + d_line;
+
+                            // Idea 2: convertir steering_cmd a setpoint diferencial y
+                            // cerrar el lazo con velocidad real de encoders
+                            float diff_sp = clampf_local(
+                                steering_cmd * LINE_STEER_ENC_SCALE,
+                                -LINE_STEER_MAX_RPS, LINE_STEER_MAX_RPS
+                            );
+                            // diff_actual: positivo → rueda der. más rápida → gira a la izquierda
+                            // Si la respuesta oscila, negar diff_actual
+                            float diff_actual = speed_right_rps_s - speed_left_rps_s;
+                            float diff_err = diff_sp - diff_actual;
+                            if (!late_cycle) {
+                                line_steer_fb_int += diff_err * dt_ctrl;
+                                line_steer_fb_int = clampf_local(line_steer_fb_int,
+                                    -LINE_STEER_FB_I_MAX, LINE_STEER_FB_I_MAX);
+                            }
+                            steering_adjustment = clampf_local(
+                                LINE_STEER_FB_KP * diff_err + LINE_STEER_FB_KI * line_steer_fb_int,
+                                -20.0f, 20.0f
+                            );
 
                             log_p_line = p_line;
                             log_i_line = i_line;

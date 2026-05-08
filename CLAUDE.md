@@ -199,7 +199,7 @@ Balancin_Mendelevich/
 - Comunicación WiFi UDP via ESP-01 con watchdog y reconexión automática
 - Telemetría en tiempo real: CSV por USB (~20 Hz) y binario por WiFi (~10 Hz)
 - Tuneo en tiempo real de Kp, Ki, Kd, setpoint, steering desde Qt
-- Seguidor de línea con 8 sensores ADC, PID de línea (Kp=15, Kd=2, Ki=0)
+- Seguidor de línea con 8 sensores ADC, PID de línea (Kp=15, Kd=2, Ki=0), velocidad en lazo cerrado y steering con encoder feedback
 - Control manual remoto (FORWARD/BACKWARD/LEFT/RIGHT/STOP)
 - Freno dinámico por velocidad de encoders (KV_BRAKE_STRONG=5.0, umbral 1.5 m/s)
 - Detección de caída y recuperación con histéresis
@@ -230,6 +230,7 @@ Balancin_Mendelevich/
 | 2026-05-08 | Core/Src/main.c | Masking anti-storm en callback de encoders: tras cada pulso se enmascara el EXTI (`EXTI->IMR &= ~pin`). TIM5 (2ms) re-habilita todos los pines del encoder. Limita a 500 Hz max por canal | Previene freeze por rafagas de interrupciones del encoder |
 | 2026-05-08 | Core/Src/main.c | Encoder 4x quadrature: PB13 y PB15 pasan de input mudo a EXTI RISING+FALLING. Callback maneja 4 canales: A con `(a==b)`, B con `(a!=b)`. `ENC_CPR` 12→24. TIM5 re-habilita los 4 pines | Duplica resolución efectiva: de 12 a 24 conteos/rev |
 | 2026-05-08 | Core/Src/main.c | `KV_BRAKE` puesto en 0.0f (base velocidad baja). `KV_BRAKE_STRONG` ajustado a 5.0f (era 8.0f). `KV_brake_value` inicializado a `KV_BRAKE_STRONG`. Slider "KV" en Qt controla `KV_brake_value` en runtime | Adaptación a motores 1000 RPM (25% más rápidos); freno fuerte funciona bien con velocidad de encoders |
+| 2026-05-08 | Core/Src/main.c | Seguidor de línea mejorado: (1) PI de velocidad externo (`LINE_VEL_KP=2.5`, `LINE_VEL_KI=0.8`) reemplaza `line_speed_scale` + `KV_LINE_BRAKE`. (2) Inner steering PI con encoder feedback (`LINE_STEER_FB_KP=5.0`, `LINE_STEER_ENC_SCALE=0.12`) reemplaza steering open-loop. (3) Reducción cuadrática de velocidad con `|line_error|` reemplaza `forward_factor` lineal. Variables `speed_right/left_rps_s` expuestas como statics. `LINE_SPEED_TARGET=0.25 m/s` ajustable en runtime. | Control fluido y robusto: la velocidad y el giro se regulan por realimentación real, no heurísticas abiertas |
 
 ---
 
@@ -247,6 +248,7 @@ Balancin_Mendelevich/
 - **Masking de EXTI en encoder:** tras cada pulso se enmascara la línea EXTI y TIM5 la reactiva cada 2ms. Limita a 500 Hz/canal, evita freeze por rafagas. Solución más robusta que solo limpiar flags
 - **4x quadrature por software:** ambos canales A y B con EXTI RISING+FALLING. Canal B usa lógica de dirección invertida `(a!=b)`. ENC_CPR=24. Sin modo encoder de hardware (requeriría cambio de pines)
 - **`KV_brake_value` mapeado a slider "KV" en Qt:** permite ajustar el freno fuerte en runtime sin recompilar. Se inicializa desde `KV_BRAKE_STRONG`
+- **Seguidor de línea con control en lazo cerrado (2026-05-08):** velocidad regulada por PI externo (`LINE_VEL_KP/KI`, setpoint `LINE_SPEED_TARGET=0.25 m/s`). Steering regulado por PI interno sobre diferencial de encoder (`LINE_STEER_FB_KP/KI`, `LINE_STEER_ENC_SCALE=0.12`). Speed reduction cuadrática con `|line_error|`. Si el steering oscila, negar `diff_actual` en `main.c` línea ~2659.
 
 ---
 
