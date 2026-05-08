@@ -394,12 +394,29 @@ void USART1_IRQHandler(void)
 /**
   * @brief This function handles EXTI line[15:10] interrupts.
   */
+void EXTI9_5_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI9_5_IRQn 0 */
+  // Limpiar flags de todas las líneas 5-9 para evitar re-entrada infinita
+  // EXTI->PR es write-1-to-clear; limpiamos líneas que no usamos (5,6,7,9)
+  EXTI->PR = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_9;
+  /* USER CODE END EXTI9_5_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_8);   // PA8 — encoder derecho (también limpia PIN_8)
+  /* USER CODE BEGIN EXTI9_5_IRQn 1 */
+
+  /* USER CODE END EXTI9_5_IRQn 1 */
+}
+
 void EXTI15_10_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI15_10_IRQn 0 */
-
+  // Limpiar solo líneas verdaderamente sin uso (10 y 11)
+  EXTI->PR = GPIO_PIN_10 | GPIO_PIN_11;
   /* USER CODE END EXTI15_10_IRQn 0 */
-  HAL_GPIO_EXTI_IRQHandler(MPU_INT_Pin);
+  HAL_GPIO_EXTI_IRQHandler(MPU_INT_Pin);  // PB12 — MPU data ready
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);  // PB13 — encoder derecho canal B
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_14);  // PB14 — encoder izquierdo canal A
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_15);  // PB15 — encoder izquierdo canal B
   /* USER CODE BEGIN EXTI15_10_IRQn 1 */
 
   /* USER CODE END EXTI15_10_IRQn 1 */

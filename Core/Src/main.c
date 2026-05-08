@@ -128,7 +128,7 @@ typedef enum {
 
 #define MOTOR_RIGHT_DEADBAND  	1   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
 #define KV_BRAKE                0.0f  // ganancia base (velocidad baja)
-#define KV_BRAKE_STRONG         8.0f  // ganancia extra por encima del umbral
+#define KV_BRAKE_STRONG         5.0f  // ganancia extra por encima del umbral
 #define BRAKE_VEL_THRESHOLD     1.5f  // velocidad a partir de la cual se aplica el freno fuerte
 #define VEL_DECAY        		0.999f
 #define VEL_DECAY_ACCEL  		0.97f   // decay del integrador del acelerómetro
@@ -169,7 +169,7 @@ typedef enum {
 #define MPU_USE_FIXED_BIAS
 #ifdef MPU_USE_FIXED_BIAS
 #define FIXED_BIAS_AX    -46
-#define FIXED_BIAS_AY    4400	//4650
+#define FIXED_BIAS_AY    4850	//4650
 #define FIXED_BIAS_AZ    1980
 #define FIXED_BIAS_GX    -441
 #define FIXED_BIAS_GY    -107
@@ -457,6 +457,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
     if (htim->Instance == TIM5) {        // 2 ms
     	if (tick2ms_count < 10) tick2ms_count++;
+    	EXTI->IMR |= GPIO_PIN_8  | GPIO_PIN_13;  // encoder derecho A y B
+    	EXTI->IMR |= GPIO_PIN_14 | GPIO_PIN_15;  // encoder izquierdo A y B
     }
 }
 
@@ -931,22 +933,38 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         }
     }
 
-    // Encoder RIGHT — PA8 es canal A
+    // Encoder RIGHT — canal A (PA8)
     if (GPIO_Pin == GPIO_PIN_8)
     {
-        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13);
         uint8_t a = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
-        if (a == b) encoder_right++;
-        else        encoder_right--;
+        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13);
+        if (a == b) encoder_right++; else encoder_right--;
+        EXTI->IMR &= ~GPIO_PIN_8;
+    }
+    // Encoder RIGHT — canal B (PB13), lógica invertida respecto a canal A
+    if (GPIO_Pin == GPIO_PIN_13)
+    {
+        uint8_t a = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
+        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13);
+        if (a != b) encoder_right++; else encoder_right--;
+        EXTI->IMR &= ~GPIO_PIN_13;
     }
 
-    // Encoder LEFT — PB14 es canal A
+    // Encoder LEFT — canal A (PB14)
     if (GPIO_Pin == GPIO_PIN_14)
     {
-        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_15);
         uint8_t a = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14);
-        if (a == b) encoder_left++;
-        else        encoder_left--;
+        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_15);
+        if (a == b) encoder_left++; else encoder_left--;
+        EXTI->IMR &= ~GPIO_PIN_14;
+    }
+    // Encoder LEFT — canal B (PB15), lógica invertida respecto a canal A
+    if (GPIO_Pin == GPIO_PIN_15)
+    {
+        uint8_t a = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14);
+        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_15);
+        if (a != b) encoder_left++; else encoder_left--;
+        EXTI->IMR &= ~GPIO_PIN_15;
     }
 }
 
@@ -1065,7 +1083,7 @@ static float ComputeBrakeSetpointTarget(uint8_t state)
     float abs_vel = fabsf(vel_for_brake);
     float brake_mag = KV_BRAKE * abs_vel;
     if (abs_vel > BRAKE_VEL_THRESHOLD)
-        brake_mag += KV_brake_value * (abs_vel - BRAKE_VEL_THRESHOLD);
+        brake_mag += KV_BRAKE_STRONG * (abs_vel - BRAKE_VEL_THRESHOLD);
 
     if (vel_for_brake < 0.0f)
         brake_mag = -brake_mag;
@@ -1991,7 +2009,7 @@ static void ControlStep10ms(void)
 		MPU6050_GetAccel(&ax, &ay, &az);
 		MPU6050_GetGyro(&gx, &gy, &gz);
 
-		// Encoder speed — leer y resetear conteos cada ciclo de control
+		// Encoder speed — leer conteos acumulados desde IRQ y calcular velocidad
 		static int32_t enc_right_prev = 0;
 		static int32_t enc_left_prev  = 0;
 		__disable_irq();
@@ -2002,13 +2020,11 @@ static void ControlStep10ms(void)
 		int32_t delta_left  = enc_l - enc_left_prev;
 		enc_right_prev = enc_r;
 		enc_left_prev  = enc_l;
-		#define ENC_CPR       12     // conteos por revolución — ajustar al encoder usado
-		#define ENC_VEL_SCALE  0.17750f  // 2π × r_rueda = 2π × 0.02825 m (diámetro 5.65 cm) → m/s
+		#define ENC_CPR        24  // 4x quadrature: ambos canales A y B, RISING+FALLING
+		#define ENC_VEL_SCALE  0.17750f  // 2π × r_rueda (radio 2.825 cm) → m/s
 		float speed_right_rps = (float)delta_right / (ENC_CPR * DT_CTRL_FIXED);
 		float speed_left_rps  = (float)delta_left  / (ENC_CPR * DT_CTRL_FIXED);
-
-		// Velocidad real promedio de ambas ruedas → reemplaza la estimación accel+gyro
-		float vel_enc = ((speed_right_rps + speed_left_rps) * 0.5f) * ENC_VEL_SCALE;
+		float vel_enc = -((speed_right_rps + speed_left_rps) * 0.5f) * ENC_VEL_SCALE;
 		vel_enc = clampf_local(vel_enc, -20.0f, 20.0f);
 		velocity_est    = vel_enc;
 		velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
@@ -2348,6 +2364,7 @@ static void ControlStep10ms(void)
             brake_setpoint_f += brake_delta;
         }
 
+        // Término de posición: integra velocidad para corregir deriva lenta
         dynamic_setpoint_f = base_setpoint_f + brake_setpoint_f;
         dynamic_setpoint_f = clampf_local(dynamic_setpoint_f, -sp_limit, sp_limit);
         brake_setpoint_f   = dynamic_setpoint_f - base_setpoint_f;
@@ -2846,14 +2863,14 @@ static void ControlStep10ms(void)
 
     if (robot_state == ROBOT_STATE_MOTOR_TEST) {
         // Modo test: SETMOTORSPEED controla directamente, sin PID ni compensación
-        MotorControl(motorRightVelocity, motorLeftVelocity);
+        MotorControl(motorRightVelocity, -motorLeftVelocity);
     } else if ((robot_state != ROBOT_STATE_IDLE) && !f_fallen) {
         int16_t mR_comp = motorRightVelocity;
         if      (mR_comp > 0)  mR_comp = (int16_t)( mR_comp + MOTOR_RIGHT_DEADBAND);
         else if (mR_comp < 0)  mR_comp = (int16_t)( mR_comp - MOTOR_RIGHT_DEADBAND);
         if (mR_comp >  100) mR_comp =  100;
         if (mR_comp < -100) mR_comp = -100;
-        MotorControl(mR_comp, motorLeftVelocity);
+        MotorControl(mR_comp, -motorLeftVelocity);
     } else {
         MotorControl(0, 0);
     }
@@ -3015,7 +3032,7 @@ int main(void)
   // Use raw bit 0 if DWT_CTRL_CYCCNT_Msk is not defined (standard for Cortex-M4)
   DWT->CTRL |= 1;
 
-  /* USER CODE END 2 */
+/* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -3737,34 +3754,22 @@ static void MX_GPIO_Init(void)
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
-  /* Encoder RIGHT — Canal A: PA8 (EXTI RISING+FALLING), Canal B: PB13 (input only) */
+  /* Encoder RIGHT — PA8 canal A, PB13 canal B (4x quadrature) */
   GPIO_InitStruct.Pin   = GPIO_PIN_8;
   GPIO_InitStruct.Mode  = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull  = GPIO_PULLUP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  GPIO_InitStruct.Pin   = GPIO_PIN_13;
-  GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull  = GPIO_PULLUP;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /* Encoder LEFT — Canal A: PB14 (EXTI RISING+FALLING), Canal B: PB15 (input only) */
-  GPIO_InitStruct.Pin   = GPIO_PIN_14;
+  /* Encoder RIGHT canal B + Encoder LEFT canal A y B — todos EXTI RISING+FALLING */
+  GPIO_InitStruct.Pin   = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
   GPIO_InitStruct.Mode  = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull  = GPIO_PULLUP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  GPIO_InitStruct.Pin   = GPIO_PIN_15;
-  GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull  = GPIO_PULLUP;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /* EXTI9_5_IRQn para PA8 (encoder derecho canal A) */
-  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 2, 0);
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
-  /* EXTI15_10_IRQn ya habilitado para MPU_INT (PB12) — también cubre PB14 (encoder izq canal A) */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }

@@ -52,7 +52,7 @@ y la comunicación bidireccional con la interfaz Qt (USB CDC + WiFi UDP).
 | Driver de motores | Sin denominación en código (PWM directo) | Control PWM via TIM3/TIM4, 2 canales cada uno (dirección + velocidad) |
 | Módulo WiFi | ESP-01 (ESP8266) | AT commands via USART1 a 115200 baud, UDP socket |
 | Display | SSD1306 OLED 128×64 | I2C1, driver no bloqueante con DMA |
-| Encoder (si aplica) | No implementado | Velocidad estimada por integración de acelerómetro + giroscopio |
+| Encoders | Cuadratura (modelo desconocido) | 4x quadrature vía EXTI: PA8/PB13 (derecho), PB14/PB15 (izquierdo). 12 CPR físicos → 24 conteos/rev con ambos canales RISING+FALLING |
 
 ---
 
@@ -146,7 +146,7 @@ Balancin_Mendelevich/
 | Frecuencia de control | TIM1 (Prescaler=9599, Period=99) | **100 Hz** (10 ms/ciclo) |
 | Filtro de derivada | Sin filtro explícito en derivada; zona suave (soft-zone) | SOFT_ZONE_ANGLE=1.5°, scale_min=0.15 |
 | Integral anti-windup | `I_MAX` | ±100.0 PWM units; decay=0.990 por ciclo |
-| Freno por velocidad | `KV_BRAKE` / `KV_BRAKE_STRONG` | 0.0 / 8.0 (umbral BRAKE_VEL_THRESHOLD=1.5) |
+| Freno por velocidad | `KV_BRAKE` / `KV_BRAKE_STRONG` | 0.0 / 5.0 (umbral BRAKE_VEL_THRESHOLD=1.5) — velocidad calculada por encoders |
 
 **Sensor de ángulo:**
 - Fuente: Filtro complementario (α=0.98) entre acelerómetro y giroscopio del MPU-6050
@@ -173,6 +173,10 @@ Balancin_Mendelevich/
 | ADC1 | 8 canales sensores (línea + analógicos) | PA1–PA7, PB0 | DMA circular, trigger TIM2, 15 ciclos/canal |
 | GPIO PB10 | LED_BLINKER | PB10 | Output |
 | GPIO PB12 | MPU_INT (EXTI12) | PB12 | Input, interrupción data-ready |
+| GPIO PA8 | Encoder derecho canal A (EXTI8) | PA8 | Input pull-up, EXTI RISING+FALLING, EXTI9_5_IRQn prio 5 |
+| GPIO PB13 | Encoder derecho canal B (EXTI13) | PB13 | Input pull-up, EXTI RISING+FALLING, EXTI15_10_IRQn |
+| GPIO PB14 | Encoder izquierdo canal A (EXTI14) | PB14 | Input pull-up, EXTI RISING+FALLING, EXTI15_10_IRQn |
+| GPIO PB15 | Encoder izquierdo canal B (EXTI15) | PB15 | Input pull-up, EXTI RISING+FALLING, EXTI15_10_IRQn |
 | GPIO PB2 | CH_PD ESP-01 (enable módulo) | PB2 | Output |
 | GPIO PA0 | KEY (botón usuario) | PA0 | Input pull-up |
 | GPIO PC13 | LED integrado | PC13 | Output |
@@ -183,7 +187,7 @@ Balancin_Mendelevich/
 
 ## Estado Actual
 - **Etapa:** Casi terminado
-- **Última sesión:** 2026-05-04
+- **Última sesión:** 2026-05-08
 
 ### Funcionalidades completas ✅
 - PID de estabilización (balance) con zona suave y anti-windup
@@ -197,16 +201,18 @@ Balancin_Mendelevich/
 - Tuneo en tiempo real de Kp, Ki, Kd, setpoint, steering desde Qt
 - Seguidor de línea con 8 sensores ADC, PID de línea (Kp=15, Kd=2, Ki=0)
 - Control manual remoto (FORWARD/BACKWARD/LEFT/RIGHT/STOP)
-- Freno dinámico por velocidad estimada (KV_BRAKE)
+- Freno dinámico por velocidad de encoders (KV_BRAKE_STRONG=5.0, umbral 1.5 m/s)
 - Detección de caída y recuperación con histéresis
 - Gestor I2C no bloqueante con cola (evita bloquear el loop de control)
+- Encoders de cuadratura 4x: PA8/PB13 (derecho), PB14/PB15 (izquierdo) vía EXTI con masking anti-storm en TIM5
+- Velocidad real de ruedas desde encoders (reemplaza estimación accel+gyro)
 
 ### Pendientes / bugs conocidos 🔧
-- El SSID/IP WiFi está hardcodeado en `main.c` (líneas 242-244); cambiar manualmente según red
-- No hay encoders físicos: la velocidad se estima por fusión accel+gyro (puede derivar)
-- `USBRxData` tiene el `UNER_PushByte` comentado (línea 486-487) — los comandos USB desde Qt no se procesan actualmente por esa ruta
+- El SSID/IP WiFi está hardcodeado en `main.c` (líneas ~244); cambiar manualmente según red
+- `USBRxData` tiene el `UNER_PushByte` comentado — los comandos USB desde Qt no se procesan por esa ruta
 - Código de debug activo en `ESP01.c` (printfs de estados AT) que genera tráfico USB extra
-- `VEL_CF_ALPHA = 0.0f` — el filtro complementario de velocidad usa 100% acelerómetro; el giroscopio de velocidad está deshabilitado
+- **HardFault intermitente al mover físicamente el robot** — causa no identificada. Sospecha: canales B del encoder (PB13/PB15 recién agregados) o MPU/I2C. Diagnóstico pendiente: deshabilitar B channels y ver si el freeze desaparece
+- Resolución de velocidad limitada: mínimo detectable ~0.74 m/s (1 count cada 10ms con ENC_CPR=24). No apto para integración de posición
 
 ---
 
@@ -219,6 +225,11 @@ Balancin_Mendelevich/
 | 2026-05-07 | Core/Src/main.c | Agregado soporte de encoders por cuadratura vía EXTI: variables `encoder_right/left`, GPIO init PA8/PB13/PB14/PB15, callbacks EXTI y cálculo de `speed_right/left_rps` en `ControlStep10ms` | Medición real de velocidad de ruedas con encoders físicos |
 | 2026-05-07 | Core/Src/main.c | `velocity_est`/`velocity_est_f` ahora alimentados desde encoders (`vel_enc = promedio(speed_right_rps, speed_left_rps) × ENC_VEL_SCALE`). Eliminadas las 3 llamadas a `UpdateVelocityEstimate` (accel+gyro). Display "VE:" ya mostraba `velocity_est_f` sin cambios. `ENC_VEL_SCALE=0.17750f` (radio 2.825 cm). | Velocidad real de ruedas en lugar de estimación por fusión inercial |
 | 2026-05-07 | Core/Src/main.c | Agregada infraestructura para steering de lazo cerrado por encoders: `ComputeSteeringPID()`, `SteeringPID_Reset()`, flag `steer_pid_enabled`. Por defecto deshabilitado (=0, comportamiento idéntico al anterior con corrección por gyro Z). Activar con `steer_pid_enabled=1` y ajustar `STEER_KP/KI/KD`. | Base para control de dirección preciso usando diferencia de velocidades de encoders |
+| 2026-05-08 | Core/Src/main.c | Motor izquierdo invertido: negado en las dos llamadas a `MotorControl` (líneas con `motorLeftVelocity`). Los encoders también tenían signo invertido: `vel_enc = -((speed_r + speed_l) * 0.5f) * ENC_VEL_SCALE` | Motores nuevos de 1000 RPM tenían polaridad opuesta al lado izquierdo |
+| 2026-05-08 | Core/Src/stm32f4xx_it.c | Agregado `EXTI9_5_IRQHandler` (faltaba → CPU caía en Default_Handler). Corregido `EXTI15_10_IRQHandler`: limpia flags de líneas no usadas con `EXTI->PR` (write-1-to-clear) y llama HAL para PB12, PB13, PB14, PB15. Esto elimina el re-ingreso infinito al handler que trababa el CPU | Fix definitivo del HardFault por interrupt storm de encoders |
+| 2026-05-08 | Core/Src/main.c | Masking anti-storm en callback de encoders: tras cada pulso se enmascara el EXTI (`EXTI->IMR &= ~pin`). TIM5 (2ms) re-habilita todos los pines del encoder. Limita a 500 Hz max por canal | Previene freeze por rafagas de interrupciones del encoder |
+| 2026-05-08 | Core/Src/main.c | Encoder 4x quadrature: PB13 y PB15 pasan de input mudo a EXTI RISING+FALLING. Callback maneja 4 canales: A con `(a==b)`, B con `(a!=b)`. `ENC_CPR` 12→24. TIM5 re-habilita los 4 pines | Duplica resolución efectiva: de 12 a 24 conteos/rev |
+| 2026-05-08 | Core/Src/main.c | `KV_BRAKE` puesto en 0.0f (base velocidad baja). `KV_BRAKE_STRONG` ajustado a 5.0f (era 8.0f). `KV_brake_value` inicializado a `KV_BRAKE_STRONG`. Slider "KV" en Qt controla `KV_brake_value` en runtime | Adaptación a motores 1000 RPM (25% más rápidos); freno fuerte funciona bien con velocidad de encoders |
 
 ---
 
@@ -233,6 +244,9 @@ Balancin_Mendelevich/
 - **USB CDC en lugar de UART para Qt:** mayor throughput y sin necesidad de conversor USB-UART externo
 - **USART1 dedicado a ESP-01:** recepción byte-a-byte por interrupción, sin DMA para UART (el ESP-01 maneja su propia lógica AT)
 - **PWM a ~100 kHz (TIM3/TIM4, Period=959):** frecuencia alta para reducir ruido audible y mejorar respuesta de motores DC
+- **Masking de EXTI en encoder:** tras cada pulso se enmascara la línea EXTI y TIM5 la reactiva cada 2ms. Limita a 500 Hz/canal, evita freeze por rafagas. Solución más robusta que solo limpiar flags
+- **4x quadrature por software:** ambos canales A y B con EXTI RISING+FALLING. Canal B usa lógica de dirección invertida `(a!=b)`. ENC_CPR=24. Sin modo encoder de hardware (requeriría cambio de pines)
+- **`KV_brake_value` mapeado a slider "KV" en Qt:** permite ajustar el freno fuerte en runtime sin recompilar. Se inicializa desde `KV_BRAKE_STRONG`
 
 ---
 
