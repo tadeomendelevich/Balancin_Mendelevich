@@ -95,7 +95,7 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  NVIC_SystemReset();   // auto-recuperación: reinicia el MCU en vez de colgar
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -410,13 +410,18 @@ void EXTI9_5_IRQHandler(void)
 void EXTI15_10_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI15_10_IRQn 0 */
-  // Limpiar solo líneas verdaderamente sin uso (10 y 11)
-  EXTI->PR = GPIO_PIN_10 | GPIO_PIN_11;
+  EXTI->PR = GPIO_PIN_10 | GPIO_PIN_11;  // limpiar líneas sin uso
   /* USER CODE END EXTI15_10_IRQn 0 */
-  HAL_GPIO_EXTI_IRQHandler(MPU_INT_Pin);  // PB12 — MPU data ready
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);  // PB13 — encoder derecho canal B
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_14);  // PB14 — encoder izquierdo canal A
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_15);  // PB15 — encoder izquierdo canal B
+  HAL_GPIO_EXTI_IRQHandler(MPU_INT_Pin);  // PB12 — MPU data ready (siempre activo)
+
+  // Encoders B/A: solo procesar si el pin NO está enmascarado por el anti-storm.
+  // Sin esta guarda, el MPU (PB12) al disparar EXTI15_10 procesa bits pendientes
+  // de encoders enmascarados, ejecutando el callback y burlando el anti-storm.
+  // Si IMR=0 (enmascarado), el bit PR se preserva para que TIM5 lo procese al
+  // rehabilitar el pin.
+  if (EXTI->IMR & GPIO_PIN_13) HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);
+  if (EXTI->IMR & GPIO_PIN_14) HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_14);
+  if (EXTI->IMR & GPIO_PIN_15) HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_15);
   /* USER CODE BEGIN EXTI15_10_IRQn 1 */
 
   /* USER CODE END EXTI15_10_IRQn 1 */

@@ -127,6 +127,7 @@ typedef enum {
 #define DEAD_ZONE_ANGLE      	15.0f   // entre 35° y 120° → zona muerta, motores off
 
 #define MOTOR_RIGHT_DEADBAND  	1   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
+#define MOTOR_LEFT_DEADBAND   	1   // ídem motor izquierdo — ajustar si el izq. no arranca a PWM bajo
 #define KV_BRAKE                0.0f  // ganancia base (velocidad baja)
 #define KV_BRAKE_STRONG         5.0f  // ganancia extra por encima del umbral
 #define BRAKE_VEL_THRESHOLD     1.5f  // velocidad a partir de la cual se aplica el freno fuerte
@@ -151,7 +152,7 @@ typedef enum {
 #define STEER_I_MAX    15.0f
 #define STEER_OUT_MAX  20.0f
 // Velocity PI (lazo externo de velocidad en seguimiento de línea)
-#define LINE_VEL_KP             2.5f   // ganancia proporcional vel PI
+#define LINE_VEL_KP             5.5f   // ganancia proporcional vel PI
 #define LINE_VEL_KI             0.8f   // ganancia integral vel PI
 #define LINE_VEL_I_MAX          3.0f   // anti-windup vel PI
 // Inner steering PI (lazo cerrado con encoder diferencial)
@@ -311,8 +312,8 @@ float KV_brake_value;
 float KP_LINE = 15.0f;
 float KD_LINE = 2.0f;
 float KI_LINE = 0.0f;
-float LINE_THRESHOLD = 3000.0f;
-float LINE_ANGLE = 0.5f;        // inclinación máxima (°) para avanzar en seguimiento de línea
+float LINE_THRESHOLD = 3000.0f;  // entre piso blanco (~1800) y cinta negra (~3800)
+float LINE_ANGLE = 2.8f;        // inclinación máxima (°) para avanzar en seguimiento de línea
 float LINE_SPEED_TARGET = 0.8f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
@@ -2107,21 +2108,14 @@ static void ControlStep10ms(void)
         float line_angle_cmd = LINE_ANGLE;
         uint8_t line_detected = 0;
         float w_sum = 0.0f;
-        static float adc_f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        const float ADC_BETA = 0.8f;
-
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-            // velocity_est ya actualizado desde encoders al inicio del ciclo
-
-            adc_f[0] += ADC_BETA * ((float)adcValues[0] - adc_f[0]);
-            adc_f[1] += ADC_BETA * ((float)adcValues[1] - adc_f[1]);
-            adc_f[2] += ADC_BETA * ((float)adcValues[2] - adc_f[2]);
-            adc_f[3] += ADC_BETA * ((float)adcValues[3] - adc_f[3]);
-
-            float s0 = adc_f[0];
-            float s1 = adc_f[1];
-            float s2 = adc_f[2];
-            float s3 = adc_f[3];
+            // Usa adcAvg[] (promedio de 15 muestras a 4 kHz = ventana 3.75 ms) en lugar
+            // del snapshot DMA crudo. Evita el retraso del filtro EMA que impedía
+            // alcanzar LINE_THRESHOLD en el primer ciclo sobre la línea.
+            float s0 = (float)adcAvg[0];
+            float s1 = (float)adcAvg[1];
+            float s2 = (float)adcAvg[2];
+            float s3 = (float)adcAvg[3];
 
             float w0 = (s0 > LINE_THRESHOLD) ? s0 : 0.0f;
             float w1 = (s1 > LINE_THRESHOLD) ? s1 : 0.0f;
@@ -2142,19 +2136,23 @@ static void ControlStep10ms(void)
             }
             line_error_disp = line_error;
 
-            // Idea 3: velocidad deseada cae cuadráticamente con el error de línea
-            // — frenada agresiva al entrar en curva, recuperación suave al salir
+            // Velocidad deseada cae cuadráticamente con el error de línea.
+            // Se mantiene un mínimo del 25 % del objetivo cuando la línea está
+            // visible para que el PI de vel nunca comande ángulo de retroceso
+            // al entrar en curva cerrada (sensores de borde 1 ó 4).
             float speed_factor = fmaxf(0.0f, 1.0f - fabsf(line_error) / 0.45f);
             speed_factor *= speed_factor;
-            float desired_vel = line_detected ? (LINE_SPEED_TARGET * speed_factor) : 0.0f;
+            float desired_vel = line_detected
+                ? fmaxf(LINE_SPEED_TARGET * 0.25f, LINE_SPEED_TARGET * speed_factor)
+                : 0.0f;
 
-            // Idea 1: PI de velocidad → inclinación de avance
+            // PI de velocidad → inclinación de avance
             float vel_error = desired_vel - velocity_est_f;
             line_vel_integral += vel_error * DT_CTRL_FIXED;
             line_vel_integral = clampf_local(line_vel_integral, -LINE_VEL_I_MAX, LINE_VEL_I_MAX);
             line_angle_cmd = clampf_local(
                 LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral,
-                -LINE_ANGLE, LINE_ANGLE
+                0.0f, LINE_ANGLE   // nunca negativo: el robot no retrocede en modo línea
             );
 
         } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
@@ -2232,38 +2230,18 @@ static void ControlStep10ms(void)
         float brake_setpoint_target = 0.0f;
 
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-            float line_target_angle = 0.0f;
-
             if (line_state == LINE_STATE_FOLLOWING && line_detected) {
-                // Idea 1: el PI de velocidad ya regula la inclinación correcta
-                line_target_angle = line_angle_cmd;
+                // Escalar el avance con el error: a mayor giro, menos velocidad.
+                // Cuando solo ve el sensor de borde (line_error=±1): scale=0.2 → casi quieto.
+                // Cuando está centrado (line_error=0): scale=1.0 → velocidad completa.
+                float turn_scale = fmaxf(0.2f, 1.0f - fabsf(line_error) * 0.8f);
+                base_setpoint_target = line_angle_cmd * turn_scale;
             } else {
-                line_target_angle = 0.0f;
+                // Línea perdida: control de posición como BALANCE_ONLY para quedarse quieto.
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
             }
-
-            {
-                const float LINE_RAMP_FAST = 3.0f;   // instantáneo cuando ve la línea
-                const float LINE_RAMP_LOST = 0.005f; // lento solo cuando la pierde
-
-                float ramp_delta = line_target_angle - line_angle_ramped;
-                float ramp_rate;
-                if (ramp_delta > 0.0f) {
-                    ramp_rate = LINE_RAMP_FAST;
-                } else if (line_detected) {
-                    ramp_rate = LINE_RAMP_FAST; // baja rápido si ve la línea pero error grande
-                } else {
-                    ramp_rate = LINE_RAMP_LOST; // baja lento si perdió la línea
-                }
-
-                if (fabsf(ramp_delta) <= ramp_rate) {
-                    line_angle_ramped = line_target_angle;
-                } else {
-                    line_angle_ramped += (ramp_delta > 0.0f) ? ramp_rate : -ramp_rate;
-                }
-            }
-
-            base_setpoint_target = SETPOINT_ANGLE + setpoint_trim + line_angle_ramped;
-            base_setpoint_target = clampf_local(base_setpoint_target, -LINE_ANGLE, LINE_ANGLE);
+            line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
         } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
             if (HAL_GetTick() - manual_cmd_last_ms > 60) {
                 manual_setpoint_cmd *= 0.96f;
@@ -2374,6 +2352,10 @@ static void ControlStep10ms(void)
         // Término de posición: integra velocidad para corregir deriva lenta
         dynamic_setpoint_f = base_setpoint_f + brake_setpoint_f;
         dynamic_setpoint_f = clampf_local(dynamic_setpoint_f, -sp_limit, sp_limit);
+        // En modo línea: garantizar que el setpoint final nunca sea negativo,
+        // incluso si setpoint_trim es negativo y no alcanza a compensar.
+        if (robot_state == ROBOT_STATE_LINE_FOLLOWING && dynamic_setpoint_f < 0.0f)
+            dynamic_setpoint_f = 0.0f;
         brake_setpoint_f   = dynamic_setpoint_f - base_setpoint_f;
 
         // -------------------------------------------------------
@@ -2648,25 +2630,10 @@ static void ControlStep10ms(void)
 
                             float steering_cmd = p_line + i_line + d_line;
 
-                            // Idea 2: convertir steering_cmd a setpoint diferencial y
-                            // cerrar el lazo con velocidad real de encoders
-                            float diff_sp = clampf_local(
-                                steering_cmd * LINE_STEER_ENC_SCALE,
-                                -LINE_STEER_MAX_RPS, LINE_STEER_MAX_RPS
-                            );
-                            // diff_actual: positivo → rueda der. más rápida → gira a la izquierda
-                            // Si la respuesta oscila, negar diff_actual
-                            float diff_actual = speed_right_rps_s - speed_left_rps_s;
-                            float diff_err = diff_sp - diff_actual;
-                            if (!late_cycle) {
-                                line_steer_fb_int += diff_err * dt_ctrl;
-                                line_steer_fb_int = clampf_local(line_steer_fb_int,
-                                    -LINE_STEER_FB_I_MAX, LINE_STEER_FB_I_MAX);
-                            }
-                            steering_adjustment = clampf_local(
-                                LINE_STEER_FB_KP * diff_err + LINE_STEER_FB_KI * line_steer_fb_int,
-                                -20.0f, 20.0f
-                            );
+                            // Steering directo: proporcional al error de línea sin inner PI.
+                            // El inner PI de encoders generaba problemas si el signo de
+                            // diff_actual no coincidía con la convención esperada.
+                            steering_adjustment = clampf_local(steering_cmd, -20.0f, 20.0f);
 
                             log_p_line = p_line;
                             log_i_line = i_line;
@@ -2675,10 +2642,11 @@ static void ControlStep10ms(void)
                         } else {
                             uint32_t ms_sin_linea = HAL_GetTick() - line_lost_ms;
 
-                            if (ms_sin_linea > 1000) {
+                            if (ms_sin_linea > 2000) {
                                 line_state      = LINE_STATE_LOST;
                                 line_search_dir = last_line_dir;
                                 line_integral   = 0.0f;
+                                steering_adjustment = 0.0f;
                             }
                         }
 
@@ -2688,36 +2656,31 @@ static void ControlStep10ms(void)
                     }
 
                     case LINE_STATE_LOST:
-                        if (line_detected) {
-                            line_integral   = 0.0f;
-                            line_error_prev = 0.0f;
-                            line_lost_ms    = HAL_GetTick();
-                            line_state      = LINE_STATE_FOLLOWING;
-                        } else if ((HAL_GetTick() - line_lost_ms) > LINE_LOST_TIMEOUT_MS) {
-                            line_state = LINE_STATE_SEARCHING;
-                        } else {
-                            float target = last_line_dir * 2.0f;
-                            steering_adjustment += 0.008f * (target - steering_adjustment);
-                        }
-                        break;
-
                     case LINE_STATE_SEARCHING:
+                        // Sin línea por >2s: solo mantener balance, sin giro.
+                        // El setpoint usa freno de posición (como BALANCE_ONLY).
                         if (line_detected) {
-                            line_integral   = 0.0f;
-                            line_error_prev = 0.0f;
-                            line_lost_ms    = HAL_GetTick();
-                            line_state      = LINE_STATE_FOLLOWING;
-                        } else {
-                            float target = last_line_dir * 6.0f;
-                            steering_adjustment += 0.02f * (target - steering_adjustment);
+                            line_integral       = 0.0f;
+                            line_error_prev     = 0.0f;
+                            line_lost_ms        = HAL_GetTick();
+                            line_steer_fb_int   = 0.0f;
+                            line_state          = LINE_STATE_FOLLOWING;
                         }
+                        steering_adjustment = 0.0f;
                         break;
                 }
 
                 if (integral >  2.0f) integral =  2.0f;
                 if (integral < -2.0f) integral = -2.0f;
-                if (pwm_sat >  40.0f) pwm_sat =  40.0f;
-                if (pwm_sat < -40.0f) pwm_sat = -40.0f;
+
+                // Limitar avance según giro: a mayor error de línea, menos pwm_sat.
+                // Efecto inmediato sin esperar la rampa del setpoint.
+                // error=0 (recto): límite=40. error=1 (borde): límite≈8.
+                {
+                    float turn_pwm_limit = fmaxf(8.0f, 40.0f * (1.0f - fabsf(line_error) * 0.8f));
+                    if (pwm_sat >  turn_pwm_limit) pwm_sat =  turn_pwm_limit;
+                    if (pwm_sat < -turn_pwm_limit) pwm_sat = -turn_pwm_limit;
+                }
 
                 if (!line_pivot_active) {
                     float half_steer = steering_adjustment * 0.5f;
@@ -2896,7 +2859,14 @@ static void ControlStep10ms(void)
         else if (mR_comp < 0)  mR_comp = (int16_t)( mR_comp - MOTOR_RIGHT_DEADBAND);
         if (mR_comp >  100) mR_comp =  100;
         if (mR_comp < -100) mR_comp = -100;
-        MotorControl(mR_comp, -motorLeftVelocity);
+
+        int16_t mL_comp = -motorLeftVelocity;
+        if      (mL_comp > 0)  mL_comp = (int16_t)( mL_comp + MOTOR_LEFT_DEADBAND);
+        else if (mL_comp < 0)  mL_comp = (int16_t)( mL_comp - MOTOR_LEFT_DEADBAND);
+        if (mL_comp >  100) mL_comp =  100;
+        if (mL_comp < -100) mL_comp = -100;
+
+        MotorControl(mR_comp, mL_comp);
     } else {
         MotorControl(0, 0);
     }
@@ -2944,6 +2914,62 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM5_Init();
   /* USER CODE BEGIN 2 */
+
+  // ── I2C Bus Recovery ─────────────────────────────────────────────────────
+  // Si el MCU se resetó a mitad de una transacción I2C (IWDG, HardFault),
+  // el esclavo (MPU-6050 o SSD1306) puede quedar con SDA en LOW, bloqueando
+  // todas las transacciones siguientes y causando freeze en el boot.
+  // Se generan 9 pulsos manuales en SCL para forzar al esclavo a soltar SDA,
+  // luego condición STOP, antes de cualquier uso real del periférico I2C.
+  {
+    GPIO_InitTypeDef gi = {0};
+    HAL_I2C_DeInit(&hi2c1);                       // libera el periférico y los pines AF
+
+    gi.Pin   = GPIO_PIN_8 | GPIO_PIN_9;            // PB8=SCL, PB9=SDA
+    gi.Mode  = GPIO_MODE_OUTPUT_OD;
+    gi.Pull  = GPIO_NOPULL;
+    gi.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &gi);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET);
+    HAL_Delay(5);
+
+    for (int _i = 0; _i < 9; _i++) {              // 9 pulsos SCL
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+      HAL_Delay(1);
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+      HAL_Delay(1);
+      if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == GPIO_PIN_SET)
+        break;                                     // SDA libre, listo
+    }
+
+    // Condición STOP: SDA low → high con SCL high
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET); HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);   HAL_Delay(5);
+
+    // Restaurar pines a función alternativa I2C1 y reinicializar el periférico
+    gi.Mode      = GPIO_MODE_AF_OD;
+    gi.Alternate = GPIO_AF4_I2C1;
+    gi.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &gi);
+    HAL_I2C_Init(&hi2c1);
+  }
+
+  // ── IWDG (Independent Watchdog) ──────────────────────────────────────────
+  // Resetea el MCU si el loop principal deja de ejecutarse por más de ~2s.
+  // LSI (~32 kHz) es independiente del clock principal; no se puede detener.
+  IWDG->KR  = 0x5555U;
+  IWDG->PR  = 0x06U;            // /256 → tick ≈ 8 ms
+  IWDG->RLR = 250U;             // timeout = 251 × 8 ms ≈ 2 s
+  { uint32_t _t = HAL_GetTick();
+    while (IWDG->SR && (HAL_GetTick() - _t) < 50U) {} }
+  IWDG->KR  = 0xAAAAU;
+  IWDG->KR  = 0xCCCCU;
+
+  // TIM5 a prioridad 6 para que no preempte handlers de encoder (prio 1/5)
+  HAL_NVIC_SetPriority(TIM5_IRQn, 6, 0);
+
   CDC_Attach_Rx(USBRxData);
   nBytesTx = 0;
   HAL_UART_Receive_IT(&huart1, &dataRx, 1);
@@ -3067,6 +3093,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  IWDG->KR = 0xAAAAU;  // patada al IWDG: resetea el contador (debe llegar cada <2s)
+
 	  // Control sincronizado con MPU — esto reemplaza el if(is10ms) del control
 	  if (mpu_data_ready_for_ctrl) {
 	      mpu_data_ready_for_ctrl = 0;
