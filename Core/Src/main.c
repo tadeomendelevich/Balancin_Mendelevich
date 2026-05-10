@@ -309,12 +309,12 @@ float KI_value;
 float KV_brake_value;
 
 // Line Follower Variables
-float KP_LINE = 15.0f;
+float KP_LINE = 8.0f;
 float KD_LINE = 2.0f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;  // entre piso blanco (~1800) y cinta negra (~3800)
 float LINE_ANGLE = 2.8f;        // inclinación máxima (°) para avanzar en seguimiento de línea
-float LINE_SPEED_TARGET = 0.8f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
+float LINE_SPEED_TARGET = 1.2f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
@@ -1662,16 +1662,16 @@ void updateDisplay(void) {
                 }
             }
 
-            // --- error de línea ---
+            // --- velocidad encoder ---
             {
                 char buf[10];
-                float v = line_error_disp;
+                float v = velocity_est_f;
                 uint8_t neg = (v < 0.0f);
                 if (neg) v = -v;
                 uint32_t vi = (uint32_t)v;
                 uint32_t vd = (uint32_t)((v - vi) * 100.0f + 0.5f);
                 if (vd >= 100) { vd = 0; vi++; }
-                snprintf(buf, sizeof(buf), "LE:%c%lu.%02lu", neg ? '-' : '+',
+                snprintf(buf, sizeof(buf), "VE:%c%lu.%02lu", neg ? '-' : '+',
                          (unsigned long)vi, (unsigned long)vd);
                 uint16_t x = 62;
                 for (char *p = buf; *p; p++) {
@@ -2160,12 +2160,16 @@ static void ControlStep10ms(void)
             // velocity_est ya actualizado desde encoders al inicio del ciclo
         }
 
+
         // -------------------------------------------------------
         // CAMBIOS DE ESTADO
         // -------------------------------------------------------
-        static eRobotState prev_robot_state = ROBOT_STATE_IDLE;
+        static eRobotState prev_robot_state   = ROBOT_STATE_IDLE;
+        static uint8_t     display_before_line = 0;  // guarda el display previo al modo línea
 
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING && prev_robot_state != ROBOT_STATE_LINE_FOLLOWING) {
+            display_before_line = f_change_display;  // guardar display actual
+            f_change_display    = 1;                 // cambiar al display de línea
             integral            = 0.0f;
             line_integral       = 0.0f;
             line_error_prev     = 0.0f;
@@ -2185,6 +2189,10 @@ static void ControlStep10ms(void)
             brake_setpoint_f    = 0.0f;
             line_lost_ms        = HAL_GetTick();
             line_angle_ramped   = 0.0f;
+        }
+
+        if (robot_state != ROBOT_STATE_LINE_FOLLOWING && prev_robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+            f_change_display = display_before_line;  // restaurar display anterior
         }
 
         if (robot_state == ROBOT_STATE_IDLE && prev_robot_state != ROBOT_STATE_IDLE) {
@@ -2231,11 +2239,12 @@ static void ControlStep10ms(void)
 
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
             if (line_state == LINE_STATE_FOLLOWING && line_detected) {
-                // Escalar el avance con el error: a mayor giro, menos velocidad.
-                // Cuando solo ve el sensor de borde (line_error=±1): scale=0.2 → casi quieto.
-                // Cuando está centrado (line_error=0): scale=1.0 → velocidad completa.
-                float turn_scale = fmaxf(0.2f, 1.0f - fabsf(line_error) * 0.8f);
-                base_setpoint_target = line_angle_cmd * turn_scale;
+                // Regulación de velocidad por encoders:
+                // - vel < 0 (avance): reducir ángulo si va muy rápido → frena
+                // - vel > 0 (reversa): scale=1 siempre → ángulo completo → empuja hacia adelante
+                float vel_fwd = fminf(0.0f, velocity_est_f); // solo la componente de avance
+                float vel_scale = fmaxf(0.0f, 1.0f - fabsf(vel_fwd) / LINE_SPEED_TARGET);
+                base_setpoint_target = line_angle_cmd * vel_scale;
             } else {
                 // Línea perdida: control de posición como BALANCE_ONLY para quedarse quieto.
                 base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
@@ -2324,7 +2333,7 @@ static void ControlStep10ms(void)
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                 sp_step_max = 0.1f;
             } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-                sp_step_max = 0.75f;
+                sp_step_max = 1.0f;
             } else {
                 sp_step_max = 0.1f;
             }
@@ -2527,7 +2536,8 @@ static void ControlStep10ms(void)
             if (pwm_sat >  50.0f) { pwm_sat =  50.0f; sat_flag = 1; }
             if (pwm_sat < -50.0f) { pwm_sat = -50.0f; sat_flag = 1; }
 
-            if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+            if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
+                line_state == LINE_STATE_FOLLOWING) {
                 if (pwm_sat >  40.0f) pwm_sat =  40.0f;
                 if (pwm_sat < -40.0f) pwm_sat = -40.0f;
             }
@@ -2670,20 +2680,24 @@ static void ControlStep10ms(void)
                         break;
                 }
 
-                if (integral >  2.0f) integral =  2.0f;
-                if (integral < -2.0f) integral = -2.0f;
-
-                // Limitar avance según giro: a mayor error de línea, menos pwm_sat.
-                // Efecto inmediato sin esperar la rampa del setpoint.
-                // error=0 (recto): límite=40. error=1 (borde): límite≈8.
-                {
-                    float turn_pwm_limit = fmaxf(8.0f, 40.0f * (1.0f - fabsf(line_error) * 0.8f));
-                    if (pwm_sat >  turn_pwm_limit) pwm_sat =  turn_pwm_limit;
-                    if (pwm_sat < -turn_pwm_limit) pwm_sat = -turn_pwm_limit;
+                // Cuando sigue línea: limitar integral para evitar deriva.
+                // Cuando pierde línea (LOST/SEARCHING): permitir hasta ±8 como
+                // BALANCE_ONLY para que el motor izquierdo tenga suficiente salida.
+                if (line_state == LINE_STATE_FOLLOWING) {
+                    if (integral >  2.0f) integral =  2.0f;
+                    if (integral < -2.0f) integral = -2.0f;
                 }
 
                 if (!line_pivot_active) {
                     float half_steer = steering_adjustment * 0.5f;
+
+                    // En LOST/SEARCHING: corrección giroscópica en Z igual que BALANCE_ONLY.
+                    // BALANCE_ONLY: mR = pwm_sat + (-gz*0.3), mL = pwm_sat - (-gz*0.3)
+                    // Acá mR = pwm_sat - half_steer → para igualar: half_steer = gz*0.3
+                    if (line_state != LINE_STATE_FOLLOWING) {
+                        float gz_dps_line = (float)gz / 131.0f;
+                        half_steer = gz_dps_line * 0.3f;
+                    }
 
                     float mR = pwm_sat - half_steer;
                     float mL = pwm_sat + half_steer;
@@ -3010,7 +3024,7 @@ int main(void)
   UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &KV_brake_value);
   UNER_RegisterSteering(&steering_adjustment);
   UNER_RegisterFlags(NULL, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
-  UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_ANGLE, NULL);
+  UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_SPEED_TARGET, NULL);
   UNER_RegisterManualControl(&manual_setpoint_cmd, &manual_steering_cmd, &manual_cmd_last_ms);
   UNER_RegisterSetpointTrim(&setpoint_trim);
   UNER_RegisterRobotState(&robot_state);
