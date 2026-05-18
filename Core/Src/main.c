@@ -152,9 +152,16 @@ typedef enum {
 #define STEER_I_MAX    15.0f
 #define STEER_OUT_MAX  20.0f
 // Velocity PI (lazo externo de velocidad en seguimiento de línea)
-#define LINE_VEL_KP             5.5f   // ganancia proporcional vel PI
-#define LINE_VEL_KI             0.8f   // ganancia integral vel PI
-#define LINE_VEL_I_MAX          3.0f   // anti-windup vel PI
+#define LINE_VEL_KP             2.5f   // ganancia proporcional vel PI
+#define LINE_VEL_KI             1.2f   // ganancia integral vel PI
+#define LINE_VEL_I_MAX          2.5f   // anti-windup vel PI
+#define LINE_ENC_CORR_KP        6.5f   // ganancia P: grados por (m/s de deficit) normalizado
+#define LINE_ENC_CORR_MAX       5.5f   // angulo extra maximo por deficit de velocidad (grados)
+#define LINE_REV_BOOST_MAX      1.4f   // extra de inclinacion si los encoders muestran reversa
+#define LINE_REV_BOOST_UP       0.06f  // subida max por ciclo de control
+#define LINE_REV_BOOST_DOWN     0.10f  // bajada max por ciclo de control
+#define LINE_REV_VEL_START      0.05f  // m/s de reversa desde donde empieza a actuar
+#define LINE_REV_VEL_FULL       0.35f  // m/s de reversa para aplicar boost maximo
 // Inner steering PI (lazo cerrado con encoder diferencial)
 #define LINE_STEER_ENC_SCALE    0.12f  // escala steering_cmd [PWM] → diff_sp [rps]
 #define LINE_STEER_MAX_RPS      2.0f   // límite del setpoint diferencial
@@ -333,6 +340,8 @@ static uint8_t  key_click_count = 0;
 
 static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
+static float line_enc_angle_corr     = 0.0f;  // corrección P de angulo por deficit de velocidad encoder
+static float line_reverse_boost     = 0.0f;  // extra de angulo si encoders muestran reversa
 static float line_vel_integral      = 0.0f;  // integral del PI de velocidad (idea 1)
 static float line_steer_fb_int      = 0.0f;  // integral del inner steering PI (idea 2)
 static float speed_right_rps_s      = 0.0f;  // velocidad rueda derecha, accesible fuera del bloque encoder
@@ -2106,6 +2115,8 @@ static void ControlStep10ms(void)
         // -------------------------------------------------------
         float line_error = 0.0f;
         float line_angle_cmd = LINE_ANGLE;
+        float line_desired_forward_vel = 0.0f;
+        float line_forward_vel = 0.0f;
         uint8_t line_detected = 0;
         float w_sum = 0.0f;
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
@@ -2142,13 +2153,17 @@ static void ControlStep10ms(void)
             // al entrar en curva cerrada (sensores de borde 1 ó 4).
             float speed_factor = fmaxf(0.0f, 1.0f - fabsf(line_error) / 0.45f);
             speed_factor *= speed_factor;
-            float desired_vel = line_detected
+            line_desired_forward_vel = line_detected
                 ? fmaxf(LINE_SPEED_TARGET * 0.25f, LINE_SPEED_TARGET * speed_factor)
                 : 0.0f;
+            line_forward_vel = fmaxf(0.0f, -velocity_est_f);
 
             // PI de velocidad → inclinación de avance
-            float vel_error = desired_vel - velocity_est_f;
-            line_vel_integral += vel_error * DT_CTRL_FIXED;
+            float vel_error = line_desired_forward_vel - line_forward_vel;
+            // Anti-windup: no acumular cuando la salida ya está saturada en máximo y el error es positivo
+            float raw_vel_cmd = LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral;
+            if (!(raw_vel_cmd >= LINE_ANGLE && vel_error > 0.0f))
+                line_vel_integral += vel_error * DT_CTRL_FIXED;
             line_vel_integral = clampf_local(line_vel_integral, -LINE_VEL_I_MAX, LINE_VEL_I_MAX);
             line_angle_cmd = clampf_local(
                 LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral,
@@ -2179,6 +2194,9 @@ static void ControlStep10ms(void)
             velocity_est_f      = 0.0f;
             vel_from_accel      = 0.0f;
             line_vel_integral   = 0.0f;
+            line_enc_angle_corr = 0.0f;
+            line_reverse_boost  = 0.0f;
+            balance_hold_active = 0;
             line_steer_fb_int   = 0.0f;
             speed_right_rps_s   = 0.0f;
             speed_left_rps_s    = 0.0f;
@@ -2243,12 +2261,57 @@ static void ControlStep10ms(void)
                 // - vel < 0 (avance): reducir ángulo si va muy rápido → frena
                 // - vel > 0 (reversa): scale=1 siempre → ángulo completo → empuja hacia adelante
                 float vel_fwd = fminf(0.0f, velocity_est_f); // solo la componente de avance
-                float vel_scale = fmaxf(0.0f, 1.0f - fabsf(vel_fwd) / LINE_SPEED_TARGET);
-                base_setpoint_target = line_angle_cmd * vel_scale;
+                float vel_scale = 1.0f; // el PI de velocidad ya regula la velocidad; vel_scale era un doble freno
+                float stability_scale = 1.0f;
+                // Referencia: base_setpoint_f (setpoint actual de línea), no el upright (0°).
+                // Sin esto, stability_scale penaliza la inclinación correcta de avance.
+                float balance_err_abs = fabsf(filtered_roll_deg - base_setpoint_f);
+                float gyro_abs = fabsf(gyro_f);
+
+                if (balance_err_abs > 1.5f)
+                    stability_scale *= fmaxf(0.60f, 1.0f - (balance_err_abs - 1.5f) / 3.0f);
+                if (gyro_abs > 20.0f)
+                    stability_scale *= fmaxf(0.60f, 1.0f - (gyro_abs - 20.0f) / 45.0f);
+
+                // Corrección P directa por déficit de velocidad de encoder:
+                // frac=1 cuando el robot está parado, frac=0 cuando alcanza la vel deseada.
+                float enc_deficit = fmaxf(0.0f, line_desired_forward_vel - line_forward_vel);
+                float enc_deficit_frac = (line_desired_forward_vel > 0.01f)
+                    ? clampf_local(enc_deficit / line_desired_forward_vel, 0.0f, 1.0f)
+                    : 0.0f;
+                line_enc_angle_corr = clampf_local(
+                    LINE_ENC_CORR_KP * enc_deficit_frac, 0.0f, LINE_ENC_CORR_MAX);
+
+                float reverse_vel = fmaxf(0.0f, velocity_est_f);
+                float reverse_target = 0.0f;
+                if (reverse_vel > LINE_REV_VEL_START) {
+                    reverse_target = LINE_REV_BOOST_MAX *
+                        clampf_local(
+                            (reverse_vel - LINE_REV_VEL_START) /
+                            (LINE_REV_VEL_FULL - LINE_REV_VEL_START),
+                            0.0f, 1.0f
+                        );
+                    if (stability_scale < 0.75f) stability_scale = 0.75f;
+                }
+
+                float reverse_delta = reverse_target - line_reverse_boost;
+                float reverse_step = (reverse_delta > 0.0f) ? LINE_REV_BOOST_UP : LINE_REV_BOOST_DOWN;
+                if (reverse_delta >  reverse_step) reverse_delta =  reverse_step;
+                if (reverse_delta < -reverse_step) reverse_delta = -reverse_step;
+                line_reverse_boost += reverse_delta;
+
+                float line_angle_with_boost = clampf_local(
+                    line_angle_cmd + line_enc_angle_corr + line_reverse_boost,
+                    0.0f, LINE_ANGLE + LINE_ENC_CORR_MAX + LINE_REV_BOOST_MAX
+                );
+
+                base_setpoint_target = line_angle_with_boost * vel_scale * stability_scale;
             } else {
                 // Línea perdida: control de posición como BALANCE_ONLY para quedarse quieto.
                 base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
                 brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                line_enc_angle_corr   = 0.0f;
+                line_reverse_boost    = 0.0f;
             }
             line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
         } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
@@ -2333,7 +2396,7 @@ static void ControlStep10ms(void)
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                 sp_step_max = 0.1f;
             } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-                sp_step_max = 1.0f;
+                sp_step_max = 0.25f;
             } else {
                 sp_step_max = 0.1f;
             }
@@ -2502,7 +2565,9 @@ static void ControlStep10ms(void)
                 float balance_pi_scale = 1.0f;
                 float balance_d_scale  = 1.0f;
 
-                if (!balance_hold_active) {
+                if (robot_state == ROBOT_STATE_LINE_FOLLOWING && line_detected)
+                    balance_hold_active = 0;
+                else if (!balance_hold_active) {
                     if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
                         abs_gyro  <= BALANCE_HOLD_ENTER_GYRO_DPS)
                         balance_hold_active = 1;

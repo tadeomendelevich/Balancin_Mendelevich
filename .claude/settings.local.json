@@ -5,7 +5,13 @@
       "Bash(git commit -m ' *)",
       "Bash(git push *)",
       "Bash(git *)",
-      "Bash(grep -v \"//.*CIPSTART\\\\|//.*StartUDP\")"
+      "Bash(grep -v \"//.*CIPSTART\\\\|//.*StartUDP\")",
+      "PowerShell($lines = Get-Content \"C:\\\\Users\\\\tadeo\\\\STM32CubeIDE\\\\workspace_1.18.1\\\\Balancin_Mendelevich\\\\Core\\\\Src\\\\main.c\"; $i = 0; $lines | ForEach-Object { $i++; if \\($_ -match \"encoder_right|encoder_left|ENC_CPR|EXTI9_5_IRQn\"\\) { \"$i`: $_\" } })",
+      "PowerShell($lines = Get-Content \"C:\\\\Users\\\\tadeo\\\\STM32CubeIDE\\\\workspace_1.18.1\\\\Balancin_Mendelevich\\\\Core\\\\Src\\\\main.c\"; $i = 0; $lines | ForEach-Object { $i++; if \\($_ -match \"UpdateVelocityEstimate|velocity_est|vel_from_accel|ComputeBrakeSetpoint|updateDisplay|velocity_est_f\"\\) { \"$i`: $_\" } })",
+      "PowerShell($lines = Get-Content \"C:\\\\Users\\\\tadeo\\\\STM32CubeIDE\\\\workspace_1.18.1\\\\Balancin_Mendelevich\\\\Core\\\\Src\\\\main.c\"; $i = 0; $lines | ForEach-Object { $i++; if \\($_ -match \"UpdateVelocityEstimate|vel_enc|ENC_VEL_SCALE|velocity_est_f \\\\+= VEL_LPF\"\\) { \"$i`: $_\" } })",
+      "PowerShell($lines = Get-Content \"C:\\\\Users\\\\tadeo\\\\STM32CubeIDE\\\\workspace_1.18.1\\\\Balancin_Mendelevich\\\\Core\\\\Src\\\\main.c\"; $i = 0; $lines | ForEach-Object { $i++; if \\($_ -match \"steering_adjustment|motorRight|motorLeft|MotorControl|PWM_init\"\\) { \"$i`: $_\" } })",
+      "PowerShell($lines = Get-Content \"C:\\\\Users\\\\tadeo\\\\STM32CubeIDE\\\\workspace_1.18.1\\\\Balancin_Mendelevich\\\\Core\\\\Src\\\\main.c\"; $i = 0; $lines | ForEach-Object { $i++; if \\($_ -match \"ComputeSteeringPID|SteeringPID_Reset|steer_pid_enabled|steer_correction|STEER_KP\"\\) { \"$i`: $_\" } })",
+      "Bash(grep -v \"//.*#define\")"
     ]
   }
 }
