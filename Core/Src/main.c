@@ -2160,10 +2160,7 @@ static void ControlStep10ms(void)
 
             // PI de velocidad → inclinación de avance
             float vel_error = line_desired_forward_vel - line_forward_vel;
-            // Anti-windup: no acumular cuando la salida ya está saturada en máximo y el error es positivo
-            float raw_vel_cmd = LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral;
-            if (!(raw_vel_cmd >= LINE_ANGLE && vel_error > 0.0f))
-                line_vel_integral += vel_error * DT_CTRL_FIXED;
+            line_vel_integral += vel_error * DT_CTRL_FIXED;
             line_vel_integral = clampf_local(line_vel_integral, -LINE_VEL_I_MAX, LINE_VEL_I_MAX);
             line_angle_cmd = clampf_local(
                 LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral,
