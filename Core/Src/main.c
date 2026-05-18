@@ -78,7 +78,7 @@ typedef enum {
 
 
 #define MPU_AVERAGE_SIZE 	10
-#define ADC_AVERAGE_SIZE 	15
+#define ADC_AVERAGE_SIZE 	4
 
 #define BAR_COUNT    		8
 #define BAR_SPACING  		2
@@ -152,11 +152,11 @@ typedef enum {
 #define STEER_I_MAX    15.0f
 #define STEER_OUT_MAX  20.0f
 // Velocity PI (lazo externo de velocidad en seguimiento de línea)
-#define LINE_VEL_KP             2.5f   // ganancia proporcional vel PI
+#define LINE_VEL_KP             5.5f   // ganancia proporcional vel PI
 #define LINE_VEL_KI             1.2f   // ganancia integral vel PI
 #define LINE_VEL_I_MAX          2.5f   // anti-windup vel PI
-#define LINE_ENC_CORR_KP        6.5f   // ganancia P: grados por (m/s de deficit) normalizado
-#define LINE_ENC_CORR_MAX       5.5f   // angulo extra maximo por deficit de velocidad (grados)
+#define LINE_ENC_CORR_KP        8.5f   // ganancia P: grados por (m/s de deficit) normalizado
+#define LINE_ENC_CORR_MAX       4.0f   // angulo extra maximo por deficit de velocidad (grados)
 #define LINE_REV_BOOST_MAX      1.4f   // extra de inclinacion si los encoders muestran reversa
 #define LINE_REV_BOOST_UP       0.06f  // subida max por ciclo de control
 #define LINE_REV_BOOST_DOWN     0.10f  // bajada max por ciclo de control
@@ -320,8 +320,8 @@ float KP_LINE = 8.0f;
 float KD_LINE = 2.0f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;  // entre piso blanco (~1800) y cinta negra (~3800)
-float LINE_ANGLE = 2.8f;        // inclinación máxima (°) para avanzar en seguimiento de línea
-float LINE_SPEED_TARGET = 1.2f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
+float LINE_ANGLE = 1.5f;        // inclinación máxima (°) para avanzar en seguimiento de línea
+float LINE_SPEED_TARGET = 1.5f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
@@ -2160,11 +2160,17 @@ static void ControlStep10ms(void)
 
             // PI de velocidad → inclinación de avance
             float vel_error = line_desired_forward_vel - line_forward_vel;
-            line_vel_integral += vel_error * DT_CTRL_FIXED;
-            line_vel_integral = clampf_local(line_vel_integral, -LINE_VEL_I_MAX, LINE_VEL_I_MAX);
+            if (vel_error > 0.0f) {
+                // Acelerando: acumula integral solo en positivo
+                line_vel_integral += vel_error * DT_CTRL_FIXED;
+                line_vel_integral = clampf_local(line_vel_integral, 0.0f, LINE_VEL_I_MAX);
+            } else {
+                // Sobre-velocidad: decae el integral suavemente, no acumula negativo
+                line_vel_integral *= 0.95f;
+            }
             line_angle_cmd = clampf_local(
                 LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral,
-                0.0f, LINE_ANGLE   // nunca negativo: el robot no retrocede en modo línea
+                -1.5f, LINE_ANGLE
             );
 
         } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
@@ -2257,8 +2263,8 @@ static void ControlStep10ms(void)
                 // Regulación de velocidad por encoders:
                 // - vel < 0 (avance): reducir ángulo si va muy rápido → frena
                 // - vel > 0 (reversa): scale=1 siempre → ángulo completo → empuja hacia adelante
-                float vel_fwd = fminf(0.0f, velocity_est_f); // solo la componente de avance
-                float vel_scale = 1.0f; // el PI de velocidad ya regula la velocidad; vel_scale era un doble freno
+                float vel_fwd = fminf(0.0f, velocity_est_f);
+                float vel_scale = fmaxf(0.0f, 1.0f - fabsf(vel_fwd) / (LINE_SPEED_TARGET * 0.9f));
                 float stability_scale = 1.0f;
                 // Referencia: base_setpoint_f (setpoint actual de línea), no el upright (0°).
                 // Sin esto, stability_scale penaliza la inclinación correcta de avance.
@@ -2297,12 +2303,16 @@ static void ControlStep10ms(void)
                 if (reverse_delta < -reverse_step) reverse_delta = -reverse_step;
                 line_reverse_boost += reverse_delta;
 
-                float line_angle_with_boost = clampf_local(
-                    line_angle_cmd + line_enc_angle_corr + line_reverse_boost,
-                    0.0f, LINE_ANGLE + LINE_ENC_CORR_MAX + LINE_REV_BOOST_MAX
-                );
-
-                base_setpoint_target = line_angle_with_boost * vel_scale * stability_scale;
+                if (line_angle_cmd < 0.0f) {
+                    // Freno activo: no aplicar boosts positivos ni vel_scale (que sería 0 y mataría el freno)
+                    base_setpoint_target = line_angle_cmd * stability_scale;
+                } else {
+                    float line_angle_with_boost = clampf_local(
+                        line_angle_cmd + line_enc_angle_corr + line_reverse_boost,
+                        0.0f, LINE_ANGLE + LINE_ENC_CORR_MAX + LINE_REV_BOOST_MAX
+                    );
+                    base_setpoint_target = line_angle_with_boost * vel_scale * stability_scale;
+                }
             } else {
                 // Línea perdida: control de posición como BALANCE_ONLY para quedarse quieto.
                 base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
@@ -2421,10 +2431,9 @@ static void ControlStep10ms(void)
         // Término de posición: integra velocidad para corregir deriva lenta
         dynamic_setpoint_f = base_setpoint_f + brake_setpoint_f;
         dynamic_setpoint_f = clampf_local(dynamic_setpoint_f, -sp_limit, sp_limit);
-        // En modo línea: garantizar que el setpoint final nunca sea negativo,
-        // incluso si setpoint_trim es negativo y no alcanza a compensar.
-        if (robot_state == ROBOT_STATE_LINE_FOLLOWING && dynamic_setpoint_f < 0.0f)
-            dynamic_setpoint_f = 0.0f;
+        // En modo línea: permite hasta -1° para frenar activamente si supera LINE_SPEED_TARGET.
+        if (robot_state == ROBOT_STATE_LINE_FOLLOWING && dynamic_setpoint_f < -1.0f)
+            dynamic_setpoint_f = -1.0f;
         brake_setpoint_f   = dynamic_setpoint_f - base_setpoint_f;
 
         // -------------------------------------------------------
