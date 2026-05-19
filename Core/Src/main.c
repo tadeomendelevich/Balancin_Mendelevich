@@ -52,6 +52,8 @@ typedef enum {
     LINE_STATE_FOLLOWING = 0,  // Siguiendo línea normalmente
     LINE_STATE_LOST,           // Línea perdida, frenando y buscando
     LINE_STATE_SEARCHING,      // Girando suavemente para buscar
+    LINE_STATE_OBJ_ROTATE,     // Objeto detectado: girando 90° derecha por encoders
+    LINE_STATE_OBJ_HOLD,       // Post-rotación: balance estático con yaw-lock por encoders
 } eLineState;
 
 /* USER CODE END PTD */
@@ -171,6 +173,11 @@ typedef enum {
 
 #define LINE_LOST_TIMEOUT_MS   2000    // ms sin línea antes de entrar en búsqueda
 #define LINE_LOST_STEERING     12.0f   // steering suave para cuando recién se pierde la línea
+
+#define OBJ_DETECT_THRESHOLD_VAL   2000.0f   // objeto detectado si ADC < este valor (sin objeto: ~4095, con objeto: <2000)
+#define OBJ_DETECT_DEBOUNCE_CNT    3          // ciclos consecutivos (30 ms) para confirmar objeto
+// Giro 90° por encoders: medir distancia entre centros de rueda y ajustar aquí
+#define OBJ_ROTATE_TRACK_WIDTH     0.220f    // metros entre centros de ruedas (medido: 220 mm)
 
 #define DISPLAY_UPDATE_INTERVAL_IDLE_MS    100U
 #define DISPLAY_UPDATE_INTERVAL_ACTIVE_MS   60U
@@ -320,8 +327,9 @@ float KP_LINE = 8.0f;
 float KD_LINE = 2.0f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;  // entre piso blanco (~1800) y cinta negra (~3800)
-float LINE_ANGLE = 1.5f;        // inclinación máxima (°) para avanzar en seguimiento de línea
+float LINE_ANGLE = 2.0f;        // inclinación máxima (°) para avanzar en seguimiento de línea
 float LINE_SPEED_TARGET = 1.5f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
+float OBJ_DETECT_THRESHOLD_f = OBJ_DETECT_THRESHOLD_VAL;  // umbral objeto, ajustable en runtime
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
@@ -350,6 +358,8 @@ static float line_error_disp        = 0.0f;  // último error de línea, para mo
 static float pwm_sat_prev = 0.0f;
 static float prev_error = 0.0f;
 static uint8_t balance_hold_active = 0;
+static uint32_t obj_detect_ignore_until_ms = 0;  // ignora sensores de objeto hasta este tick
+static uint8_t  obj_hold_initialized = 0;         // flag de inicialización del estado OBJ_HOLD
 
 volatile uint8_t tick2ms_count = 0;
 
@@ -431,6 +441,7 @@ void ProcessEspRxLimited(void);
 static void ControlStep10ms(void);
 static float ComputeSteeringPID(float speed_r, float speed_l, float sp);
 static void  SteeringPID_Reset(void);
+static void  I2C1_Recover(void);
 
 static inline uint32_t micros(void) {
     return DWT->CYCCNT / (SystemCoreClock / 1000000);
@@ -1507,18 +1518,17 @@ void updateDisplay(void) {
         // PANTALLA 1: Estado general + estado line follower
         // -------------------------------------------------------
 
-        // ----- 4 barras ADC izquierda -----
+        // ----- 8 barras ADC izquierda: 1-4 sensores línea, 5-8 sensores objeto -----
         {
-            const uint8_t  adc_count  = 4;
-            const uint16_t bar_top    = 2;
-            const uint16_t digit_y    = 55;
-            const uint16_t bar_max_h  = digit_y - bar_top - 1;
-            const uint16_t spacing    = 2;
-            const uint16_t left_w     = 55;
-            const uint16_t bar_width  = (left_w - (adc_count + 1) * spacing) / adc_count;
+            const uint16_t bar_top   = 2;
+            const uint16_t digit_y   = 55;
+            const uint16_t bar_max_h = digit_y - bar_top - 1;
+            const uint16_t bar_width = 7;   // 8×7 + 9×1 = 65 px en área de 70 px
+            const uint16_t spacing   = 1;
 
-            for (uint8_t i = 0; i < adc_count; i++) {
-                uint8_t adc_idx = (adc_count - 1) - i;
+            for (uint8_t i = 0; i < 8; i++) {
+                // ADC 1-4 en orden invertido (igual que antes), ADC 5-8 directo
+                uint8_t adc_idx = (i < 4) ? (3 - i) : i;
                 uint16_t v = adcAvg[adc_idx] > 4095 ? 4095 : adcAvg[adc_idx];
                 uint16_t h = (uint32_t)v * bar_max_h / 4095;
                 uint16_t x0 = spacing + i * (bar_width + spacing);
@@ -1528,15 +1538,20 @@ void updateDisplay(void) {
                     SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
                 }
 
-                uint16_t tx = x0 + (bar_width - Font_5x7.FontWidth) / 2;
-                SSD1306_DrawChar5x7('1' + adc_idx, tx, digit_y);
+                SSD1306_DrawChar5x7('1' + adc_idx, x0 + 1, digit_y);
             }
 
-            SSD1306_DrawLine(0, digit_y - 1, left_w - 1, digit_y - 1, SSD1306_COLOR_WHITE);
+            // Separador punteado vertical entre grupo línea (1-4) y objeto (5-8)
+            uint16_t sep_x = spacing + 4 * (bar_width + spacing) - 1;  // x=32
+            for (uint16_t py = bar_top; py < digit_y - 1; py += 3) {
+                SSD1306_DrawPixel(sep_x, py, SSD1306_COLOR_WHITE);
+            }
+
+            SSD1306_DrawLine(0, digit_y - 1, 70, digit_y - 1, SSD1306_COLOR_WHITE);
         }
 
         // ----- línea divisoria vertical -----
-        SSD1306_DrawLine(57, 0, 57, SCREEN_H - 1, SSD1306_COLOR_WHITE);
+        SSD1306_DrawLine(71, 0, 71, SCREEN_H - 1, SSD1306_COLOR_WHITE);
 
         // ----- lado derecho -----
         {
@@ -1557,16 +1572,18 @@ void updateDisplay(void) {
                 line_mode_str = "OFF";
             } else {
                 switch (line_state) {
-                    case LINE_STATE_FOLLOWING: line_mode_str = "FOLLOW"; break;
-                    case LINE_STATE_LOST:      line_mode_str = "LOST";   break;
-                    case LINE_STATE_SEARCHING: line_mode_str = "SEARCH"; break;
-                    default:                   line_mode_str = "UNK";    break;
+                    case LINE_STATE_FOLLOWING:  line_mode_str = "FOLLOW"; break;
+                    case LINE_STATE_LOST:       line_mode_str = "LOST";   break;
+                    case LINE_STATE_SEARCHING:  line_mode_str = "SEARCH"; break;
+                    case LINE_STATE_OBJ_ROTATE: line_mode_str = "ROTATE"; break;
+                    case LINE_STATE_OBJ_HOLD:   line_mode_str = "HOLD";   break;
+                    default:                    line_mode_str = "UNK";    break;
                 }
             }
 
             // --- fila superior: modo (Font_5x7) + WiFi icon ---
             {
-                uint16_t x = 62;
+                uint16_t x = 73;
                 for (const char *p = robot_mode_str; *p; p++) {
                     SSD1306_DrawChar5x7(*p, x, 1);
                     x += Font_5x7.FontWidth + 1;
@@ -1607,7 +1624,7 @@ void updateDisplay(void) {
             }
 
             // --- separador superior ---
-            SSD1306_DrawLine(62, 10, 127, 10, SSD1306_COLOR_WHITE);
+            SSD1306_DrawLine(72, 10, 127, 10, SSD1306_COLOR_WHITE);
 
             // --- SP: setpoint activo del balance PID ---
             {
@@ -1620,7 +1637,7 @@ void updateDisplay(void) {
                 if (vd >= 100) { vd = 0; vi++; }
                 snprintf(buf, sizeof(buf), "SP:%c%lu.%02lu", neg ? '-' : '+',
                          (unsigned long)vi, (unsigned long)vd);
-                uint16_t x = 62;
+                uint16_t x = 73;
                 for (char *p = buf; *p; p++) {
                     SSD1306_DrawChar5x7(*p, x, 13);
                     x += Font_5x7.FontWidth + 1;
@@ -1636,7 +1653,7 @@ void updateDisplay(void) {
                 if (vd >= 1000) { vd = 0; vi++; }
                 snprintf(buf, sizeof(buf), "KP:%lu.%03lu",
                          (unsigned long)vi, (unsigned long)vd);
-                uint16_t x = 62;
+                uint16_t x = 73;
                 for (char *p = buf; *p; p++) {
                     SSD1306_DrawChar5x7(*p, x, 22);
                     x += Font_5x7.FontWidth + 1;
@@ -1652,7 +1669,7 @@ void updateDisplay(void) {
                 if (vd >= 1000) { vd = 0; vi++; }
                 snprintf(buf, sizeof(buf), "KD:%lu.%03lu",
                          (unsigned long)vi, (unsigned long)vd);
-                uint16_t x = 62;
+                uint16_t x = 73;
                 for (char *p = buf; *p; p++) {
                     SSD1306_DrawChar5x7(*p, x, 31);
                     x += Font_5x7.FontWidth + 1;
@@ -1660,11 +1677,11 @@ void updateDisplay(void) {
             }
 
             // --- separador inferior ---
-            SSD1306_DrawLine(62, 41, 127, 41, SSD1306_COLOR_WHITE);
+            SSD1306_DrawLine(72, 41, 127, 41, SSD1306_COLOR_WHITE);
 
             // --- modo línea abajo ---
             {
-                uint16_t x = 62;
+                uint16_t x = 73;
                 for (const char *p = line_mode_str; *p; p++) {
                     SSD1306_DrawChar5x7(*p, x, 44);
                     x += Font_5x7.FontWidth + 1;
@@ -1682,7 +1699,7 @@ void updateDisplay(void) {
                 if (vd >= 100) { vd = 0; vi++; }
                 snprintf(buf, sizeof(buf), "VE:%c%lu.%02lu", neg ? '-' : '+',
                          (unsigned long)vi, (unsigned long)vd);
-                uint16_t x = 62;
+                uint16_t x = 73;
                 for (char *p = buf; *p; p++) {
                     SSD1306_DrawChar5x7(*p, x, 52);
                     x += Font_5x7.FontWidth + 1;
@@ -1873,23 +1890,32 @@ void updateDisplay(void) {
         // -------------------------------------------------------
 
         {
-            char buf[20];
+            // Grid 4×2: ADC1-4 columna izquierda, ADC5-8 columna derecha
+            // Font_5x7: "A1=4095" = 7 chars × 6px = 42px por columna
+            const uint16_t col_l = 1;
+            const uint16_t col_r = 67;
+            const uint16_t rows[4] = {1, 14, 27, 40};
+            char buf[12];
 
-            snprintf(buf, sizeof(buf), "ADC1=%4u", adcAvg[0]);
-            SSD1306_GotoXY(2, 2);
-            SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+            for (uint8_t i = 0; i < 4; i++) {
+                uint16_t x;
 
-            snprintf(buf, sizeof(buf), "ADC2=%4u", adcAvg[1]);
-            SSD1306_GotoXY(2, 16);
-            SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+                snprintf(buf, sizeof(buf), "A%u=%4u", i + 1, adcAvg[i]);
+                x = col_l;
+                for (char *p = buf; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, rows[i]);
+                    x += Font_5x7.FontWidth + 1;
+                }
 
-            snprintf(buf, sizeof(buf), "ADC3=%4u", adcAvg[2]);
-            SSD1306_GotoXY(2, 30);
-            SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+                snprintf(buf, sizeof(buf), "A%u=%4u", i + 5, adcAvg[i + 4]);
+                x = col_r;
+                for (char *p = buf; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, rows[i]);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
 
-            snprintf(buf, sizeof(buf), "ADC4=%4u", adcAvg[3]);
-            SSD1306_GotoXY(2, 44);
-            SSD1306_Puts(buf, &Font_7x10, SSD1306_COLOR_WHITE);
+            SSD1306_DrawLine(63, 0, 63, 52, SSD1306_COLOR_WHITE);
         }
 
         // ----- spinner abajo a la derecha -----
@@ -2019,6 +2045,49 @@ void updateDisplay(void) {
     SSD1306_RequestUpdate();
 }
 
+// Recupera el bus I2C cuando el DMA queda colgado sin completar la transferencia.
+// Misma secuencia de 9 pulsos SCL que se usa en el boot; tarda ~20 ms.
+static void I2C1_Recover(void)
+{
+    IWDG->KR = 0xAAAAU;  // patear antes de los HAL_Delay
+
+    HAL_DMA_Abort(&hdma_i2c1_rx);
+    HAL_DMA_Abort(&hdma_i2c1_tx);
+
+    GPIO_InitTypeDef gi = {0};
+    HAL_I2C_DeInit(&hi2c1);
+
+    gi.Pin   = GPIO_PIN_8 | GPIO_PIN_9;
+    gi.Mode  = GPIO_MODE_OUTPUT_OD;
+    gi.Pull  = GPIO_NOPULL;
+    gi.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &gi);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET);
+    HAL_Delay(2);
+
+    for (uint8_t i = 0; i < 9; i++) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET); HAL_Delay(1);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   HAL_Delay(1);
+        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == GPIO_PIN_SET) break;
+    }
+    // Condición STOP
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET); HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);   HAL_Delay(2);
+
+    gi.Mode      = GPIO_MODE_AF_OD;
+    gi.Alternate = GPIO_AF4_I2C1;
+    gi.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &gi);
+    HAL_I2C_Init(&hi2c1);
+
+    I2C_Manager_Init();
+    i2c1_tx_busy    = 0;
+    mpu_req_pending = 0;
+
+    USB_DebugStr("I2C RECOVER\r\n");
+}
+
 static void ControlStep10ms(void)
 {
 		if (!MPU6050_IsDataReady()) return;
@@ -2120,6 +2189,29 @@ static void ControlStep10ms(void)
         uint8_t line_detected = 0;
         float w_sum = 0.0f;
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+            // Detección de objetos: sensores de largo alcance ADC 5-8 (índices 4-7).
+            // Si cualquier sensor supera el umbral durante OBJ_DETECT_DEBOUNCE_CNT ciclos
+            // consecutivos (30 ms), se sale a IDLE y los motores se apagan.
+            {
+                static uint8_t obj_cnt = 0;
+                uint8_t obj_now = ((float)adcAvg[4] < OBJ_DETECT_THRESHOLD_f ||
+                                   (float)adcAvg[5] < OBJ_DETECT_THRESHOLD_f ||
+                                   (float)adcAvg[6] < OBJ_DETECT_THRESHOLD_f ||
+                                   (float)adcAvg[7] < OBJ_DETECT_THRESHOLD_f);
+                if (obj_now) { if (obj_cnt < OBJ_DETECT_DEBOUNCE_CNT) obj_cnt++; }
+                else         { obj_cnt = 0; }
+                if (obj_cnt >= OBJ_DETECT_DEBOUNCE_CNT &&
+                    line_state == LINE_STATE_FOLLOWING &&
+                    HAL_GetTick() >= obj_detect_ignore_until_ms) {
+                    line_state          = LINE_STATE_OBJ_ROTATE;
+                    obj_cnt             = 0;
+                    steering_adjustment = 0.0f;
+                    line_integral       = 0.0f;
+                    line_error_prev     = 0.0f;
+                    line_error_f_d      = 0.0f;
+                }
+            }
+
             // Usa adcAvg[] (promedio de 15 muestras a 4 kHz = ventana 3.75 ms) en lugar
             // del snapshot DMA crudo. Evita el retraso del filtro EMA que impedía
             // alcanzar LINE_THRESHOLD en el primer ciclo sobre la línea.
@@ -2313,6 +2405,18 @@ static void ControlStep10ms(void)
                     );
                     base_setpoint_target = line_angle_with_boost * vel_scale * stability_scale;
                 }
+            } else if (line_state == LINE_STATE_OBJ_ROTATE) {
+                // Rotación evasiva: upright sin avance, sin freno de encoders
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_target = 0.0f;
+                line_enc_angle_corr   = 0.0f;
+                line_reverse_boost    = 0.0f;
+            } else if (line_state == LINE_STATE_OBJ_HOLD) {
+                // Hold post-rotación: upright con freno traslacional, yaw-lock en switch
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                line_enc_angle_corr   = 0.0f;
+                line_reverse_boost    = 0.0f;
             } else {
                 // Línea perdida: control de posición como BALANCE_ONLY para quedarse quieto.
                 base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
@@ -2571,7 +2675,9 @@ static void ControlStep10ms(void)
                 float balance_pi_scale = 1.0f;
                 float balance_d_scale  = 1.0f;
 
-                if (robot_state == ROBOT_STATE_LINE_FOLLOWING && line_detected)
+                if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
+                    (line_detected || line_state == LINE_STATE_OBJ_ROTATE ||
+                     line_state == LINE_STATE_OBJ_HOLD))
                     balance_hold_active = 0;
                 else if (!balance_hold_active) {
                     if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
@@ -2749,6 +2855,67 @@ static void ControlStep10ms(void)
                         }
                         steering_adjustment = 0.0f;
                         break;
+
+                    case LINE_STATE_OBJ_ROTATE:
+                    {
+                        // Giro 90° a la derecha medido por encoders.
+                        // target_counts = (π/4 × track_width × ENC_CPR) / ENC_VEL_SCALE
+                        // ENC_VEL_SCALE = circunferencia_rueda (m/rev).
+                        static const int32_t target_counts = (int32_t)(
+                            (M_PI * 0.25f * OBJ_ROTATE_TRACK_WIDTH * ENC_CPR)
+                            / ENC_VEL_SCALE + 0.5f);
+
+                        static int32_t  rot_r0          = 0;
+                        static int32_t  rot_l0          = 0;
+                        static uint8_t  rot_initialized = 0;
+                        static uint32_t rot_start_ms    = 0;
+
+                        if (!rot_initialized) {
+                            __disable_irq();
+                            rot_r0 = encoder_right;
+                            rot_l0 = encoder_left;
+                            __enable_irq();
+                            rot_initialized = 1;
+                            rot_start_ms    = HAL_GetTick();
+                        }
+
+                        __disable_irq();
+                        int32_t dr = encoder_right - rot_r0;
+                        int32_t dl = encoder_left  - rot_l0;
+                        __enable_irq();
+
+                        // Métrica diferencial: en giro derecha, dl > 0 y dr < 0.
+                        // Promedio de valores absolutos cancela correcciones de balance.
+                        int32_t rot_counts = (abs(dr) + abs(dl)) / 2;
+
+                        if (rot_counts >= target_counts ||
+                            (HAL_GetTick() - rot_start_ms) > 3000U) {
+                            line_state          = LINE_STATE_OBJ_HOLD;
+                            steering_adjustment = 0.0f;
+                            rot_initialized     = 0;
+                            rot_start_ms        = 0;
+                            obj_hold_initialized = 0;  // fuerza re-init en OBJ_HOLD
+                        } else {
+                            steering_adjustment = -20.0f;  // negativo = giro derecha
+                        }
+                        break;
+                    }
+
+                    case LINE_STATE_OBJ_HOLD:
+                    {
+                        // Balance estático idéntico a BALANCE_ONLY.
+                        // La corrección yaw usa gyro Z (igual que LOST/SEARCHING, ver abajo).
+                        // Sale cuando el robot cae → vuelve a FOLLOWING para retomar la línea.
+                        steering_adjustment = 0.0f;
+                        if (f_fallen) {
+                            line_state      = LINE_STATE_FOLLOWING;
+                            line_integral   = 0.0f;
+                            line_error_prev = 0.0f;
+                            line_error_f_d  = 0.0f;
+                            line_lost_ms    = HAL_GetTick();
+                        }
+                        break;
+                    }
                 }
 
                 // Cuando sigue línea: limitar integral para evitar deriva.
@@ -2762,10 +2929,11 @@ static void ControlStep10ms(void)
                 if (!line_pivot_active) {
                     float half_steer = steering_adjustment * 0.5f;
 
-                    // En LOST/SEARCHING: corrección giroscópica en Z igual que BALANCE_ONLY.
-                    // BALANCE_ONLY: mR = pwm_sat + (-gz*0.3), mL = pwm_sat - (-gz*0.3)
-                    // Acá mR = pwm_sat - half_steer → para igualar: half_steer = gz*0.3
-                    if (line_state != LINE_STATE_FOLLOWING) {
+                    // En LOST/SEARCHING/OBJ_HOLD: corrección yaw igual que BALANCE_ONLY.
+                    // OBJ_ROTATE usa steering_adjustment directo (calculado en el case).
+                    if (line_state == LINE_STATE_LOST     ||
+                        line_state == LINE_STATE_SEARCHING ||
+                        line_state == LINE_STATE_OBJ_HOLD) {
                         float gz_dps_line = (float)gz / 131.0f;
                         half_steer = gz_dps_line * 0.3f;
                     }
@@ -3180,10 +3348,25 @@ int main(void)
     /* USER CODE BEGIN 3 */
 	  IWDG->KR = 0xAAAAU;  // patada al IWDG: resetea el contador (debe llegar cada <2s)
 
-	  // Control sincronizado con MPU — esto reemplaza el if(is10ms) del control
-	  if (mpu_data_ready_for_ctrl) {
-	      mpu_data_ready_for_ctrl = 0;
-	      ControlStep10ms();  // corre exactamente cuando hay dato, 100Hz estable
+	  // Control sincronizado con MPU — corre exactamente cuando hay dato, 100 Hz estable.
+	  // Watchdog integrado: si pasan >150 ms sin dato nuevo (DMA I2C colgado),
+	  // se ejecuta un bus recovery de I2C y se relanza la lectura del MPU sin resetear el MCU.
+	  {
+	      static uint32_t last_ctrl_ms = 0;
+
+	      if (mpu_data_ready_for_ctrl) {
+	          mpu_data_ready_for_ctrl = 0;
+	          last_ctrl_ms = HAL_GetTick();
+	          ControlStep10ms();
+	      }
+
+	      if (mpu_initialized && last_ctrl_ms != 0 &&
+	          (HAL_GetTick() - last_ctrl_ms) > 150U) {
+	          I2C1_Recover();
+	          mpu_req_pending = 1;
+	          MPU6050_StartRead_DMA();
+	          last_ctrl_ms = HAL_GetTick();
+	      }
 	  }
 
 	  if (i2c_process_pending) {
@@ -3282,6 +3465,7 @@ int main(void)
 	                          if (robot_state == ROBOT_STATE_IDLE ||
 	                              robot_state == ROBOT_STATE_BALANCE_ONLY) {
 	                              robot_state = ROBOT_STATE_LINE_FOLLOWING;
+	                              obj_detect_ignore_until_ms = HAL_GetTick() + 4000U;
 	                          } else {
 	                              robot_state = ROBOT_STATE_IDLE;
 	                          }
