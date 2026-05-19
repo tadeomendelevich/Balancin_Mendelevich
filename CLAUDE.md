@@ -208,6 +208,12 @@ Balancin_Mendelevich/
 - Encoders de cuadratura 4x: PA8/PB13 (derecho), PB14/PB15 (izquierdo) vía EXTI con masking anti-storm en TIM5
 - Velocidad real de ruedas desde encoders (reemplaza estimación accel+gyro)
 
+### Cambios recientes (2026-05-19)
+- Detección de objetos **deshabilitada temporalmente** (`obj_now = 0`) para trabajar solo en seguimiento de línea
+- Centroide cuadrático implementado: coeficientes {+9,+1,-1,-9} / (9×w_sum), sensores a ±5.75mm y ±17.25mm del centro
+- `ADC_BASELINE[4]` para sustracción de baseline — **completar con valores medidos sobre piso blanco**
+- Cadena de evasión implementada pero pausada: FOLLOWING → OBJ_REVERSE → OBJ_BRAKE → OBJ_ROTATE → OBJ_HOLD
+
 ### Pendientes / bugs conocidos 🔧
 - El SSID/IP WiFi está hardcodeado en `main.c` (líneas ~244); cambiar manualmente según red
 - `USBRxData` tiene el `UNER_PushByte` comentado — los comandos USB desde Qt no se procesan por esa ruta

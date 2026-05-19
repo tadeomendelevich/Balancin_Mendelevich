@@ -262,14 +262,14 @@ static uint16_t esp01IwRx = 0;
 static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrante */
 uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
 volatile uint16_t espUSBBufIw, espUSBBufIr;
-//
-//const char *wifiSSID     = "FCAL";
-//const char *wifiPassword = "fcalconcordia.06-2019";
-//const char *wifiIp = "172.23.205.98";
 
-const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-const char *wifiPassword = "djg19dlk";
-const char *wifiIp 		 = "192.168.100.5";
+const char *wifiSSID     = "FCAL";
+const char *wifiPassword = "fcalconcordia.06-2019";
+const char *wifiIp = "172.23.205.98";
+
+//const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
+//const char *wifiPassword = "djg19dlk";
+//const char *wifiIp 		 = "192.168.100.5";
 
 //const char *wifiSSID     = "Delco_Mendelevich";
 //const char *wifiPassword = "toyotakia";
@@ -325,11 +325,17 @@ float KI_value;
 float KV_brake_value;
 
 // Line Follower Variables
-float KP_LINE = 8.0f;
+float KP_LINE = 10.0f;
 float KD_LINE = 2.0f;
 float KI_LINE = 0.0f;
 float LINE_THRESHOLD = 3000.0f;  // entre piso blanco (~1800) y cinta negra (~3800)
 float LINE_ANGLE = 2.0f;        // inclinación máxima (°) para avanzar en seguimiento de línea
+
+// Baseline de cada sensor ADC (valor mínimo sobre superficie blanca, sin línea).
+// Medirlos colocando el robot sobre el piso blanco y leyendo adcAvg[] en la pantalla 4.
+// La sustracción de baseline elimina el offset entre sensores y mejora el centroide.
+// COMPLETAR con los valores medidos:
+static const float ADC_BASELINE[4] = { 0.0f, 0.0f, 0.0f, 0.0f };  // s0, s1, s2, s3
 float LINE_SPEED_TARGET = 1.5f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
 float OBJ_DETECT_THRESHOLD_f = OBJ_DETECT_THRESHOLD_VAL;  // umbral objeto, ajustable en runtime
 
@@ -2205,10 +2211,7 @@ static void ControlStep10ms(void)
             // consecutivos (30 ms), se sale a IDLE y los motores se apagan.
             {
                 static uint8_t obj_cnt = 0;
-                uint8_t obj_now = ((float)adcAvg[4] < OBJ_DETECT_THRESHOLD_f ||
-                                   (float)adcAvg[5] < OBJ_DETECT_THRESHOLD_f ||
-                                   (float)adcAvg[6] < OBJ_DETECT_THRESHOLD_f ||
-                                   (float)adcAvg[7] < OBJ_DETECT_THRESHOLD_f);
+                uint8_t obj_now = 0;  // DESHABILITADO: detección de objetos en pausa
                 if (obj_now) { if (obj_cnt < OBJ_DETECT_DEBOUNCE_CNT) obj_cnt++; }
                 else         { obj_cnt = 0; }
                 if (obj_cnt >= OBJ_DETECT_DEBOUNCE_CNT &&
@@ -2228,27 +2231,35 @@ static void ControlStep10ms(void)
             // Usa adcAvg[] (promedio de 15 muestras a 4 kHz = ventana 3.75 ms) en lugar
             // del snapshot DMA crudo. Evita el retraso del filtro EMA que impedía
             // alcanzar LINE_THRESHOLD en el primer ciclo sobre la línea.
-            float s0 = (float)adcAvg[0];
-            float s1 = (float)adcAvg[1];
-            float s2 = (float)adcAvg[2];
-            float s3 = (float)adcAvg[3];
+            // Centroide cuadrático con sustracción de baseline.
+            // Sensores a posiciones relativas {-3,-1,+1,+3} × 5.75 mm desde el centro.
+            // Peso cuadrático: pos² × sign(pos) → coeficientes {-9,-1,+1,+9}.
+            // Normalización: 9 × w_sum → error en [-1, +1].
+            // Convención: izquierda = positivo, derecha = negativo.
+            float s[4] = {
+                (float)adcAvg[0], (float)adcAvg[1],
+                (float)adcAvg[2], (float)adcAvg[3]
+            };
 
-            float w0 = (s0 > LINE_THRESHOLD) ? s0 : 0.0f;
-            float w1 = (s1 > LINE_THRESHOLD) ? s1 : 0.0f;
-            float w2 = (s2 > LINE_THRESHOLD) ? s2 : 0.0f;
-            float w3 = (s3 > LINE_THRESHOLD) ? s3 : 0.0f;
-            w_sum = w0 + w1 + w2 + w3;
+            // Sustracción de baseline: peso = señal por encima del fondo de cada sensor.
+            // Si el ADC no supera el umbral, contribuye 0 (ruido/luz ambiente).
+            float w[4];
+            for (int i = 0; i < 4; i++) {
+                float signal = s[i] - ADC_BASELINE[i];
+                w[i] = (s[i] > LINE_THRESHOLD) ? fmaxf(signal, 0.0f) : 0.0f;
+            }
+            w_sum = w[0] + w[1] + w[2] + w[3];
 
             line_detected = (w_sum > 0.0f);
 
             if (line_detected) {
-                line_error = ((w0 * 1.0f + w1 * 0.33f) - (w3 * 1.0f + w2 * 0.33f)) / w_sum;
+                // Numerador cuadrático: coeficientes {+9,+1,-1,-9} (izq=positivo)
+                float num = 9.0f*w[0] + 1.0f*w[1] - 1.0f*w[2] - 9.0f*w[3];
+                line_error = num / (9.0f * w_sum);
 
-                if (line_error > 0.05f) {
-                    last_line_dir = 1.0f;
-                } else if (line_error < -0.05f) {
-                    last_line_dir = -1.0f;
-                }
+                // Umbral más bajo porque sensores internos solo generan ±0.11
+                if (line_error > 0.02f)       last_line_dir =  1.0f;
+                else if (line_error < -0.02f) last_line_dir = -1.0f;
             }
             line_error_disp = line_error;
 
@@ -2275,7 +2286,7 @@ static void ControlStep10ms(void)
             }
             line_angle_cmd = clampf_local(
                 LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral,
-                -1.5f, LINE_ANGLE
+                -0.8f, LINE_ANGLE
             );
 
         } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
