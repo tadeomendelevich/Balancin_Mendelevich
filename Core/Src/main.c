@@ -156,7 +156,7 @@ typedef enum {
 #define STEER_I_MAX    15.0f
 #define STEER_OUT_MAX  20.0f
 // Velocity PI (lazo externo de velocidad en seguimiento de línea)
-#define LINE_VEL_KP             5.5f   // ganancia proporcional vel PI
+#define LINE_VEL_KP             3.0f   // ganancia proporcional vel PI
 #define LINE_VEL_KI             1.2f   // ganancia integral vel PI
 #define LINE_VEL_I_MAX          2.5f   // anti-windup vel PI
 #define LINE_ENC_CORR_KP        8.5f   // ganancia P: grados por (m/s de deficit) normalizado
@@ -2281,12 +2281,12 @@ static void ControlStep10ms(void)
                 line_vel_integral += vel_error * DT_CTRL_FIXED;
                 line_vel_integral = clampf_local(line_vel_integral, 0.0f, LINE_VEL_I_MAX);
             } else {
-                // Sobre-velocidad: decae el integral suavemente, no acumula negativo
-                line_vel_integral *= 0.95f;
+                // Sobre-velocidad: decae rápido para soltar el freno sin demora
+                line_vel_integral *= 0.80f;
             }
             line_angle_cmd = clampf_local(
                 LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral,
-                -0.8f, LINE_ANGLE
+                -1.0f, LINE_ANGLE
             );
 
         } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
