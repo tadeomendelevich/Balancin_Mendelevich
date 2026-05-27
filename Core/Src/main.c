@@ -57,7 +57,9 @@ typedef enum {
     LINE_STATE_OBJ_BRAKE,      // (deshabilitado) frena hasta velocidad ≈ 0 antes de girar
     LINE_STATE_OBJ_ROTATE,     // Objeto detectado: girando 180° derecha por encoders
     LINE_STATE_OBJ_HOLD,       // Post-rotación: balance estático espera 2s
-    LINE_STATE_OBJ_ARC,        // Post-hold: avance en arco hasta re-detectar línea
+    LINE_STATE_OBJ_ARC,        // (no usado) reservado
+    LINE_STATE_OBJ_WALL_FWD,   // Wall-following: avanza +0.5° mientras ve objeto en ADC7
+    LINE_STATE_OBJ_WALL_TURN,  // Wall-following: pivot izquierda hasta re-ver objeto en ADC7
 } eLineState;
 
 /* USER CODE END PTD */
@@ -188,7 +190,12 @@ typedef enum {
 #define OBJ_PRE_REVERSE_HOLD_MS    1000U      // tiempo de balance estatico antes de rotar
 // Giro 90° por encoders: medir distancia entre centros de rueda y ajustar aquí
 #define OBJ_ROTATE_TRACK_WIDTH     0.220f    // metros entre centros de ruedas (medido: 220 mm)
-#define OBJ_HOLD_DURATION_MS       2000U     // ms de balance estatico en OBJ_HOLD antes de pasar a OBJ_ARC
+#define OBJ_HOLD_DURATION_MS       2000U     // ms de balance estatico en OBJ_HOLD antes de wall-following
+#define OBJ_WALL_ADC_IDX           6          // índice del sensor lateral (ADC7 = adcAvg[6])
+#define OBJ_WALL_THRESHOLD         3750.0f   // ADC < umbral → objeto visible; > umbral → perdido
+#define OBJ_WALL_TOO_CLOSE_THOLD   300.0f    // ADC7 < este valor → demasiado cerca, pivot derecha
+#define OBJ_WALL_FWD_ANGLE         5.5f      // ángulo fijo de avance en WALL_FWD (°)
+#define OBJ_WALL_PIVOT_POWER       20.0f     // potencia del pivot en WALL_TURN/WALL_FWD (era 5)
 
 // Parámetros del arco evasivo (OBJ_ARC) — ajustables en runtime desde Qt
 // OBJ_ARC_DIFF_TARGET: diferencial de velocidad deseado entre ruedas [rps] (derecha - izquierda)
@@ -398,6 +405,8 @@ static uint32_t obj_brake_start_ms   = 0;         // inicio de OBJ_BRAKE (file-s
 static uint32_t obj_pre_rotate_ms    = 0;         // inicio del wait post-freno antes de OBJ_ROTATE
 static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
 static float    obj_arc_steer_int    = 0.0f;      // integral del PI de diferencial en OBJ_ARC
+static float    obj_rev_straight_int = 0.0f;      // integral del PI de enderezamiento en OBJ_REVERSE
+static float    obj_wall_vel_int     = 0.0f;      // integral del PI de velocidad en OBJ_WALL_FWD
 
 volatile uint8_t tick2ms_count = 0;
 
@@ -1617,8 +1626,9 @@ void updateDisplay(void) {
                     case LINE_STATE_OBJ_REVERSE: line_mode_str = "REVERS"; break;
                     case LINE_STATE_OBJ_BRAKE:   line_mode_str = "BRAKE";  break;
                     case LINE_STATE_OBJ_ROTATE:  line_mode_str = "ROTATE"; break;
-                    case LINE_STATE_OBJ_HOLD:    line_mode_str = "HOLD";   break;
-                    case LINE_STATE_OBJ_ARC:     line_mode_str = "ARC";    break;
+                    case LINE_STATE_OBJ_HOLD:      line_mode_str = "HOLD";   break;
+                    case LINE_STATE_OBJ_WALL_FWD:  line_mode_str = "WF_FWD"; break;
+                    case LINE_STATE_OBJ_WALL_TURN: line_mode_str = "WF_TRN"; break;
                     default:                    line_mode_str = "UNK";    break;
                 }
             }
@@ -2530,9 +2540,15 @@ static void ControlStep10ms(void)
                 brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_OBJ_ARC) {
-                // Arco evasivo: avance con steering constante hasta re-detectar línea
-                base_setpoint_target  = OBJ_ARC_ANGLE;
+            } else if (line_state == LINE_STATE_OBJ_WALL_FWD) {
+                // Ángulo fijo de avance: el PID de balance regula la inclinación hacia OBJ_WALL_FWD_ANGLE
+                base_setpoint_target  = OBJ_WALL_FWD_ANGLE;
+                brake_setpoint_target = 0.0f;
+                line_enc_angle_corr   = 0.0f;
+                line_reverse_boost    = 0.0f;
+            } else if (line_state == LINE_STATE_OBJ_WALL_TURN) {
+                // Wall-following girando: upright puro, motores controlados por line_pivot_active
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
                 brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
@@ -2728,10 +2744,12 @@ static void ControlStep10ms(void)
                 obj_rev_initialized = 0;
                 obj_rot_initialized = 0;
                 obj_rot_start_ms    = 0;
-                obj_brake_start_ms  = 0;
-                obj_pre_rotate_ms   = 0;
-                obj_hold_start_ms   = 0;
-                obj_arc_steer_int   = 0.0f;
+                obj_brake_start_ms   = 0;
+                obj_pre_rotate_ms    = 0;
+                obj_hold_start_ms    = 0;
+                obj_rev_straight_int = 0.0f;
+                obj_arc_steer_int    = 0.0f;
+                obj_wall_vel_int     = 0.0f;
             }
         } else {
             if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
@@ -2815,8 +2833,9 @@ static void ControlStep10ms(void)
                      line_state == LINE_STATE_OBJ_REVERSE ||
                      line_state == LINE_STATE_OBJ_BRAKE  ||
                      line_state == LINE_STATE_OBJ_ROTATE ||
-                     line_state == LINE_STATE_OBJ_HOLD   ||
-                     line_state == LINE_STATE_OBJ_ARC))
+                     line_state == LINE_STATE_OBJ_HOLD      ||
+                     line_state == LINE_STATE_OBJ_WALL_FWD  ||
+                     line_state == LINE_STATE_OBJ_WALL_TURN))
                     balance_hold_active = 0;
                 else if (!balance_hold_active) {
                     if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
@@ -3020,7 +3039,8 @@ static void ControlStep10ms(void)
                             obj_rev_r0 = encoder_right;
                             obj_rev_l0 = encoder_left;
                             __enable_irq();
-                            obj_rev_initialized = 1;
+                            obj_rev_initialized  = 1;
+                            obj_rev_straight_int = 0.0f;
                         }
 
                         __disable_irq();
@@ -3078,10 +3098,15 @@ static void ControlStep10ms(void)
                                 log_i_line = i_line;
                                 log_d_line = d_line;
                             } else {
-                                const float REV_ENC_KP = 0.05f;
-                                float enc_corr = (float)(rev_dr - rev_dl) * REV_ENC_KP;
-                                if (enc_corr >  10.0f) enc_corr =  10.0f;
-                                if (enc_corr < -10.0f) enc_corr = -10.0f;
+                                // PI de enderezamiento: target = rev_dr == rev_dl.
+                                // Si el signo curva al reves, negar diff_err.
+                                float diff_err = (float)(rev_dr - rev_dl);
+                                obj_rev_straight_int += diff_err * DT_CTRL_FIXED;
+                                if (obj_rev_straight_int >  30.0f) obj_rev_straight_int =  30.0f;
+                                if (obj_rev_straight_int < -30.0f) obj_rev_straight_int = -30.0f;
+                                float enc_corr = 3.0f * diff_err + 0.5f * obj_rev_straight_int;
+                                if (enc_corr >  15.0f) enc_corr =  15.0f;
+                                if (enc_corr < -15.0f) enc_corr = -15.0f;
                                 steering_adjustment = enc_corr;
                             }
                         }
@@ -3137,10 +3162,7 @@ static void ControlStep10ms(void)
 
                         int32_t rot_counts = (abs(dr) + abs(dl)) / 2;
 
-                        uint8_t obj_side_visible = ((float)adcAvg[6] < OBJ_DETECT_THRESHOLD_f);
-
                         if (rot_counts >= target_counts ||
-                            obj_side_visible              ||
                             (HAL_GetTick() - obj_rot_start_ms) > 4000U) {
                             line_state          = LINE_STATE_OBJ_HOLD;
                             steering_adjustment = 0.0f;
@@ -3174,16 +3196,26 @@ static void ControlStep10ms(void)
                             line_lost_ms      = HAL_GetTick();
                             obj_hold_start_ms = 0;
                         } else if ((HAL_GetTick() - obj_hold_start_ms) >= OBJ_HOLD_DURATION_MS) {
-                            line_state        = LINE_STATE_OBJ_ARC;
+                            line_state        = LINE_STATE_OBJ_WALL_FWD;
                             obj_hold_start_ms = 0;
+                            obj_wall_vel_int  = 0.0f;
                         }
                         break;
                     }
 
                     case LINE_STATE_OBJ_ARC:
+                        // (no usado — reservado) cae al WALL_FWD si se llega aquí por error
+                        line_state = LINE_STATE_OBJ_WALL_FWD;
+                        break;
+
+                    case LINE_STATE_OBJ_WALL_FWD:
                     {
-                        // Avance en arco con PI cerrado sobre diferencial de encoders.
-                        // OBJ_ARC_DIFF_TARGET [rps] = (speed_right - speed_left): pos → izquierda (empírico).
+                        // Wall-following: avanza mientras ADC7 ve el objeto.
+                        // Si pierde el objeto → pivot izquierda. Si ve línea → FOLLOWING.
+                        // Si demasiado cerca (ADC7 < TOO_CLOSE) → pivot derecha igual que OBJ_ROTATE.
+                        float wall_adc      = (float)adcAvg[OBJ_WALL_ADC_IDX];
+                        uint8_t wall_visible = (wall_adc < OBJ_WALL_THRESHOLD);
+                        uint8_t too_close    = (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
                         if (line_detected) {
                             line_state          = LINE_STATE_FOLLOWING;
                             line_integral       = 0.0f;
@@ -3192,21 +3224,56 @@ static void ControlStep10ms(void)
                             line_error_f_d      = 0.0f;
                             line_lost_ms        = HAL_GetTick();
                             steering_adjustment = 0.0f;
-                            obj_arc_steer_int   = 0.0f;
+                        } else if (too_close) {
+                            // Demasiado cerca: pivot derecha (alejar del obstáculo)
+                            line_pivot_active  = 1;
+                            motorRightVelocity = (int16_t)clampf_local(
+                                -(pwm_sat + OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                            motorLeftVelocity  = (int16_t)clampf_local(
+                                -(pwm_sat - OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                        } else if (!wall_visible) {
+                            line_state          = LINE_STATE_OBJ_WALL_TURN;
+                            steering_adjustment = 0.0f;
+                            obj_wall_vel_int    = 0.0f;
                         } else {
-                            float arc_diff_meas  = speed_right_rps_s - speed_left_rps_s;
-                            float arc_diff_err   = OBJ_ARC_DIFF_TARGET - arc_diff_meas;
-                            obj_arc_steer_int   += arc_diff_err * DT_CTRL_FIXED;
-                            steering_adjustment  = OBJ_ARC_KP * arc_diff_err
-                                                 + OBJ_ARC_KI * obj_arc_steer_int;
-                            if (steering_adjustment >  OBJ_ARC_STEER_MAX) {
-                                steering_adjustment = OBJ_ARC_STEER_MAX;
-                                obj_arc_steer_int  -= arc_diff_err * DT_CTRL_FIXED; // anti-windup
-                            }
-                            if (steering_adjustment < -OBJ_ARC_STEER_MAX) {
-                                steering_adjustment = -OBJ_ARC_STEER_MAX;
-                                obj_arc_steer_int  -= arc_diff_err * DT_CTRL_FIXED; // anti-windup
-                            }
+                            // Avanza hacia adelante con ángulo fijo; steering neutro.
+                            steering_adjustment = 0.0f;
+                        }
+                        break;
+                    }
+
+                    case LINE_STATE_OBJ_WALL_TURN:
+                    {
+                        // Pivot izquierda hasta re-ver el objeto en ADC7 o detectar línea.
+                        // Si demasiado cerca (ADC7 < TOO_CLOSE) → pivot derecha en cambio.
+                        float wall_adc       = (float)adcAvg[OBJ_WALL_ADC_IDX];
+                        uint8_t wall_visible = (wall_adc < OBJ_WALL_THRESHOLD);
+                        uint8_t too_close    = (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
+                        if (line_detected) {
+                            line_state          = LINE_STATE_FOLLOWING;
+                            line_integral       = 0.0f;
+                            line_obj_rev_vel_integral = 0.0f;
+                            line_error_prev     = 0.0f;
+                            line_error_f_d      = 0.0f;
+                            line_lost_ms        = HAL_GetTick();
+                            line_pivot_active   = 0;
+                        } else if (too_close) {
+                            // Demasiado cerca: pivot derecha (alejar del obstáculo)
+                            line_pivot_active  = 1;
+                            motorRightVelocity = (int16_t)clampf_local(
+                                -(pwm_sat + OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                            motorLeftVelocity  = (int16_t)clampf_local(
+                                -(pwm_sat - OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                        } else if (wall_visible) {
+                            line_state        = LINE_STATE_OBJ_WALL_FWD;
+                            line_pivot_active = 0;
+                        } else {
+                            // Pivot izquierda: signo opuesto a OBJ_ROTATE (que pivotea derecha).
+                            line_pivot_active  = 1;
+                            motorRightVelocity = (int16_t)clampf_local(
+                                -(pwm_sat - OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                            motorLeftVelocity  = (int16_t)clampf_local(
+                                -(pwm_sat + OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
                         }
                         break;
                     }
