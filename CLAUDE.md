@@ -216,7 +216,8 @@ Balancin_Mendelevich/
 - `OBJ_WALL_FWD`: ángulo fijo `5.5°`, avanza mientras ADC7 < 3750. Si ADC7 < 300 ("demasiado cerca") → pivot derecha. Si ADC7 > 3750 → WALL_TURN.
 - `OBJ_WALL_TURN`: pivot izquierda (potencia 20) hasta re-ver ADC7 < 3750. Si ADC7 < 300 → pivot derecha en cambio.
 - `OBJ_DETECT_THRESHOLD_VAL` subido de `2000` → `3200` (sensores hardware actualizados con nuevas resistencias, mayor alcance)
-- `OBJ_WALL_PIVOT_POWER` aumentado de 5.0 → 20.0 (5 estaba por debajo del umbral efectivo de los motores)
+- `OBJ_WALL_PIVOT_POWER` = 8.0 (subido de 5 que era insuficiente, bajado de 20 que era demasiado agresivo)
+- Línea ignorada durante `OBJ_WALL_LINE_IGNORE_MS=3000ms` al entrar en WALL_FWD (evita volver a FOLLOWING prematuramente al cruzar la línea original)
 - `rev_target_counts` reducido de `300` → `10` counts; hold pre-reversa reducido de 2s → 1s
 
 ### Pendientes / bugs conocidos 🔧
@@ -253,6 +254,7 @@ Balancin_Mendelevich/
 | 2026-05-27 | Core/Src/main.c | Detección "demasiado cerca" en WALL_FWD y WALL_TURN: si `adcAvg[6] < OBJ_WALL_TOO_CLOSE_THOLD=300`, pivotea derecha (mismo signo que OBJ_ROTATE) en lugar de avanzar/izquierda. Prioridad: `line_detected` > `too_close` > `!wall_visible` > avance. Nuevo define `OBJ_WALL_TOO_CLOSE_THOLD=300.0f`. | Evitar que el robot choque con el obstáculo cuando se acerca demasiado |
 | 2026-05-27 | Core/Src/main.c | `steering_adjustment = 0.0f` explícito en rama de avance de WALL_FWD (cuando wall_visible y no too_close). Antes: valor residual de OBJ_HOLD podía causar desvío no deseado. | Prevenir desvío lateral al avanzar junto al objeto |
 | 2026-05-27 | Core/Src/main.c | `obj_wall_vel_int = 0.0f` agregado en transición OBJ_HOLD→WALL_FWD. | Estado limpio al entrar en wall-following |
+| 2026-05-27 | Core/Src/main.c | `OBJ_WALL_PIVOT_POWER` ajustado de 20.0 → 8.0 (20 era demasiado agresivo). `OBJ_WALL_LINE_IGNORE_MS=3000` agregado: al entrar a WALL_FWD se ignora `line_detected` durante 3s para no volver a FOLLOWING al pasar sobre la línea original. `obj_wall_fwd_start_ms` nuevo file-scope, inicializado al entrar desde OBJ_HOLD o WALL_TURN, reseteado al salir. | Robot volvía a FOLLOWING inmediatamente al cruzar la línea y el pivot era excesivo |
 | 2026-05-26 | Core/Src/main.c | Detección de objetos re-habilitada: `obj_now` restaurado a `adcAvg[4..7] < OBJ_DETECT_THRESHOLD_f` (estaba forzado a 0). Cadena de evasión FOLLOWING→OBJ_REVERSE→OBJ_BRAKE→OBJ_ROTATE→OBJ_HOLD activa nuevamente | Se había deshabilitado para trabajar solo en seguimiento de línea |
 | 2026-05-26 | Core/Src/main.c | OBJ_REVERSE: cuando no hay línea visible, `steering_adjustment` ahora usa feedback de encoders `(rev_dr - rev_dl) × REV_ENC_KP(0.05)` en lugar de 0. Compensa asimetría mecánica de la rueda izquierda que retrocede menos que la derecha | Reversa torcida: motor izquierdo tiene mayor resistencia en ese sentido |
 | 2026-05-26 | Core/Src/main.c | `OBJ_REVERSE` reemplaza el setpoint fijo `-1.5°` por PI de velocidad hacia atrás (`LINE_OBJ_REV_*`) y usa PID de línea con error invertido, limitado por `LINE_OBJ_REV_STEER_MAX`. El clamp negativo de modo línea permite `-LINE_OBJ_REV_TILT_MAX` solo en reversa por obstáculo | Mantenerse sobre la línea al retroceder ante obstáculos, inclinando hacia atrás como el seguidor inclina hacia adelante |

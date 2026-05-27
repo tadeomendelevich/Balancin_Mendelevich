@@ -195,7 +195,8 @@ typedef enum {
 #define OBJ_WALL_THRESHOLD         3750.0f   // ADC < umbral → objeto visible; > umbral → perdido
 #define OBJ_WALL_TOO_CLOSE_THOLD   300.0f    // ADC7 < este valor → demasiado cerca, pivot derecha
 #define OBJ_WALL_FWD_ANGLE         5.5f      // ángulo fijo de avance en WALL_FWD (°)
-#define OBJ_WALL_PIVOT_POWER       20.0f     // potencia del pivot en WALL_TURN/WALL_FWD (era 5)
+#define OBJ_WALL_PIVOT_POWER       8.0f      // potencia del pivot en WALL_TURN/WALL_FWD
+#define OBJ_WALL_LINE_IGNORE_MS    3000U     // ms al inicio de WALL_FWD en que se ignora la línea
 
 // Parámetros del arco evasivo (OBJ_ARC) — ajustables en runtime desde Qt
 // OBJ_ARC_DIFF_TARGET: diferencial de velocidad deseado entre ruedas [rps] (derecha - izquierda)
@@ -406,7 +407,8 @@ static uint32_t obj_pre_rotate_ms    = 0;         // inicio del wait post-freno 
 static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
 static float    obj_arc_steer_int    = 0.0f;      // integral del PI de diferencial en OBJ_ARC
 static float    obj_rev_straight_int = 0.0f;      // integral del PI de enderezamiento en OBJ_REVERSE
-static float    obj_wall_vel_int     = 0.0f;      // integral del PI de velocidad en OBJ_WALL_FWD
+static float    obj_wall_vel_int     = 0.0f;      // integral del PI de velocidad en OBJ_WALL_FWD (reservada)
+static uint32_t obj_wall_fwd_start_ms = 0;         // timestamp de entrada a WALL_FWD (para ignorar línea 3s)
 
 volatile uint8_t tick2ms_count = 0;
 
@@ -2749,7 +2751,8 @@ static void ControlStep10ms(void)
                 obj_hold_start_ms    = 0;
                 obj_rev_straight_int = 0.0f;
                 obj_arc_steer_int    = 0.0f;
-                obj_wall_vel_int     = 0.0f;
+                obj_wall_vel_int      = 0.0f;
+                obj_wall_fwd_start_ms = 0;
             }
         } else {
             if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
@@ -3196,9 +3199,10 @@ static void ControlStep10ms(void)
                             line_lost_ms      = HAL_GetTick();
                             obj_hold_start_ms = 0;
                         } else if ((HAL_GetTick() - obj_hold_start_ms) >= OBJ_HOLD_DURATION_MS) {
-                            line_state        = LINE_STATE_OBJ_WALL_FWD;
-                            obj_hold_start_ms = 0;
-                            obj_wall_vel_int  = 0.0f;
+                            line_state            = LINE_STATE_OBJ_WALL_FWD;
+                            obj_hold_start_ms     = 0;
+                            obj_wall_vel_int      = 0.0f;
+                            obj_wall_fwd_start_ms = HAL_GetTick();
                         }
                         break;
                     }
@@ -3211,12 +3215,15 @@ static void ControlStep10ms(void)
                     case LINE_STATE_OBJ_WALL_FWD:
                     {
                         // Wall-following: avanza mientras ADC7 ve el objeto.
-                        // Si pierde el objeto → pivot izquierda. Si ve línea → FOLLOWING.
+                        // Si pierde el objeto → pivot izquierda. Si ve línea (tras 3s) → FOLLOWING.
                         // Si demasiado cerca (ADC7 < TOO_CLOSE) → pivot derecha igual que OBJ_ROTATE.
-                        float wall_adc      = (float)adcAvg[OBJ_WALL_ADC_IDX];
+                        if (obj_wall_fwd_start_ms == 0)
+                            obj_wall_fwd_start_ms = HAL_GetTick();
+                        uint8_t line_ignore = ((HAL_GetTick() - obj_wall_fwd_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
+                        float wall_adc       = (float)adcAvg[OBJ_WALL_ADC_IDX];
                         uint8_t wall_visible = (wall_adc < OBJ_WALL_THRESHOLD);
                         uint8_t too_close    = (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
-                        if (line_detected) {
+                        if (line_detected && !line_ignore) {
                             line_state          = LINE_STATE_FOLLOWING;
                             line_integral       = 0.0f;
                             line_obj_rev_vel_integral = 0.0f;
@@ -3224,6 +3231,7 @@ static void ControlStep10ms(void)
                             line_error_f_d      = 0.0f;
                             line_lost_ms        = HAL_GetTick();
                             steering_adjustment = 0.0f;
+                            obj_wall_fwd_start_ms = 0;
                         } else if (too_close) {
                             // Demasiado cerca: pivot derecha (alejar del obstáculo)
                             line_pivot_active  = 1;
@@ -3232,9 +3240,10 @@ static void ControlStep10ms(void)
                             motorLeftVelocity  = (int16_t)clampf_local(
                                 -(pwm_sat - OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
                         } else if (!wall_visible) {
-                            line_state          = LINE_STATE_OBJ_WALL_TURN;
-                            steering_adjustment = 0.0f;
-                            obj_wall_vel_int    = 0.0f;
+                            line_state            = LINE_STATE_OBJ_WALL_TURN;
+                            steering_adjustment   = 0.0f;
+                            obj_wall_vel_int      = 0.0f;
+                            obj_wall_fwd_start_ms = 0;
                         } else {
                             // Avanza hacia adelante con ángulo fijo; steering neutro.
                             steering_adjustment = 0.0f;
@@ -3265,8 +3274,9 @@ static void ControlStep10ms(void)
                             motorLeftVelocity  = (int16_t)clampf_local(
                                 -(pwm_sat - OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
                         } else if (wall_visible) {
-                            line_state        = LINE_STATE_OBJ_WALL_FWD;
-                            line_pivot_active = 0;
+                            line_state            = LINE_STATE_OBJ_WALL_FWD;
+                            line_pivot_active     = 0;
+                            obj_wall_fwd_start_ms = HAL_GetTick();
                         } else {
                             // Pivot izquierda: signo opuesto a OBJ_ROTATE (que pivotea derecha).
                             line_pivot_active  = 1;
