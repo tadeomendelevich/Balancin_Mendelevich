@@ -185,7 +185,7 @@ typedef enum {
 
 #define OBJ_DETECT_THRESHOLD_VAL   3200.0f   // objeto detectado si ADC < este valor (sin objeto: ~4095, con objeto: <3200)
 #define OBJ_DETECT_DEBOUNCE_CNT    3          // ciclos consecutivos (30 ms) para confirmar objeto
-#define OBJ_PRE_REVERSE_HOLD_MS    2000U      // tiempo de balance estatico antes de hacer reversa
+#define OBJ_PRE_REVERSE_HOLD_MS    1000U      // tiempo de balance estatico antes de rotar
 // Giro 90° por encoders: medir distancia entre centros de rueda y ajustar aquí
 #define OBJ_ROTATE_TRACK_WIDTH     0.220f    // metros entre centros de ruedas (medido: 220 mm)
 #define OBJ_HOLD_DURATION_MS       2000U     // ms de balance estatico en OBJ_HOLD antes de pasar a OBJ_ARC
@@ -395,6 +395,7 @@ static uint8_t  obj_rev_initialized  = 0;         // flag sesión actual de OBJ_
 static int32_t  obj_rev_r0           = 0;
 static int32_t  obj_rev_l0           = 0;
 static uint32_t obj_brake_start_ms   = 0;         // inicio de OBJ_BRAKE (file-scope para reset en caída)
+static uint32_t obj_pre_rotate_ms    = 0;         // inicio del wait post-freno antes de OBJ_ROTATE
 static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
 static float    obj_arc_steer_int    = 0.0f;      // integral del PI de diferencial en OBJ_ARC
 
@@ -2148,7 +2149,7 @@ static void ControlStep10ms(void)
 		int32_t delta_left  = enc_l - enc_left_prev;
 		enc_right_prev = enc_r;
 		enc_left_prev  = enc_l;
-		#define ENC_CPR        24  // 4x quadrature: ambos canales A y B, RISING+FALLING
+		#define ENC_CPR        28  // 4x quadrature: ambos canales A y B, RISING+FALLING
 		#define ENC_VEL_SCALE  0.17750f  // 2π × r_rueda (radio 2.825 cm) → m/s
 		float speed_right_rps = (float)delta_right / (ENC_CPR * DT_CTRL_FIXED);
 		float speed_left_rps  = (float)delta_left  / (ENC_CPR * DT_CTRL_FIXED);
@@ -2245,9 +2246,9 @@ static void ControlStep10ms(void)
                 if (obj_cnt >= OBJ_DETECT_DEBOUNCE_CNT &&
                     line_state == LINE_STATE_FOLLOWING &&
                     HAL_GetTick() >= obj_detect_ignore_until_ms) {
-                    line_state          = LINE_STATE_OBJ_PRE_REVERSE_HOLD;
+                    line_state           = LINE_STATE_OBJ_PRE_REVERSE_HOLD;
                     obj_pre_rev_start_ms = HAL_GetTick();
-                    obj_cnt             = 0;
+                    obj_cnt              = 0;
                     steering_adjustment = 0.0f;
                     line_integral       = 0.0f;
                     line_obj_rev_vel_integral = 0.0f;
@@ -2728,6 +2729,7 @@ static void ControlStep10ms(void)
                 obj_rot_initialized = 0;
                 obj_rot_start_ms    = 0;
                 obj_brake_start_ms  = 0;
+                obj_pre_rotate_ms   = 0;
                 obj_hold_start_ms   = 0;
                 obj_arc_steer_int   = 0.0f;
             }
@@ -3001,16 +3003,17 @@ static void ControlStep10ms(void)
                         line_error_f_d      = 0.0f;
 
                         if ((HAL_GetTick() - obj_pre_rev_start_ms) >= OBJ_PRE_REVERSE_HOLD_MS) {
-                            line_state           = LINE_STATE_OBJ_ROTATE;
+                            line_state          = LINE_STATE_OBJ_REVERSE;
                             obj_pre_rev_start_ms = 0;
-                            obj_rot_initialized  = 0;
+                            obj_rev_initialized = 0;
+                            obj_rot_initialized = 0;
                         }
                         break;
                     }
 
                     case LINE_STATE_OBJ_REVERSE:
                     {
-                        const int32_t rev_target_counts = 150;
+                        const int32_t rev_target_counts = 10;
 
                         if (!obj_rev_initialized) {
                             __disable_irq();
@@ -3088,19 +3091,27 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_OBJ_BRAKE:
                     {
-                        // Espera a que la velocidad caiga antes de girar.
-                        // ComputeBrakeSetpointTarget actúa sobre el setpoint; acá solo
-                        // verificamos la condición de salida con velocity_est_f.
-                        const float  BRAKE_VEL_THR = 0.05f;   // m/s
-                        const uint32_t BRAKE_TIMEOUT = 1500U;  // ms máximo de espera
+                        // Fase 1: espera a que la velocidad caiga. Fase 2: wait 1s antes de rotar.
+                        const float    BRAKE_VEL_THR  = 0.05f;
+                        const uint32_t BRAKE_TIMEOUT  = 1500U;
+                        const uint32_t PRE_ROTATE_MS  = 1000U;
                         if (obj_brake_start_ms == 0) obj_brake_start_ms = HAL_GetTick();
 
-                        if (fabsf(velocity_est_f) < BRAKE_VEL_THR ||
-                            (HAL_GetTick() - obj_brake_start_ms) > BRAKE_TIMEOUT) {
+                        // Fase 1: frenar hasta quieto o timeout
+                        if (obj_pre_rotate_ms == 0) {
+                            if (fabsf(velocity_est_f) < BRAKE_VEL_THR ||
+                                (HAL_GetTick() - obj_brake_start_ms) > BRAKE_TIMEOUT) {
+                                obj_pre_rotate_ms = HAL_GetTick();  // arranca fase 2
+                            }
+                        }
+                        // Fase 2: wait 1s quieto antes de girar
+                        if (obj_pre_rotate_ms != 0 &&
+                            (HAL_GetTick() - obj_pre_rotate_ms) >= PRE_ROTATE_MS) {
                             line_state          = LINE_STATE_OBJ_ROTATE;
                             obj_rot_initialized = 0;
                             steering_adjustment = 0.0f;
                             obj_brake_start_ms  = 0;
+                            obj_pre_rotate_ms   = 0;
                         }
                         break;
                     }
@@ -3126,8 +3137,11 @@ static void ControlStep10ms(void)
 
                         int32_t rot_counts = (abs(dr) + abs(dl)) / 2;
 
+                        uint8_t obj_side_visible = ((float)adcAvg[6] < OBJ_DETECT_THRESHOLD_f);
+
                         if (rot_counts >= target_counts ||
-                            (HAL_GetTick() - obj_rot_start_ms) > 3000U) {
+                            obj_side_visible              ||
+                            (HAL_GetTick() - obj_rot_start_ms) > 4000U) {
                             line_state          = LINE_STATE_OBJ_HOLD;
                             steering_adjustment = 0.0f;
                             obj_rot_initialized = 0;
