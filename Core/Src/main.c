@@ -194,7 +194,12 @@ typedef enum {
 #define OBJ_WALL_ADC_IDX           6          // índice del sensor lateral (ADC7 = adcAvg[6])
 #define OBJ_WALL_THRESHOLD         3750.0f   // ADC < umbral → objeto visible; > umbral → perdido
 #define OBJ_WALL_TOO_CLOSE_THOLD   300.0f    // ADC7 < este valor → demasiado cerca, pivot derecha
-#define OBJ_WALL_FWD_ANGLE         5.5f      // ángulo fijo de avance en WALL_FWD (°)
+#define OBJ_WALL_FWD_ANGLE         2.5f      // ángulo máximo de avance en WALL_FWD (°)
+#define OBJ_WALL_SPEED_TARGET      0.25f     // velocidad objetivo en WALL_FWD (m/s)
+#define OBJ_WALL_VEL_KP            8.0f      // ganancia P del PI de velocidad WALL_FWD
+#define OBJ_WALL_VEL_KI            2.0f      // ganancia I del PI de velocidad WALL_FWD
+#define OBJ_WALL_VEL_I_MAX         1.5f      // límite del integral (° equivalentes)
+#define OBJ_WALL_MIN_ANGLE         0.5f      // ángulo mínimo de avance cuando ve la pared (°)
 #define OBJ_WALL_PIVOT_POWER       8.0f      // potencia del pivot en WALL_TURN/WALL_FWD
 #define OBJ_WALL_LINE_IGNORE_MS    3000U     // ms al inicio de WALL_FWD en que se ignora la línea
 
@@ -2538,8 +2543,23 @@ static void ControlStep10ms(void)
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_WALL_FWD) {
-                // Ángulo fijo de avance: el PID de balance regula la inclinación hacia OBJ_WALL_FWD_ANGLE
-                base_setpoint_target  = OBJ_WALL_FWD_ANGLE;
+                // PI de velocidad: pide más ángulo si va lento, menos si va rápido.
+                // Piso OBJ_WALL_MIN_ANGLE para arrancar siempre con algo de inclinación.
+                {
+                    float wf_fwd_vel = fmaxf(0.0f, -velocity_est_f);
+                    float wf_vel_err = OBJ_WALL_SPEED_TARGET - wf_fwd_vel;
+                    if (wf_vel_err > 0.0f) {
+                        obj_wall_vel_int += wf_vel_err * DT_CTRL_FIXED;
+                        if (obj_wall_vel_int > OBJ_WALL_VEL_I_MAX)
+                            obj_wall_vel_int = OBJ_WALL_VEL_I_MAX;
+                    } else {
+                        obj_wall_vel_int *= 0.85f;
+                    }
+                    float wf_cmd = OBJ_WALL_VEL_KP * wf_vel_err + OBJ_WALL_VEL_KI * obj_wall_vel_int;
+                    if (wf_cmd < OBJ_WALL_MIN_ANGLE) wf_cmd = OBJ_WALL_MIN_ANGLE;
+                    if (wf_cmd > OBJ_WALL_FWD_ANGLE) wf_cmd = OBJ_WALL_FWD_ANGLE;
+                    base_setpoint_target = wf_cmd;
+                }
                 brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
