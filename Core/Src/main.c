@@ -56,10 +56,11 @@ typedef enum {
     LINE_STATE_OBJ_REVERSE,    // (deshabilitado) reversa breve antes del giro
     LINE_STATE_OBJ_BRAKE,      // (deshabilitado) frena hasta velocidad ≈ 0 antes de girar
     LINE_STATE_OBJ_ROTATE,     // Objeto detectado: girando 180° derecha por encoders
-    LINE_STATE_OBJ_HOLD,       // Post-rotación: balance estático espera 2s
-    LINE_STATE_OBJ_ARC,        // (no usado) reservado
-    LINE_STATE_OBJ_WALL_FWD,   // Wall-following: avanza +0.5° mientras ve objeto en ADC7
-    LINE_STATE_OBJ_WALL_TURN,  // Wall-following: pivot izquierda hasta re-ver objeto en ADC7
+    LINE_STATE_OBJ_HOLD,          // Post-rotación: balance estático espera 2s
+    LINE_STATE_OBJ_ARC,           // (no usado) reservado
+    LINE_STATE_OBJ_WALL_APPROACH, // Avanza despacio (2°) hasta encontrar la pared en ADC7
+    LINE_STATE_OBJ_WALL_FWD,      // Wall-following: avanza mientras ADC7 en rango 300-3750
+    LINE_STATE_OBJ_WALL_TURN,     // Wall-following: pivot izquierda hasta re-ver objeto en ADC7
 } eLineState;
 
 /* USER CODE END PTD */
@@ -194,6 +195,8 @@ typedef enum {
 #define OBJ_WALL_ADC_IDX           6          // índice del sensor lateral (ADC7 = adcAvg[6])
 #define OBJ_WALL_THRESHOLD         3750.0f   // ADC < umbral → objeto visible; > umbral → perdido
 #define OBJ_WALL_TOO_CLOSE_THOLD   300.0f    // ADC7 < este valor → demasiado cerca, pivot derecha
+#define OBJ_WALL_APPROACH_ANGLE    2.0f      // ángulo de avance lento buscando la pared (°)
+#define OBJ_WALL_APPROACH_TIMEOUT  6000U     // ms máximos buscando la pared antes de rendirse
 #define OBJ_WALL_FWD_ANGLE         2.5f      // ángulo máximo de avance en WALL_FWD (°)
 #define OBJ_WALL_SPEED_TARGET      0.25f     // velocidad objetivo en WALL_FWD (m/s)
 #define OBJ_WALL_VEL_KP            8.0f      // ganancia P del PI de velocidad WALL_FWD
@@ -412,7 +415,8 @@ static uint32_t obj_pre_rotate_ms    = 0;         // inicio del wait post-freno 
 static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
 static float    obj_arc_steer_int    = 0.0f;      // integral del PI de diferencial en OBJ_ARC
 static float    obj_rev_straight_int = 0.0f;      // integral del PI de enderezamiento en OBJ_REVERSE
-static float    obj_wall_vel_int     = 0.0f;      // integral del PI de velocidad en OBJ_WALL_FWD (reservada)
+static float    obj_wall_vel_int      = 0.0f;      // integral del PI de velocidad en OBJ_WALL_FWD
+static uint32_t obj_wall_approach_start_ms = 0;    // timestamp de entrada a WALL_APPROACH
 static uint32_t obj_wall_fwd_start_ms = 0;         // timestamp de entrada a WALL_FWD (para ignorar línea 3s)
 
 volatile uint8_t tick2ms_count = 0;
@@ -1633,9 +1637,10 @@ void updateDisplay(void) {
                     case LINE_STATE_OBJ_REVERSE: line_mode_str = "REVERS"; break;
                     case LINE_STATE_OBJ_BRAKE:   line_mode_str = "BRAKE";  break;
                     case LINE_STATE_OBJ_ROTATE:  line_mode_str = "ROTATE"; break;
-                    case LINE_STATE_OBJ_HOLD:      line_mode_str = "HOLD";   break;
-                    case LINE_STATE_OBJ_WALL_FWD:  line_mode_str = "WF_FWD"; break;
-                    case LINE_STATE_OBJ_WALL_TURN: line_mode_str = "WF_TRN"; break;
+                    case LINE_STATE_OBJ_HOLD:          line_mode_str = "HOLD";   break;
+                    case LINE_STATE_OBJ_WALL_APPROACH: line_mode_str = "WF_APR"; break;
+                    case LINE_STATE_OBJ_WALL_FWD:      line_mode_str = "WF_FWD"; break;
+                    case LINE_STATE_OBJ_WALL_TURN:     line_mode_str = "WF_TRN"; break;
                     default:                    line_mode_str = "UNK";    break;
                 }
             }
@@ -2542,6 +2547,12 @@ static void ControlStep10ms(void)
                 brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
+            } else if (line_state == LINE_STATE_OBJ_WALL_APPROACH) {
+                // Avanza despacio buscando la pared; ángulo fijo hasta que ADC7 la detecte.
+                base_setpoint_target  = OBJ_WALL_APPROACH_ANGLE;
+                brake_setpoint_target = 0.0f;
+                line_enc_angle_corr   = 0.0f;
+                line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_WALL_FWD) {
                 // PI de velocidad: pide más ángulo si va lento, menos si va rápido.
                 // Piso OBJ_WALL_MIN_ANGLE para arrancar siempre con algo de inclinación.
@@ -2766,8 +2777,9 @@ static void ControlStep10ms(void)
                 obj_hold_start_ms    = 0;
                 obj_rev_straight_int = 0.0f;
                 obj_arc_steer_int    = 0.0f;
-                obj_wall_vel_int      = 0.0f;
-                obj_wall_fwd_start_ms = 0;
+                obj_wall_vel_int           = 0.0f;
+                obj_wall_approach_start_ms = 0;
+                obj_wall_fwd_start_ms      = 0;
             }
         } else {
             if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
@@ -2852,6 +2864,7 @@ static void ControlStep10ms(void)
                      line_state == LINE_STATE_OBJ_BRAKE  ||
                      line_state == LINE_STATE_OBJ_ROTATE ||
                      line_state == LINE_STATE_OBJ_HOLD      ||
+                     line_state == LINE_STATE_OBJ_WALL_APPROACH ||
                      line_state == LINE_STATE_OBJ_WALL_FWD  ||
                      line_state == LINE_STATE_OBJ_WALL_TURN))
                     balance_hold_active = 0;
@@ -3214,18 +3227,39 @@ static void ControlStep10ms(void)
                             line_lost_ms      = HAL_GetTick();
                             obj_hold_start_ms = 0;
                         } else if ((HAL_GetTick() - obj_hold_start_ms) >= OBJ_HOLD_DURATION_MS) {
-                            line_state            = LINE_STATE_OBJ_WALL_FWD;
-                            obj_hold_start_ms     = 0;
-                            obj_wall_vel_int      = 0.0f;
-                            obj_wall_fwd_start_ms = HAL_GetTick();
+                            line_state                 = LINE_STATE_OBJ_WALL_APPROACH;
+                            obj_hold_start_ms          = 0;
+                            obj_wall_approach_start_ms = HAL_GetTick();
                         }
                         break;
                     }
 
                     case LINE_STATE_OBJ_ARC:
-                        // (no usado — reservado) cae al WALL_FWD si se llega aquí por error
-                        line_state = LINE_STATE_OBJ_WALL_FWD;
+                        // (no usado — reservado)
+                        line_state = LINE_STATE_OBJ_WALL_APPROACH;
                         break;
+
+                    case LINE_STATE_OBJ_WALL_APPROACH:
+                    {
+                        // Avanza despacio con OBJ_WALL_APPROACH_ANGLE hasta que ADC7 detecta la pared.
+                        // Timeout OBJ_WALL_APPROACH_TIMEOUT → vuelve a FOLLOWING si no encuentra pared.
+                        uint8_t wall_found = ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD);
+                        if (f_fallen) {
+                            line_state                 = LINE_STATE_FOLLOWING;
+                            obj_wall_approach_start_ms = 0;
+                        } else if (wall_found) {
+                            line_state                 = LINE_STATE_OBJ_WALL_FWD;
+                            obj_wall_approach_start_ms = 0;
+                            obj_wall_vel_int           = 0.0f;
+                            obj_wall_fwd_start_ms      = HAL_GetTick();
+                        } else if ((HAL_GetTick() - obj_wall_approach_start_ms) >= OBJ_WALL_APPROACH_TIMEOUT) {
+                            line_state                 = LINE_STATE_FOLLOWING;
+                            obj_wall_approach_start_ms = 0;
+                        }
+                        // Mientras avanza: steering neutro, setpoint manejado por bloque de setpoints.
+                        steering_adjustment = 0.0f;
+                        break;
+                    }
 
                     case LINE_STATE_OBJ_WALL_FWD:
                     {
