@@ -1714,15 +1714,10 @@ void updateDisplay(void) {
                 }
             }
 
-            // --- KD ---
+            // --- ADC7 (sensor lateral pared) ---
             {
                 char buf[14];
-                float v = KD_LINE;
-                uint32_t vi = (uint32_t)v;
-                uint32_t vd = (uint32_t)((v - vi) * 1000.0f + 0.5f);
-                if (vd >= 1000) { vd = 0; vi++; }
-                snprintf(buf, sizeof(buf), "KD:%lu.%03lu",
-                         (unsigned long)vi, (unsigned long)vd);
+                snprintf(buf, sizeof(buf), "A7:%lu", (unsigned long)adcAvg[6]);
                 uint16_t x = 73;
                 for (char *p = buf; *p; p++) {
                     SSD1306_DrawChar5x7(*p, x, 31);
