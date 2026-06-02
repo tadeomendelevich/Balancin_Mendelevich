@@ -151,7 +151,7 @@ typedef enum {
 #define BRAKE_TILT_MAX          3.0f
 #define BRAKE_TILT_MAX_MANUAL   3.0f
 #define BRAKE_TILT_STEP_BAL     0.5f
-#define BRAKE_TILT_STEP_MAN     0.3f
+#define BRAKE_TILT_STEP_MAN     0.5f
 #define INTEGRAL_DECAY   		0.990f
 
 // Steering PID (lazo cerrado por encoders)
@@ -388,15 +388,18 @@ static uint8_t  key_click_count = 0;
 static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 
 // Giro preciso en modo MANUAL (encoders + giroscopio)
-#define MANUAL_ROT_PIVOT_POWER  12.0f   // PWM de pivot durante el giro
-#define MANUAL_ROT_SLOWDOWN_DEG  15.0f  // grados antes del target para reducir potencia
+#define MANUAL_ROT_PIVOT_POWER  15.0f   // PWM de pivot durante el giro
+#define MANUAL_ROT_SLOWDOWN_DEG 35.0f   // grados antes del target para reducir potencia
+#define MANUAL_ROT_BRAKE_POWER  15.0f   // contra-pivot activo para frenar inercia post-giro
 static float    manual_rot_target_deg  = 0.0f;
 static uint8_t  manual_rot_trigger     = 0;    // set por UNER para arrancar
 static uint8_t  manual_rot_active      = 0;    // 1 = giro en curso
+static uint8_t  manual_rot_phase       = 0;    // 0=avance, 1=contra-frenado activo
 static float    manual_rot_heading     = 0.0f; // ángulo acumulado por giroscopio (°)
 static uint32_t manual_rot_start_ms   = 0;
 static int32_t  manual_rot_enc_r0     = 0;
 static int32_t  manual_rot_enc_l0     = 0;
+static uint32_t manual_auto_rot_last_ms = 0;  // timestamp del último giro automático
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float line_enc_angle_corr     = 0.0f;  // corrección P de angulo por deficit de velocidad encoder
 static float line_reverse_boost     = 0.0f;  // extra de angulo si encoders muestran reversa
@@ -2471,6 +2474,7 @@ static void ControlStep10ms(void)
                 manual_cmd_last_ms     = HAL_GetTick();
                 manual_setpoint_ramped = 0.0f;
                 steering_adjustment    = 0.0f;
+                manual_auto_rot_last_ms = HAL_GetTick();
             }
         }
 
@@ -2603,10 +2607,19 @@ static void ControlStep10ms(void)
             line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
         } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
 
+            // ── Giro automático cada 5 s: 90° derecha ────────────────────────
+            if (!manual_rot_active && !f_fallen &&
+                (HAL_GetTick() - manual_auto_rot_last_ms) >= 5000U) {
+                manual_rot_target_deg   = 90.0f;
+                manual_rot_trigger      = 1;
+                manual_auto_rot_last_ms = HAL_GetTick();
+            }
+
             // ── Giro preciso: arranque por trigger UNER ──────────────────────
             if (manual_rot_trigger && !manual_rot_active && !f_fallen) {
                 manual_rot_active   = 1;
                 manual_rot_trigger  = 0;
+                manual_rot_phase    = 0;
                 manual_rot_heading  = 0.0f;
                 manual_rot_start_ms = HAL_GetTick();
                 __disable_irq();
@@ -2628,9 +2641,31 @@ static void ControlStep10ms(void)
                 // Timeout proporcional al ángulo objetivo (mínimo 3s)
                 uint32_t timeout_ms = (uint32_t)(abs_target / 90.0f * 3000.0f) + 2000U;
 
-                if (abs_heading >= abs_target * 0.97f ||
-                    (HAL_GetTick() - manual_rot_start_ms) > timeout_ms) {
-                    manual_rot_active = 0;
+                if ((HAL_GetTick() - manual_rot_start_ms) > timeout_ms) {
+                    // Timeout: abortar sin importar la fase
+                    manual_rot_active       = 0;
+                    manual_rot_phase        = 0;
+                    manual_auto_rot_last_ms = HAL_GetTick();
+                    manual_setpoint_cmd     = 0.0f;
+                    manual_steering_cmd     = 0.0f;
+                    manual_setpoint_ramped  = SETPOINT_ANGLE + setpoint_trim;
+                    steering_adjustment     = 0.0f;
+                    manual_cmd_last_ms      = HAL_GetTick();
+                } else if (manual_rot_phase == 0 && abs_heading >= abs_target * 0.60f) {
+                    // Al 60% del ángulo: pasar a contra-frenado activo
+                    manual_rot_phase = 1;
+                } else if (manual_rot_phase == 1) {
+                    // Salir cuando la rotación casi se detuvo dentro del rango aceptable
+                    if (abs_heading <= abs_target + 3.0f && fabsf(gz_dps) < 15.0f) {
+                        manual_rot_active       = 0;
+                        manual_rot_phase        = 0;
+                        manual_auto_rot_last_ms = HAL_GetTick();
+                        manual_setpoint_cmd     = 0.0f;
+                        manual_steering_cmd     = 0.0f;
+                        manual_setpoint_ramped  = SETPOINT_ANGLE + setpoint_trim;
+                        steering_adjustment     = 0.0f;
+                        manual_cmd_last_ms      = HAL_GetTick();
+                    }
                 }
 
                 // Durante el giro: upright puro, sin avance ni freno traslacional
@@ -2959,8 +2994,6 @@ static void ControlStep10ms(void)
             float pwm_limit;
             if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
                 pwm_limit = 40.0f;
-            } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                pwm_limit = 55.0f;
             } else {
                 pwm_limit = 100.0f;
             }
@@ -3420,17 +3453,21 @@ static void ControlStep10ms(void)
                 line_state          = LINE_STATE_FOLLOWING;
 
                 if (manual_rot_active) {
-                    // Pivot de precisión: misma fórmula que OBJ_ROTATE.
                     // dir > 0 = derecha: right retrocede, left avanza.
-                    // dir < 0 = izquierda: right avanza, left retrocede.
                     float dir = (manual_rot_target_deg >= 0.0f) ? 1.0f : -1.0f;
+                    float pivot;
 
-                    // Reducir potencia en los últimos MANUAL_ROT_SLOWDOWN_DEG para mayor precisión
-                    float abs_remaining = fabsf(manual_rot_target_deg) - fabsf(manual_rot_heading);
-                    float slowdown = (abs_remaining < MANUAL_ROT_SLOWDOWN_DEG)
-                                   ? (abs_remaining / MANUAL_ROT_SLOWDOWN_DEG)
-                                   : 1.0f;
-                    float pivot = MANUAL_ROT_PIVOT_POWER * fmaxf(slowdown, 0.3f);
+                    if (manual_rot_phase == 0) {
+                        // Fase 1: avance con slowdown suave desde MANUAL_ROT_SLOWDOWN_DEG
+                        float abs_remaining = fabsf(manual_rot_target_deg) - fabsf(manual_rot_heading);
+                        float slowdown = (abs_remaining < MANUAL_ROT_SLOWDOWN_DEG)
+                                       ? (abs_remaining / MANUAL_ROT_SLOWDOWN_DEG)
+                                       : 1.0f;
+                        pivot = MANUAL_ROT_PIVOT_POWER * fmaxf(slowdown, 0.0f);
+                    } else {
+                        // Fase 2: contra-pivot activo para frenar inercia
+                        pivot = -MANUAL_ROT_BRAKE_POWER;
+                    }
 
                     steering_adjustment = 0.0f;
                     motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + dir * pivot), -60.0f, 60.0f);
