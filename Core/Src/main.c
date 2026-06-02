@@ -386,6 +386,17 @@ static uint32_t key_click_time = 0;
 static uint8_t  key_click_count = 0;
 
 static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
+
+// Giro preciso en modo MANUAL (encoders + giroscopio)
+#define MANUAL_ROT_PIVOT_POWER  12.0f   // PWM de pivot durante el giro
+#define MANUAL_ROT_SLOWDOWN_DEG  15.0f  // grados antes del target para reducir potencia
+static float    manual_rot_target_deg  = 0.0f;
+static uint8_t  manual_rot_trigger     = 0;    // set por UNER para arrancar
+static uint8_t  manual_rot_active      = 0;    // 1 = giro en curso
+static float    manual_rot_heading     = 0.0f; // ángulo acumulado por giroscopio (°)
+static uint32_t manual_rot_start_ms   = 0;
+static int32_t  manual_rot_enc_r0     = 0;
+static int32_t  manual_rot_enc_l0     = 0;
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float line_enc_angle_corr     = 0.0f;  // corrección P de angulo por deficit de velocidad encoder
 static float line_reverse_boost     = 0.0f;  // extra de angulo si encoders muestran reversa
@@ -2591,50 +2602,81 @@ static void ControlStep10ms(void)
             }
             line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
         } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-            if (HAL_GetTick() - manual_cmd_last_ms > 60) {
-                manual_setpoint_cmd *= 0.96f;
-                manual_steering_cmd *= 0.90f;
 
-                if (fabsf(manual_setpoint_cmd) < 0.01f) manual_setpoint_cmd = 0.0f;
-                if (fabsf(manual_steering_cmd) < 0.01f) manual_steering_cmd = 0.0f;
+            // ── Giro preciso: arranque por trigger UNER ──────────────────────
+            if (manual_rot_trigger && !manual_rot_active && !f_fallen) {
+                manual_rot_active   = 1;
+                manual_rot_trigger  = 0;
+                manual_rot_heading  = 0.0f;
+                manual_rot_start_ms = HAL_GetTick();
+                __disable_irq();
+                manual_rot_enc_r0 = encoder_right;
+                manual_rot_enc_l0 = encoder_left;
+                __enable_irq();
+                manual_setpoint_cmd = 0.0f;
+                manual_steering_cmd = 0.0f;
             }
 
-            const float manual_safe_angle = 15.0f;
-            const float manual_max_angle  = 35.0f;
+            if (manual_rot_active) {
+                // Integrar velocidad angular del giroscopio (sensor primario de precisión)
+                float gz_dps = (float)gz / 131.0f;
+                manual_rot_heading += gz_dps * DT_CTRL_FIXED;
 
-            float abs_roll = fabsf(filtered_roll_deg);
-            float safety_factor;
+                float abs_target  = fabsf(manual_rot_target_deg);
+                float abs_heading = fabsf(manual_rot_heading);
 
-            if (abs_roll <= manual_safe_angle) {
-                safety_factor = 1.0f;
-            } else if (abs_roll >= manual_max_angle) {
-                safety_factor = 0.0f;
+                // Timeout proporcional al ángulo objetivo (mínimo 3s)
+                uint32_t timeout_ms = (uint32_t)(abs_target / 90.0f * 3000.0f) + 2000U;
+
+                if (abs_heading >= abs_target * 0.97f ||
+                    (HAL_GetTick() - manual_rot_start_ms) > timeout_ms) {
+                    manual_rot_active = 0;
+                }
+
+                // Durante el giro: upright puro, sin avance ni freno traslacional
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_target = 0.0f;
+                manual_setpoint_ramped = base_setpoint_target;
             } else {
-                safety_factor = 1.0f - ((abs_roll - manual_safe_angle) / (manual_max_angle - manual_safe_angle));
+                // Control manual normal
+                if (HAL_GetTick() - manual_cmd_last_ms > 60) {
+                    manual_setpoint_cmd *= 0.96f;
+                    manual_steering_cmd *= 0.90f;
+                    if (fabsf(manual_setpoint_cmd) < 0.01f) manual_setpoint_cmd = 0.0f;
+                    if (fabsf(manual_steering_cmd) < 0.01f) manual_steering_cmd = 0.0f;
+                }
+
+                const float manual_safe_angle = 15.0f;
+                const float manual_max_angle  = 35.0f;
+                float abs_roll = fabsf(filtered_roll_deg);
+                float safety_factor;
+                if (abs_roll <= manual_safe_angle) {
+                    safety_factor = 1.0f;
+                } else if (abs_roll >= manual_max_angle) {
+                    safety_factor = 0.0f;
+                } else {
+                    safety_factor = 1.0f - ((abs_roll - manual_safe_angle) / (manual_max_angle - manual_safe_angle));
+                }
+
+                float scaled_cmd = manual_setpoint_cmd * safety_factor;
+                const float conflict_threshold = 10.0f;
+                if (filtered_roll_deg >  conflict_threshold && scaled_cmd > 0.0f) scaled_cmd = 0.0f;
+                if (filtered_roll_deg < -conflict_threshold && scaled_cmd < 0.0f) scaled_cmd = 0.0f;
+
+                const float RAMP_RATE_UP   = 0.01f;
+                const float RAMP_RATE_DOWN = 0.008f;
+                float ramp_target = SETPOINT_ANGLE + setpoint_trim + scaled_cmd;
+                float ramp_delta  = ramp_target - manual_setpoint_ramped;
+                float ramp_rate   = (ramp_delta > 0.0f) ? RAMP_RATE_UP : RAMP_RATE_DOWN;
+                if (fabsf(ramp_delta) <= ramp_rate) {
+                    manual_setpoint_ramped = ramp_target;
+                } else {
+                    manual_setpoint_ramped += (ramp_delta > 0.0f) ? ramp_rate : -ramp_rate;
+                }
+
+                base_setpoint_target  = manual_setpoint_ramped;
+                brake_setpoint_target = ComputeBrakeSetpointTarget(robot_state);
             }
-
-            float scaled_cmd = manual_setpoint_cmd * safety_factor;
-
-            const float conflict_threshold = 10.0f;
-            if (filtered_roll_deg >  conflict_threshold && scaled_cmd > 0.0f) scaled_cmd = 0.0f;
-            if (filtered_roll_deg < -conflict_threshold && scaled_cmd < 0.0f) scaled_cmd = 0.0f;
-
-            const float RAMP_RATE_UP   = 0.01f;
-            const float RAMP_RATE_DOWN = 0.008f;
-
-            float ramp_target = SETPOINT_ANGLE + setpoint_trim + scaled_cmd;
-            float ramp_delta  = ramp_target - manual_setpoint_ramped;
-            float ramp_rate   = (ramp_delta > 0.0f) ? RAMP_RATE_UP : RAMP_RATE_DOWN;
-
-            if (fabsf(ramp_delta) <= ramp_rate) {
-                manual_setpoint_ramped = ramp_target;
-            } else {
-                manual_setpoint_ramped += (ramp_delta > 0.0f) ? ramp_rate : -ramp_rate;
-            }
-
-            // velocity_est ya actualizado desde encoders al inicio del ciclo
-            base_setpoint_target  = manual_setpoint_ramped;
-            brake_setpoint_target = ComputeBrakeSetpointTarget(robot_state);
         } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
             base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
         } else if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
@@ -3377,31 +3419,48 @@ static void ControlStep10ms(void)
                 line_error_prev     = 0.0f;
                 line_state          = LINE_STATE_FOLLOWING;
 
-                {
-                    const float STEER_RATE = 1.5f;
-                    float steer_delta = manual_steering_cmd - steering_adjustment;
-                    if (steer_delta >  STEER_RATE) steer_delta =  STEER_RATE;
-                    if (steer_delta < -STEER_RATE) steer_delta = -STEER_RATE;
-                    steering_adjustment += steer_delta;
-                }
+                if (manual_rot_active) {
+                    // Pivot de precisión: misma fórmula que OBJ_ROTATE.
+                    // dir > 0 = derecha: right retrocede, left avanza.
+                    // dir < 0 = izquierda: right avanza, left retrocede.
+                    float dir = (manual_rot_target_deg >= 0.0f) ? 1.0f : -1.0f;
 
-                static float prev_steering_cmd = 0.0f;
-                if ((manual_steering_cmd > 0.5f && prev_steering_cmd < -0.5f) ||
-                    (manual_steering_cmd < -0.5f && prev_steering_cmd > 0.5f)) {
-                    integral = 0.0f;
-                }
-                prev_steering_cmd = manual_steering_cmd;
+                    // Reducir potencia en los últimos MANUAL_ROT_SLOWDOWN_DEG para mayor precisión
+                    float abs_remaining = fabsf(manual_rot_target_deg) - fabsf(manual_rot_heading);
+                    float slowdown = (abs_remaining < MANUAL_ROT_SLOWDOWN_DEG)
+                                   ? (abs_remaining / MANUAL_ROT_SLOWDOWN_DEG)
+                                   : 1.0f;
+                    float pivot = MANUAL_ROT_PIVOT_POWER * fmaxf(slowdown, 0.3f);
 
-                float mR = pwm_sat - steering_adjustment;
-                float mL = pwm_sat + steering_adjustment;
+                    steering_adjustment = 0.0f;
+                    motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + dir * pivot), -60.0f, 60.0f);
+                    motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - dir * pivot), -60.0f, 60.0f);
+                } else {
+                    {
+                        const float STEER_RATE = 1.5f;
+                        float steer_delta = manual_steering_cmd - steering_adjustment;
+                        if (steer_delta >  STEER_RATE) steer_delta =  STEER_RATE;
+                        if (steer_delta < -STEER_RATE) steer_delta = -STEER_RATE;
+                        steering_adjustment += steer_delta;
+                    }
 
-                if (mR >  100.0f) mR =  100.0f;
-                if (mR < -100.0f) mR = -100.0f;
-                if (mL >  100.0f) mL =  100.0f;
-                if (mL < -100.0f) mL = -100.0f;
+                    static float prev_steering_cmd = 0.0f;
+                    if ((manual_steering_cmd > 0.5f && prev_steering_cmd < -0.5f) ||
+                        (manual_steering_cmd < -0.5f && prev_steering_cmd > 0.5f)) {
+                        integral = 0.0f;
+                    }
+                    prev_steering_cmd = manual_steering_cmd;
 
-                motorRightVelocity = -(int16_t)mL;
-                motorLeftVelocity  = -(int16_t)mR;
+                    float mR = pwm_sat - steering_adjustment;
+                    float mL = pwm_sat + steering_adjustment;
+                    if (mR >  100.0f) mR =  100.0f;
+                    if (mR < -100.0f) mR = -100.0f;
+                    if (mL >  100.0f) mL =  100.0f;
+                    if (mL < -100.0f) mL = -100.0f;
+
+                    motorRightVelocity = -(int16_t)mL;
+                    motorLeftVelocity  = -(int16_t)mR;
+                } // end else (no rotation active)
 
             } else if (robot_state != ROBOT_STATE_MOTOR_TEST) {
                 line_integral       = 0.0f;
@@ -3694,6 +3753,7 @@ int main(void)
   UNER_RegisterFlags(NULL, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
   UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_SPEED_TARGET, NULL);
   UNER_RegisterManualControl(&manual_setpoint_cmd, &manual_steering_cmd, &manual_cmd_last_ms);
+  UNER_RegisterRotationCmd(&manual_rot_target_deg, &manual_rot_trigger);
   UNER_RegisterSetpointTrim(&setpoint_trim);
   UNER_RegisterRobotState(&robot_state);
 

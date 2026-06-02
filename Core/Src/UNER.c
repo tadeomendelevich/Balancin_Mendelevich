@@ -75,6 +75,9 @@ static float *p_manual_sp_cmd = NULL;
 static float *p_manual_st_cmd = NULL;
 static uint32_t *p_manual_tmo = NULL;
 
+static float   *p_rot_target_deg = NULL;
+static uint8_t *p_rot_trigger    = NULL;
+
 static float *p_setpoint_trim = NULL;
 
 static uint8_t last_manual_cmd = 0;
@@ -723,6 +726,66 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
             putByteOnTx(dataTx, dataTx->chk);
         break;
 
+        case ROTATE_90_RIGHT:
+            if (p_robot_state != NULL && *p_robot_state == 4 && p_rot_target_deg && p_rot_trigger) {
+                *p_rot_target_deg = +90.0f;
+                *p_rot_trigger    = 1;
+            }
+            putHeaderOnTx(dataTx, ROTATE_90_RIGHT, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
+        case ROTATE_90_LEFT:
+            if (p_robot_state != NULL && *p_robot_state == 4 && p_rot_target_deg && p_rot_trigger) {
+                *p_rot_target_deg = -90.0f;
+                *p_rot_trigger    = 1;
+            }
+            putHeaderOnTx(dataTx, ROTATE_90_LEFT, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
+        case ROTATE_180_RIGHT:
+            if (p_robot_state != NULL && *p_robot_state == 4 && p_rot_target_deg && p_rot_trigger) {
+                *p_rot_target_deg = +180.0f;
+                *p_rot_trigger    = 1;
+            }
+            putHeaderOnTx(dataTx, ROTATE_180_RIGHT, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
+        case ROTATE_180_LEFT:
+            if (p_robot_state != NULL && *p_robot_state == 4 && p_rot_target_deg && p_rot_trigger) {
+                *p_rot_target_deg = -180.0f;
+                *p_rot_trigger    = 1;
+            }
+            putHeaderOnTx(dataTx, ROTATE_180_LEFT, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
+        case ROTATE_CUSTOM:
+        {
+            // Payload: 4 bytes = float en little-endian (grados; + = derecha, - = izquierda)
+            if (p_robot_state != NULL && *p_robot_state == 4 && p_rot_target_deg && p_rot_trigger) {
+                union { uint8_t b[4]; float f; } conv;
+                conv.b[0] = unerRx->buff[(unerRx->indexR + 2) & unerRx->mask];
+                conv.b[1] = unerRx->buff[(unerRx->indexR + 3) & unerRx->mask];
+                conv.b[2] = unerRx->buff[(unerRx->indexR + 4) & unerRx->mask];
+                conv.b[3] = unerRx->buff[(unerRx->indexR + 5) & unerRx->mask];
+                if (conv.f != 0.0f) {
+                    *p_rot_target_deg = conv.f;
+                    *p_rot_trigger    = 1;
+                }
+            }
+            putHeaderOnTx(dataTx, ROTATE_CUSTOM, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        }
+        break;
+
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
 
@@ -972,6 +1035,11 @@ void UNER_RegisterManualControl(float *spCmdPtr, float *stCmdPtr, uint32_t *tmoP
     p_manual_sp_cmd = spCmdPtr;
     p_manual_st_cmd = stCmdPtr;
     p_manual_tmo = tmoPtr;
+}
+
+void UNER_RegisterRotationCmd(float *rotDegPtr, uint8_t *rotTriggerPtr) {
+    p_rot_target_deg = rotDegPtr;
+    p_rot_trigger    = rotTriggerPtr;
 }
 
 void UNER_RegisterSetpointTrim(float *trimPtr) {

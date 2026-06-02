@@ -129,6 +129,11 @@ typedef enum{
     MOVE_LEFT = 0xD2,
     MOVE_RIGHT = 0xD3,
     MOVE_STOP = 0xD4,
+    ROTATE_90_RIGHT  = 0xD5,   // giro 90° derecha (encoders + gyro)
+    ROTATE_90_LEFT   = 0xD6,   // giro 90° izquierda
+    ROTATE_180_RIGHT = 0xD7,   // giro 180° derecha
+    ROTATE_180_LEFT  = 0xD8,   // giro 180° izquierda
+    ROTATE_CUSTOM    = 0xD9,   // payload: float 4 bytes (°, + = derecha, − = izquierda)
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -222,6 +227,8 @@ void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3,
 void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLinePtr, float *thresPtr, float *speedPtr, uint8_t *lineFollowFlagPtr);
 
 void UNER_RegisterManualControl(float *spCmdPtr, float *stCmdPtr, uint32_t *tmoPtr);
+
+void UNER_RegisterRotationCmd(float *rotDegPtr, uint8_t *rotTriggerPtr);
 
 void UNER_RegisterSetpointTrim(float *trimPtr);
 
