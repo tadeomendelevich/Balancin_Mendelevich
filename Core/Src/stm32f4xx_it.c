@@ -392,7 +392,7 @@ void USART1_IRQHandler(void)
 }
 
 /**
-  * @brief This function handles EXTI line[15:10] interrupts.
+  * @brief This function handles EXTI line[9:5] interrupts.
   */
 void EXTI9_5_IRQHandler(void)
 {
@@ -407,6 +407,9 @@ void EXTI9_5_IRQHandler(void)
   /* USER CODE END EXTI9_5_IRQn 1 */
 }
 
+/**
+  * @brief This function handles EXTI line[15:10] interrupts.
+  */
 void EXTI15_10_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI15_10_IRQn 0 */
@@ -417,8 +420,6 @@ void EXTI15_10_IRQHandler(void)
   // Encoders B/A: solo procesar si el pin NO está enmascarado por el anti-storm.
   // Sin esta guarda, el MPU (PB12) al disparar EXTI15_10 procesa bits pendientes
   // de encoders enmascarados, ejecutando el callback y burlando el anti-storm.
-  // Si IMR=0 (enmascarado), el bit PR se preserva para que TIM5 lo procese al
-  // rehabilitar el pin.
   if (EXTI->IMR & GPIO_PIN_13) HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);
   if (EXTI->IMR & GPIO_PIN_14) HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_14);
   if (EXTI->IMR & GPIO_PIN_15) HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_15);

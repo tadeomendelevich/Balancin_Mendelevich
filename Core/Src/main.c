@@ -59,7 +59,7 @@ typedef enum {
     LINE_STATE_OBJ_HOLD,          // Post-rotación: balance estático espera 2s
     LINE_STATE_OBJ_ARC,           // (no usado) reservado
     LINE_STATE_OBJ_WALL_APPROACH, // Avanza despacio (2°) hasta encontrar la pared en ADC7
-    LINE_STATE_OBJ_WALL_FWD,      // Wall-following: avanza mientras ADC7 en rango 300-3750
+    LINE_STATE_OBJ_WALL_FWD,      // Wall-following: avanza mientras ADC7 en rango 500-3750
     LINE_STATE_OBJ_WALL_TURN,     // Wall-following: pivot izquierda hasta re-ver objeto en ADC7
 } eLineState;
 
@@ -194,15 +194,12 @@ typedef enum {
 #define OBJ_HOLD_DURATION_MS       2000U     // ms de balance estatico en OBJ_HOLD antes de wall-following
 #define OBJ_WALL_ADC_IDX           6          // índice del sensor lateral (ADC7 = adcAvg[6])
 #define OBJ_WALL_THRESHOLD         3750.0f   // ADC < umbral → objeto visible; > umbral → perdido
-#define OBJ_WALL_TOO_CLOSE_THOLD   300.0f    // ADC7 < este valor → demasiado cerca, pivot derecha
+#define OBJ_WALL_TOO_CLOSE_THOLD   500.0f    // ADC7 < este valor → demasiado cerca, pivot derecha
 #define OBJ_WALL_APPROACH_ANGLE    2.0f      // ángulo de avance lento buscando la pared (°)
 #define OBJ_WALL_APPROACH_TIMEOUT  6000U     // ms máximos buscando la pared antes de rendirse
-#define OBJ_WALL_FWD_ANGLE         2.5f      // ángulo máximo de avance en WALL_FWD (°)
-#define OBJ_WALL_SPEED_TARGET      0.25f     // velocidad objetivo en WALL_FWD (m/s)
-#define OBJ_WALL_VEL_KP            8.0f      // ganancia P del PI de velocidad WALL_FWD
-#define OBJ_WALL_VEL_KI            2.0f      // ganancia I del PI de velocidad WALL_FWD
-#define OBJ_WALL_VEL_I_MAX         1.5f      // límite del integral (° equivalentes)
-#define OBJ_WALL_MIN_ANGLE         0.5f      // ángulo mínimo de avance cuando ve la pared (°)
+#define OBJ_WALL_FWD_ANGLE         4.5f      // ángulo máximo de avance en WALL_FWD (°)
+#define OBJ_WALL_BRAKE_ANGLE       1.0f      // freno activo máximo por sobrevelocidad en WALL_FWD (°)
+#define OBJ_WALL_OVERSPEED_VEL     0.90f     // velocidad medida para frenar; evita regular fino con encoders cuantizados
 #define OBJ_WALL_PIVOT_POWER       8.0f      // potencia del pivot en WALL_TURN/WALL_FWD
 #define OBJ_WALL_LINE_IGNORE_MS    3000U     // ms al inicio de WALL_FWD en que se ignora la línea
 
@@ -415,7 +412,6 @@ static uint32_t obj_pre_rotate_ms    = 0;         // inicio del wait post-freno 
 static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
 static float    obj_arc_steer_int    = 0.0f;      // integral del PI de diferencial en OBJ_ARC
 static float    obj_rev_straight_int = 0.0f;      // integral del PI de enderezamiento en OBJ_REVERSE
-static float    obj_wall_vel_int      = 0.0f;      // integral del PI de velocidad en OBJ_WALL_FWD
 static uint32_t obj_wall_approach_start_ms = 0;    // timestamp de entrada a WALL_APPROACH
 static uint32_t obj_wall_fwd_start_ms = 0;         // timestamp de entrada a WALL_FWD (para ignorar línea 3s)
 
@@ -2554,21 +2550,14 @@ static void ControlStep10ms(void)
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_WALL_FWD) {
-                // PI de velocidad: pide más ángulo si va lento, menos si va rápido.
-                // Piso OBJ_WALL_MIN_ANGLE para arrancar siempre con algo de inclinación.
+                // Avance por pared: angulo fijo para no bambolear por cuantizacion de encoders.
+                // Solo frena si la velocidad filtrada supera claramente el rango seguro.
                 {
+                    // Camino activo: angulo fijo para avanzar recto; freno solo por sobrevelocidad clara.
                     float wf_fwd_vel = fmaxf(0.0f, -velocity_est_f);
-                    float wf_vel_err = OBJ_WALL_SPEED_TARGET - wf_fwd_vel;
-                    if (wf_vel_err > 0.0f) {
-                        obj_wall_vel_int += wf_vel_err * DT_CTRL_FIXED;
-                        if (obj_wall_vel_int > OBJ_WALL_VEL_I_MAX)
-                            obj_wall_vel_int = OBJ_WALL_VEL_I_MAX;
-                    } else {
-                        obj_wall_vel_int *= 0.85f;
-                    }
-                    float wf_cmd = OBJ_WALL_VEL_KP * wf_vel_err + OBJ_WALL_VEL_KI * obj_wall_vel_int;
-                    if (wf_cmd < OBJ_WALL_MIN_ANGLE) wf_cmd = OBJ_WALL_MIN_ANGLE;
-                    if (wf_cmd > OBJ_WALL_FWD_ANGLE) wf_cmd = OBJ_WALL_FWD_ANGLE;
+                    float wf_cmd = (wf_fwd_vel > OBJ_WALL_OVERSPEED_VEL)
+                                 ? -OBJ_WALL_BRAKE_ANGLE
+                                 :  OBJ_WALL_FWD_ANGLE;
                     base_setpoint_target = wf_cmd;
                 }
                 brake_setpoint_target = 0.0f;
@@ -2777,7 +2766,6 @@ static void ControlStep10ms(void)
                 obj_hold_start_ms    = 0;
                 obj_rev_straight_int = 0.0f;
                 obj_arc_steer_int    = 0.0f;
-                obj_wall_vel_int           = 0.0f;
                 obj_wall_approach_start_ms = 0;
                 obj_wall_fwd_start_ms      = 0;
             }
@@ -3250,7 +3238,6 @@ static void ControlStep10ms(void)
                         } else if (wall_found) {
                             line_state                 = LINE_STATE_OBJ_WALL_FWD;
                             obj_wall_approach_start_ms = 0;
-                            obj_wall_vel_int           = 0.0f;
                             obj_wall_fwd_start_ms      = HAL_GetTick();
                         } else if ((HAL_GetTick() - obj_wall_approach_start_ms) >= OBJ_WALL_APPROACH_TIMEOUT) {
                             line_state                 = LINE_STATE_FOLLOWING;
@@ -3291,10 +3278,9 @@ static void ControlStep10ms(void)
                         } else if (!wall_visible) {
                             line_state            = LINE_STATE_OBJ_WALL_TURN;
                             steering_adjustment   = 0.0f;
-                            obj_wall_vel_int      = 0.0f;
                             obj_wall_fwd_start_ms = 0;
                         } else {
-                            // Avanza hacia adelante con ángulo fijo; steering neutro.
+                            // Avanza hacia adelante con ángulo fijo; yaw-lock se aplica al calcular motores.
                             steering_adjustment = 0.0f;
                         }
                         break;
@@ -3354,7 +3340,8 @@ static void ControlStep10ms(void)
                     if (line_state == LINE_STATE_LOST     ||
                         line_state == LINE_STATE_SEARCHING ||
                         line_state == LINE_STATE_OBJ_PRE_REVERSE_HOLD ||
-                        line_state == LINE_STATE_OBJ_HOLD) {
+                        line_state == LINE_STATE_OBJ_HOLD ||
+                        line_state == LINE_STATE_OBJ_WALL_FWD) {
                         float gz_dps_line = (float)gz / 131.0f;
                         half_steer = gz_dps_line * 0.3f;
                     }
@@ -3643,8 +3630,14 @@ int main(void)
   IWDG->KR  = 0xAAAAU;
   IWDG->KR  = 0xCCCCU;
 
-  // TIM5 a prioridad 6 para que no preempte handlers de encoder (prio 1/5)
-  HAL_NVIC_SetPriority(TIM5_IRQn, 6, 0);
+  // Prioridades de interrupts — CubeMX las resetea a 0 al regenerar; las fijamos acá.
+  // I2C DMA deben estar por debajo de 0 para no competir con ADC_IRQn (prio 0).
+  // EXTI15_10 (encoders PB13/14/15 + MPU PB12) a prio 1 para que el I2C DMA no se pise.
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 1, 0);  // I2C1 RX DMA
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 1, 0);  // I2C1 TX DMA
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 2, 0);  // ADC1 DMA
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn,    1, 0);  // Encoders (PB13/14/15) + MPU (PB12)
+  HAL_NVIC_SetPriority(TIM5_IRQn,         6, 0);  // TIM5: re-habilitador de encoders, por debajo de encoders (prio 1/5)
 
   CDC_Attach_Rx(USBRxData);
   nBytesTx = 0;
@@ -3760,7 +3753,7 @@ int main(void)
   // Use raw bit 0 if DWT_CTRL_CYCCNT_Msk is not defined (standard for Cortex-M4)
   DWT->CTRL |= 1;
 
-/* USER CODE END 2 */
+  /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -4084,6 +4077,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_6;
   sConfig.Rank = 6;
+  sConfig.SamplingTime = ADC_SAMPLETIME_112CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -4093,6 +4087,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_7;
   sConfig.Rank = 7;
+  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -4102,6 +4097,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_8;
   sConfig.Rank = 8;
+  sConfig.SamplingTime = ADC_SAMPLETIME_112CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -4433,13 +4429,13 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 1, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
   /* DMA1_Stream1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 1, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 2, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
@@ -4495,7 +4491,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(MPU_INT_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 1, 0);
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
