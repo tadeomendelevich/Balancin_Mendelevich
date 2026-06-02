@@ -400,6 +400,7 @@ static uint32_t manual_rot_start_ms   = 0;
 static int32_t  manual_rot_enc_r0     = 0;
 static int32_t  manual_rot_enc_l0     = 0;
 static uint32_t manual_auto_rot_last_ms = 0;  // timestamp del último giro automático
+static uint8_t  manual_auto_rot_step    = 0;  // 0=90°der, 1=90°izq, 2=180°der
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float line_enc_angle_corr     = 0.0f;  // corrección P de angulo por deficit de velocidad encoder
 static float line_reverse_boost     = 0.0f;  // extra de angulo si encoders muestran reversa
@@ -2475,6 +2476,7 @@ static void ControlStep10ms(void)
                 manual_setpoint_ramped = 0.0f;
                 steering_adjustment    = 0.0f;
                 manual_auto_rot_last_ms = HAL_GetTick();
+                manual_auto_rot_step    = 0;
             }
         }
 
@@ -2607,10 +2609,16 @@ static void ControlStep10ms(void)
             line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
         } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
 
-            // ── Giro automático cada 5 s: 90° derecha ────────────────────────
+            // ── Ciclo automático cada 2.5 s: 90°der → 90°izq → 180°der → rep ─
             if (!manual_rot_active && !f_fallen &&
-                (HAL_GetTick() - manual_auto_rot_last_ms) >= 5000U) {
-                manual_rot_target_deg   = 90.0f;
+                (HAL_GetTick() - manual_auto_rot_last_ms) >= 2500U) {
+                switch (manual_auto_rot_step) {
+                    case 0: manual_rot_target_deg =  90.0f; break;
+                    case 1: manual_rot_target_deg = -90.0f; break;
+                    case 2: manual_rot_target_deg = 180.0f; break;
+                    default: manual_auto_rot_step = 0; manual_rot_target_deg = 90.0f; break;
+                }
+                manual_auto_rot_step    = (manual_auto_rot_step + 1) % 3;
                 manual_rot_trigger      = 1;
                 manual_auto_rot_last_ms = HAL_GetTick();
             }
