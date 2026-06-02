@@ -399,6 +399,7 @@ static float pwm_sat_prev = 0.0f;
 static float prev_error = 0.0f;
 static uint8_t balance_hold_active = 0;
 static uint32_t obj_detect_ignore_until_ms = 0;  // ignora sensores de objeto hasta este tick
+static uint8_t  prev_all_line_black        = 1;  // todos los sensores de línea en negro (robot en el aire)
 static uint32_t obj_pre_rev_start_ms = 0;
 static uint8_t  obj_rot_initialized  = 0;
 static int32_t  obj_rot_r0           = 0;
@@ -2295,6 +2296,18 @@ static void ControlStep10ms(void)
             w_sum = w[0] + w[1] + w[2] + w[3];
 
             line_detected = (w_sum > 0.0f);
+
+            // Detección de "puesto en el piso": los 4 sensores en negro = robot en el aire.
+            // Al transicionar a cualquier otro estado = robot apoyado → ignorar obstáculos 3s.
+            {
+                uint8_t all_black = (adcAvg[0] > (uint16_t)LINE_THRESHOLD &&
+                                     adcAvg[1] > (uint16_t)LINE_THRESHOLD &&
+                                     adcAvg[2] > (uint16_t)LINE_THRESHOLD &&
+                                     adcAvg[3] > (uint16_t)LINE_THRESHOLD);
+                if (prev_all_line_black && !all_black)
+                    obj_detect_ignore_until_ms = HAL_GetTick() + 3000U;
+                prev_all_line_black = all_black;
+            }
 
             if (line_detected) {
                 // Numerador cuadrático: coeficientes {+9,+1,-1,-9} (izq=positivo)
