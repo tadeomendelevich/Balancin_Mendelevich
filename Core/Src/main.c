@@ -2661,12 +2661,12 @@ static void ControlStep10ms(void)
                     manual_cmd_last_ms      = HAL_GetTick();
                     integral                = 0.0f;
                     brake_setpoint_f        = ComputeBrakeSetpointTarget(robot_state);
-                } else if (manual_rot_phase == 0 && abs_heading >= abs_target * 0.62f) {
-                    // Al 60% del ángulo: pasar a contra-frenado activo
+                } else if (manual_rot_phase == 0 && abs_heading >= abs_target * 0.55f) {
+                    // Al 55% del ángulo: pasar a contra-frenado activo
                     manual_rot_phase = 1;
                 } else if (manual_rot_phase == 1) {
-                    // Salir cuando la rotación casi se detuvo dentro del rango aceptable
-                    if (abs_heading <= abs_target + 3.0f && fabsf(gz_dps) < 15.0f) {
+                    // Salir cuando la rotación se detuvo (gz bajo), sin importar heading final
+                    if (fabsf(gz_dps) < 12.0f) {
                         manual_rot_active       = 0;
                         manual_rot_phase        = 0;
                         manual_auto_rot_last_ms = HAL_GetTick();
