@@ -2651,7 +2651,9 @@ static void ControlStep10ms(void)
                     manual_setpoint_ramped  = SETPOINT_ANGLE + setpoint_trim;
                     steering_adjustment     = 0.0f;
                     manual_cmd_last_ms      = HAL_GetTick();
-                } else if (manual_rot_phase == 0 && abs_heading >= abs_target * 0.60f) {
+                    integral                = 0.0f;
+                    brake_setpoint_f        = ComputeBrakeSetpointTarget(robot_state);
+                } else if (manual_rot_phase == 0 && abs_heading >= abs_target * 0.62f) {
                     // Al 60% del ángulo: pasar a contra-frenado activo
                     manual_rot_phase = 1;
                 } else if (manual_rot_phase == 1) {
@@ -2665,6 +2667,8 @@ static void ControlStep10ms(void)
                         manual_setpoint_ramped  = SETPOINT_ANGLE + setpoint_trim;
                         steering_adjustment     = 0.0f;
                         manual_cmd_last_ms      = HAL_GetTick();
+                        integral                = 0.0f;
+                        brake_setpoint_f        = ComputeBrakeSetpointTarget(robot_state);
                     }
                 }
 
