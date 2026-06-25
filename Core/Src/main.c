@@ -390,7 +390,7 @@ static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 // Giro preciso en modo MANUAL (encoders + giroscopio)
 #define MANUAL_ROT_PIVOT_POWER  15.0f   // PWM de pivot durante el giro
 #define MANUAL_ROT_SLOWDOWN_DEG 55.0f   // grados antes del target para reducir potencia (debe ser > 90*(1-0.55)=40.5 para que realmente se active)
-#define MANUAL_ROT_BRAKE_POWER  15.0f   // contra-pivot activo para frenar inercia post-giro
+#define MANUAL_ROT_BRAKE_POWER   5.0f   // contra-pivot suave para frenar inercia sin revertir
 static float    manual_rot_target_deg  = 0.0f;
 static uint8_t  manual_rot_trigger     = 0;    // set por UNER para arrancar
 static uint8_t  manual_rot_active      = 0;    // 1 = giro en curso
@@ -2653,12 +2653,12 @@ static void ControlStep10ms(void)
                 // Timeout total proporcional al ángulo (mínimo 3s)
                 uint32_t timeout_ms = (uint32_t)(abs_target / 90.0f * 3000.0f) + 2000U;
 
-                // Fallback por tiempo: reducido a 600 ms para 90° (antes 1000 ms causaba
-                // que el giro izquierda acumulara demasiada inercia cuando gz≈0).
-                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 600.0f);
+                // Fallback por tiempo: 400 ms para 90°. Mantiene menos inercia que 600 ms
+                // y el freno suave (BRAKE_POWER=5) puede detenerla sin revertir el giro.
+                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 400.0f);
 
-                // Tiempo fijo de freno en fase 1
-                uint32_t phase1_max_ms = 500U;
+                // Tiempo máximo de freno en fase 1: 250 ms
+                uint32_t phase1_max_ms = 250U;
 
                 if (elapsed_ms > timeout_ms) {
                     // Timeout total: abortar
@@ -2680,9 +2680,10 @@ static void ControlStep10ms(void)
                 } else if (manual_rot_phase == 1) {
                     uint32_t phase1_elapsed = HAL_GetTick() - manual_rot_start_ms;
                     int overshoot = (abs_heading > abs_target * 1.3f);
-                    // gz<12 solo puede salir DESPUÉS de 300 ms mínimos: evita que cuando gz≈0
-                    // (giro izquierda) la condición dispare en la primera iteración sin frenar nada.
-                    int gz_settled = (fabsf(gz_dps) < 12.0f && phase1_elapsed >= 300U);
+                    // gz<12 solo puede salir DESPUÉS de 120 ms mínimos: suficiente para iniciar
+                    // el freno pero sin acumular tanto contra-momentum que revierta el giro.
+                    // (Para giro izquierda, gz≈0 siempre → sale exactamente a los 120 ms.)
+                    int gz_settled = (fabsf(gz_dps) < 12.0f && phase1_elapsed >= 120U);
                     if (gz_settled || phase1_elapsed >= phase1_max_ms || overshoot) {
                         manual_rot_active   = 0;
                         manual_rot_phase    = 0;
