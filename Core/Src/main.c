@@ -2653,9 +2653,8 @@ static void ControlStep10ms(void)
                 // Timeout total proporcional al ángulo (mínimo 3s)
                 uint32_t timeout_ms = (uint32_t)(abs_target / 90.0f * 3000.0f) + 2000U;
 
-                // Fallback por tiempo: 400 ms para 90°. Mantiene menos inercia que 600 ms
-                // y el freno suave (BRAKE_POWER=5) puede detenerla sin revertir el giro.
-                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 400.0f);
+                // Fallback por tiempo: 500 ms para 90°.
+                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 500.0f);
 
                 // Tiempo máximo de freno en fase 1: 250 ms
                 uint32_t phase1_max_ms = 250U;
