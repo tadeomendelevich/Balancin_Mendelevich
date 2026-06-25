@@ -2663,8 +2663,8 @@ static void ControlStep10ms(void)
                 // Timeout total proporcional al ángulo (mínimo 3s)
                 uint32_t timeout_ms = (uint32_t)(abs_target / 90.0f * 3000.0f) + 2000U;
 
-                // Fallback por tiempo: 1000 ms para 90°.
-                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 1000.0f);
+                // Fallback por tiempo: 1400 ms para 90°.
+                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 1400.0f);
 
                 // Tiempo máximo de freno en fase 1: 250 ms
                 uint32_t phase1_max_ms = 250U;
