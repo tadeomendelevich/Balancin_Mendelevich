@@ -3499,8 +3499,13 @@ static void ControlStep10ms(void)
                     steering_adjustment = 0.0f;
                     if (manual_rot_phase == 0) {
                         // Fase 0: spin con componente de balance + slowdown
-                        // abs_heading ya es el max(gz, enc) calculado arriba
-                        float abs_remaining = abs_target - abs_heading;
+                        __disable_irq();
+                        int32_t _dr = encoder_right - manual_rot_enc_r0;
+                        int32_t _dl = encoder_left  - manual_rot_enc_l0;
+                        __enable_irq();
+                        float _enc_hdg = (fabsf((float)_dr) + fabsf((float)_dl)) * 0.5f * (90.0f / 325.0f);
+                        float _abs_hdg = fmaxf(fabsf(manual_rot_heading), _enc_hdg);
+                        float abs_remaining = fabsf(manual_rot_target_deg) - _abs_hdg;
                         float slowdown = (abs_remaining < MANUAL_ROT_SLOWDOWN_DEG)
                                        ? (abs_remaining / MANUAL_ROT_SLOWDOWN_DEG)
                                        : 1.0f;
