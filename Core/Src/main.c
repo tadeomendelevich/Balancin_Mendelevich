@@ -391,11 +391,15 @@ static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 #define MANUAL_ROT_PIVOT_POWER  15.0f   // PWM de pivot durante el giro
 #define MANUAL_ROT_SLOWDOWN_DEG 55.0f   // grados antes del target para reducir potencia (debe ser > 90*(1-0.55)=40.5 para que realmente se active)
 #define MANUAL_ROT_BRAKE_POWER   5.0f   // contra-pivot suave para frenar inercia sin revertir
+// Counts promedio (|dr|+|dl|)/2 esperados para un giro de 90°.
+// Ajustar con el valor que imprime "ROT_ENC" en USB al terminar cada giro.
+#define MANUAL_ROT_ENC_TARGET  380.0f
 static float    manual_rot_target_deg  = 0.0f;
 static uint8_t  manual_rot_trigger     = 0;    // set por UNER para arrancar
 static uint8_t  manual_rot_active      = 0;    // 1 = giro en curso
 static uint8_t  manual_rot_phase       = 0;    // 0=avance, 1=contra-frenado activo
 static float    manual_rot_heading     = 0.0f; // ángulo acumulado por giroscopio (°)
+static float    manual_rot_enc_counts  = 0.0f; // counts promedio acumulados en el giro actual
 static uint32_t manual_rot_start_ms   = 0;
 static int32_t  manual_rot_enc_r0     = 0;
 static int32_t  manual_rot_enc_l0     = 0;
@@ -2618,9 +2622,10 @@ static void ControlStep10ms(void)
                 switch (manual_auto_rot_step) {
                     case 0: manual_rot_target_deg =  90.0f; break;
                     case 1: manual_rot_target_deg = -90.0f; break;
+                    case 2: manual_rot_target_deg = 180.0f; break;
                     default: manual_auto_rot_step = 0; manual_rot_target_deg = 90.0f; break;
                 }
-                manual_auto_rot_step = (manual_auto_rot_step + 1) % 2;
+                manual_auto_rot_step = (manual_auto_rot_step + 1) % 3;
                 manual_rot_trigger   = 1;
                 manual_seq_next_ms   = 0; // desarmar; se re-arma al terminar el giro
             }
@@ -2645,35 +2650,35 @@ static void ControlStep10ms(void)
                 float gz_dps = (float)gz / 131.0f;
                 manual_rot_heading += gz_dps * DT_CTRL_FIXED;
 
-                // Heading por encoders: mismo mecanismo que OBJ_ROTATE (325 counts = 90°).
-                // Funciona para ambos sentidos (gz≈0 en giro izquierda, encoders no).
+                // Counts encoder acumulados desde inicio del giro (ambos sentidos)
                 __disable_irq();
                 int32_t enc_dr = encoder_right - manual_rot_enc_r0;
                 int32_t enc_dl = encoder_left  - manual_rot_enc_l0;
                 __enable_irq();
-                float enc_counts_avg  = (fabsf((float)enc_dr) + fabsf((float)enc_dl)) * 0.5f;
-                float enc_heading_deg = enc_counts_avg * (90.0f / 325.0f);
+                manual_rot_enc_counts = (fabsf((float)enc_dr) + fabsf((float)enc_dl)) * 0.5f;
 
-                // Heading compuesto: el mayor entre gz y encoders
                 float abs_target  = fabsf(manual_rot_target_deg);
+                // Heading compuesto: gz (funciona bien CW) + encoder (funciona ambos sentidos)
+                float enc_heading_deg = manual_rot_enc_counts * (90.0f / MANUAL_ROT_ENC_TARGET);
                 float abs_heading = fmaxf(fabsf(manual_rot_heading), enc_heading_deg);
 
                 uint32_t elapsed_ms = HAL_GetTick() - manual_rot_start_ms;
 
-                // Timeout total proporcional al ángulo (mínimo 3s)
+                // Timeout total de seguridad
                 uint32_t timeout_ms = (uint32_t)(abs_target / 90.0f * 3000.0f) + 2000U;
 
-                // Fallback por tiempo: 1400 ms para 90°.
-                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 1400.0f);
+                // Tiempo máximo de fase 0; encoder puede salir antes al 85% del target
+                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 1200.0f);
+                float enc_phase0_thr = (abs_target / 90.0f) * MANUAL_ROT_ENC_TARGET * 0.85f;
 
-                // Tiempo máximo de freno en fase 1: 250 ms
-                uint32_t phase1_max_ms = 250U;
+                // Tiempo máximo de freno fase 1
+                uint32_t phase1_max_ms = 300U;
 
                 if (elapsed_ms > timeout_ms) {
                     // Timeout total: abortar
                     manual_rot_active   = 0;
                     manual_rot_phase    = 0;
-                    manual_seq_next_ms  = HAL_GetTick() + 2500U; // pausa 2.5 s desde el fin
+                    manual_seq_next_ms  = HAL_GetTick() + 2500U;
                     manual_setpoint_cmd = 0.0f;
                     manual_steering_cmd = 0.0f;
                     manual_setpoint_ramped  = SETPOINT_ANGLE + setpoint_trim;
@@ -2682,19 +2687,24 @@ static void ControlStep10ms(void)
                     integral                = 0.0f;
                     brake_setpoint_f        = ComputeBrakeSetpointTarget(robot_state);
                 } else if (manual_rot_phase == 0 &&
-                           (abs_heading >= abs_target * 0.80f || elapsed_ms >= phase0_max_ms)) {
-                    // Al 80% por heading compuesto O al tiempo máximo de fase 0: pasar a contra-frenado
+                           (fabsf(manual_rot_heading) >= abs_target * 0.80f ||
+                            manual_rot_enc_counts >= enc_phase0_thr ||
+                            elapsed_ms >= phase0_max_ms)) {
+                    // Al 80% por gz (derecha), al 85% de MANUAL_ROT_ENC_TARGET (ambos), o por tiempo
                     manual_rot_phase    = 1;
-                    manual_rot_start_ms = HAL_GetTick(); // reiniciar timer para fase 1
+                    manual_rot_start_ms = HAL_GetTick();
                 } else if (manual_rot_phase == 1) {
                     uint32_t phase1_elapsed = HAL_GetTick() - manual_rot_start_ms;
-                    int overshoot   = (abs_heading > abs_target * 1.3f);
-                    // gz<12 solo puede salir DESPUÉS de 120 ms mínimos.
-                    // (Para giro izquierda, gz≈0 siempre → sale exactamente a los 120 ms.)
-                    int gz_settled  = (fabsf(gz_dps) < 12.0f && phase1_elapsed >= 120U);
-                    // Los encoders detectan llegada al ángulo objetivo (>= 95%) → frenar justo ahí
-                    int enc_reached = (enc_heading_deg >= abs_target * 0.95f && phase1_elapsed >= 60U);
-                    if (gz_settled || phase1_elapsed >= phase1_max_ms || overshoot || enc_reached) {
+                    int overshoot = (abs_heading > abs_target * 1.3f);
+                    // Salida por velocidad de rueda: cuando las ruedas se detienen → giro completo
+                    float rot_vel = (fabsf(speed_right_rps_s) + fabsf(speed_left_rps_s)) * 0.5f;
+                    int vel_settled = (rot_vel < 2.0f && phase1_elapsed >= 80U);
+                    if (vel_settled || phase1_elapsed >= phase1_max_ms || overshoot) {
+                        // Imprimir counts reales por USB para calibrar MANUAL_ROT_ENC_TARGET
+                        char _dbg[48];
+                        snprintf(_dbg, sizeof(_dbg), "ROT_ENC %.0f dr=%ld dl=%ld\r\n",
+                                 manual_rot_enc_counts, (long)enc_dr, (long)enc_dl);
+                        USB_DebugStr(_dbg);
                         manual_rot_active   = 0;
                         manual_rot_phase    = 0;
                         manual_seq_next_ms  = HAL_GetTick() + 2500U; // pausa 2.5 s desde el fin
@@ -3499,11 +3509,8 @@ static void ControlStep10ms(void)
                     steering_adjustment = 0.0f;
                     if (manual_rot_phase == 0) {
                         // Fase 0: spin con componente de balance + slowdown
-                        __disable_irq();
-                        int32_t _dr = encoder_right - manual_rot_enc_r0;
-                        int32_t _dl = encoder_left  - manual_rot_enc_l0;
-                        __enable_irq();
-                        float _enc_hdg = (fabsf((float)_dr) + fabsf((float)_dl)) * 0.5f * (90.0f / 325.0f);
+                        // manual_rot_enc_counts ya fue actualizado en el bloque de estado
+                        float _enc_hdg = manual_rot_enc_counts * (90.0f / MANUAL_ROT_ENC_TARGET);
                         float _abs_hdg = fmaxf(fabsf(manual_rot_heading), _enc_hdg);
                         float abs_remaining = fabsf(manual_rot_target_deg) - _abs_hdg;
                         float slowdown = (abs_remaining < MANUAL_ROT_SLOWDOWN_DEG)
