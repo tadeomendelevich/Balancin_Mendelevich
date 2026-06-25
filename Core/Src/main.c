@@ -2663,8 +2663,8 @@ static void ControlStep10ms(void)
                 // Timeout total proporcional al ángulo (mínimo 3s)
                 uint32_t timeout_ms = (uint32_t)(abs_target / 90.0f * 3000.0f) + 2000U;
 
-                // Fallback por tiempo: 500 ms para 90°.
-                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 500.0f);
+                // Fallback por tiempo: 1000 ms para 90°.
+                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 1000.0f);
 
                 // Tiempo máximo de freno en fase 1: 250 ms
                 uint32_t phase1_max_ms = 250U;
@@ -2682,8 +2682,8 @@ static void ControlStep10ms(void)
                     integral                = 0.0f;
                     brake_setpoint_f        = ComputeBrakeSetpointTarget(robot_state);
                 } else if (manual_rot_phase == 0 &&
-                           (abs_heading >= abs_target * 0.55f || elapsed_ms >= phase0_max_ms)) {
-                    // Al 55% por gz O al tiempo máximo de fase 0: pasar a contra-frenado
+                           (abs_heading >= abs_target * 0.80f || elapsed_ms >= phase0_max_ms)) {
+                    // Al 80% por heading compuesto O al tiempo máximo de fase 0: pasar a contra-frenado
                     manual_rot_phase    = 1;
                     manual_rot_start_ms = HAL_GetTick(); // reiniciar timer para fase 1
                 } else if (manual_rot_phase == 1) {
