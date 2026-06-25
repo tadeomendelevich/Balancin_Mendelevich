@@ -2610,8 +2610,10 @@ static void ControlStep10ms(void)
         } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
 
             // ── Ciclo automático: 90°der → pausa 2.5 s → 90°izq → pausa 2.5 s → rep ──
-            // manual_seq_next_ms es el deadline absoluto; el giro no arranca antes de ese tick.
+            // manual_seq_next_ms == 0  →  desarmado (giro en curso o no iniciado)
+            // manual_seq_next_ms != 0  →  armado; dispara cuando HAL_GetTick() >= deadline
             if (!manual_rot_active && !f_fallen &&
+                manual_seq_next_ms != 0 &&
                 HAL_GetTick() >= manual_seq_next_ms) {
                 switch (manual_auto_rot_step) {
                     case 0: manual_rot_target_deg =  90.0f; break;
@@ -2620,15 +2622,14 @@ static void ControlStep10ms(void)
                 }
                 manual_auto_rot_step = (manual_auto_rot_step + 1) % 2;
                 manual_rot_trigger   = 1;
-                // Bloquear el siguiente disparo hasta que este giro TERMINE + 2.5 s
-                // (se actualiza al final del giro; este valor es solo un respaldo)
-                manual_seq_next_ms = HAL_GetTick() + 10000U;
+                manual_seq_next_ms   = 0; // desarmar; se re-arma al terminar el giro
             }
 
             // ── Giro preciso: arranque por trigger UNER ──────────────────────
             if (manual_rot_trigger && !manual_rot_active && !f_fallen) {
                 manual_rot_active   = 1;
                 manual_rot_trigger  = 0;
+                // seq_next queda en 0 durante toda la rotación
                 manual_rot_phase    = 0;
                 manual_rot_heading  = 0.0f;
                 manual_rot_start_ms = HAL_GetTick();
