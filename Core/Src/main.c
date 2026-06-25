@@ -389,7 +389,7 @@ static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 
 // Giro preciso en modo MANUAL (encoders + giroscopio)
 #define MANUAL_ROT_PIVOT_POWER  15.0f   // PWM de pivot durante el giro
-#define MANUAL_ROT_SLOWDOWN_DEG 35.0f   // grados antes del target para reducir potencia
+#define MANUAL_ROT_SLOWDOWN_DEG 55.0f   // grados antes del target para reducir potencia (debe ser > 90*(1-0.55)=40.5 para que realmente se active)
 #define MANUAL_ROT_BRAKE_POWER  15.0f   // contra-pivot activo para frenar inercia post-giro
 static float    manual_rot_target_deg  = 0.0f;
 static uint8_t  manual_rot_trigger     = 0;    // set por UNER para arrancar
@@ -2609,16 +2609,15 @@ static void ControlStep10ms(void)
             line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
         } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
 
-            // ── Ciclo automático cada 2.5 s: 90°der → 90°izq → 180°der → rep ─
+            // ── Ciclo automático cada 2.5 s: 90°der → 90°izq → rep ─
             if (!manual_rot_active && !f_fallen &&
                 (HAL_GetTick() - manual_auto_rot_last_ms) >= 2500U) {
                 switch (manual_auto_rot_step) {
                     case 0: manual_rot_target_deg =  90.0f; break;
                     case 1: manual_rot_target_deg = -90.0f; break;
-                    case 2: manual_rot_target_deg = 180.0f; break;
                     default: manual_auto_rot_step = 0; manual_rot_target_deg = 90.0f; break;
                 }
-                manual_auto_rot_step    = (manual_auto_rot_step + 1) % 3;
+                manual_auto_rot_step    = (manual_auto_rot_step + 1) % 2;
                 manual_rot_trigger      = 1;
                 manual_auto_rot_last_ms = HAL_GetTick();
             }
@@ -2639,18 +2638,26 @@ static void ControlStep10ms(void)
             }
 
             if (manual_rot_active) {
-                // Integrar velocidad angular del giroscopio (sensor primario de precisión)
                 float gz_dps = (float)gz / 131.0f;
                 manual_rot_heading += gz_dps * DT_CTRL_FIXED;
 
                 float abs_target  = fabsf(manual_rot_target_deg);
                 float abs_heading = fabsf(manual_rot_heading);
 
-                // Timeout proporcional al ángulo objetivo (mínimo 3s)
+                uint32_t elapsed_ms = HAL_GetTick() - manual_rot_start_ms;
+
+                // Timeout total proporcional al ángulo (mínimo 3s)
                 uint32_t timeout_ms = (uint32_t)(abs_target / 90.0f * 3000.0f) + 2000U;
 
-                if ((HAL_GetTick() - manual_rot_start_ms) > timeout_ms) {
-                    // Timeout: abortar sin importar la fase
+                // Fallback por tiempo: reducido a 600 ms para 90° (antes 1000 ms causaba
+                // que el giro izquierda acumulara demasiada inercia cuando gz≈0).
+                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 600.0f);
+
+                // Tiempo fijo de freno en fase 1
+                uint32_t phase1_max_ms = 500U;
+
+                if (elapsed_ms > timeout_ms) {
+                    // Timeout total: abortar
                     manual_rot_active       = 0;
                     manual_rot_phase        = 0;
                     manual_auto_rot_last_ms = HAL_GetTick();
@@ -2661,12 +2668,18 @@ static void ControlStep10ms(void)
                     manual_cmd_last_ms      = HAL_GetTick();
                     integral                = 0.0f;
                     brake_setpoint_f        = ComputeBrakeSetpointTarget(robot_state);
-                } else if (manual_rot_phase == 0 && abs_heading >= abs_target * 0.55f) {
-                    // Al 55% del ángulo: pasar a contra-frenado activo
-                    manual_rot_phase = 1;
+                } else if (manual_rot_phase == 0 &&
+                           (abs_heading >= abs_target * 0.55f || elapsed_ms >= phase0_max_ms)) {
+                    // Al 55% por gz O al tiempo máximo de fase 0: pasar a contra-frenado
+                    manual_rot_phase    = 1;
+                    manual_rot_start_ms = HAL_GetTick(); // reiniciar timer para fase 1
                 } else if (manual_rot_phase == 1) {
-                    // Salir cuando la rotación se detuvo (gz bajo), sin importar heading final
-                    if (fabsf(gz_dps) < 12.0f) {
+                    uint32_t phase1_elapsed = HAL_GetTick() - manual_rot_start_ms;
+                    int overshoot = (abs_heading > abs_target * 1.3f);
+                    // gz<12 solo puede salir DESPUÉS de 300 ms mínimos: evita que cuando gz≈0
+                    // (giro izquierda) la condición dispare en la primera iteración sin frenar nada.
+                    int gz_settled = (fabsf(gz_dps) < 12.0f && phase1_elapsed >= 300U);
+                    if (gz_settled || phase1_elapsed >= phase1_max_ms || overshoot) {
                         manual_rot_active       = 0;
                         manual_rot_phase        = 0;
                         manual_auto_rot_last_ms = HAL_GetTick();
@@ -3467,23 +3480,24 @@ static void ControlStep10ms(void)
                 if (manual_rot_active) {
                     // dir > 0 = derecha: right retrocede, left avanza.
                     float dir = (manual_rot_target_deg >= 0.0f) ? 1.0f : -1.0f;
-                    float pivot;
 
+                    steering_adjustment = 0.0f;
                     if (manual_rot_phase == 0) {
-                        // Fase 1: avance con slowdown suave desde MANUAL_ROT_SLOWDOWN_DEG
+                        // Fase 0: spin con componente de balance + slowdown
                         float abs_remaining = fabsf(manual_rot_target_deg) - fabsf(manual_rot_heading);
                         float slowdown = (abs_remaining < MANUAL_ROT_SLOWDOWN_DEG)
                                        ? (abs_remaining / MANUAL_ROT_SLOWDOWN_DEG)
                                        : 1.0f;
-                        pivot = MANUAL_ROT_PIVOT_POWER * fmaxf(slowdown, 0.0f);
+                        float pivot = MANUAL_ROT_PIVOT_POWER * fmaxf(slowdown, 0.0f);
+                        motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + dir * pivot), -60.0f, 60.0f);
+                        motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - dir * pivot), -60.0f, 60.0f);
                     } else {
-                        // Fase 2: contra-pivot activo para frenar inercia
-                        pivot = -MANUAL_ROT_BRAKE_POWER;
+                        // Fase 1: contra-rotación CON pwm_sat para mantener balance.
+                        // La diferencia entre ambos motores siempre es 2×BRAKE_POWER (frena la inercia),
+                        // mientras que pwm_sat actúa como modo común y mantiene el equilibrio.
+                        motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - dir * MANUAL_ROT_BRAKE_POWER), -60.0f, 60.0f);
+                        motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + dir * MANUAL_ROT_BRAKE_POWER), -60.0f, 60.0f);
                     }
-
-                    steering_adjustment = 0.0f;
-                    motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + dir * pivot), -60.0f, 60.0f);
-                    motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - dir * pivot), -60.0f, 60.0f);
                 } else {
                     {
                         const float STEER_RATE = 1.5f;
