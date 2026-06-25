@@ -2645,8 +2645,18 @@ static void ControlStep10ms(void)
                 float gz_dps = (float)gz / 131.0f;
                 manual_rot_heading += gz_dps * DT_CTRL_FIXED;
 
+                // Heading por encoders: mismo mecanismo que OBJ_ROTATE (325 counts = 90°).
+                // Funciona para ambos sentidos (gz≈0 en giro izquierda, encoders no).
+                __disable_irq();
+                int32_t enc_dr = encoder_right - manual_rot_enc_r0;
+                int32_t enc_dl = encoder_left  - manual_rot_enc_l0;
+                __enable_irq();
+                float enc_counts_avg  = (fabsf((float)enc_dr) + fabsf((float)enc_dl)) * 0.5f;
+                float enc_heading_deg = enc_counts_avg * (90.0f / 325.0f);
+
+                // Heading compuesto: el mayor entre gz y encoders
                 float abs_target  = fabsf(manual_rot_target_deg);
-                float abs_heading = fabsf(manual_rot_heading);
+                float abs_heading = fmaxf(fabsf(manual_rot_heading), enc_heading_deg);
 
                 uint32_t elapsed_ms = HAL_GetTick() - manual_rot_start_ms;
 
@@ -2678,12 +2688,13 @@ static void ControlStep10ms(void)
                     manual_rot_start_ms = HAL_GetTick(); // reiniciar timer para fase 1
                 } else if (manual_rot_phase == 1) {
                     uint32_t phase1_elapsed = HAL_GetTick() - manual_rot_start_ms;
-                    int overshoot = (abs_heading > abs_target * 1.3f);
-                    // gz<12 solo puede salir DESPUÉS de 120 ms mínimos: suficiente para iniciar
-                    // el freno pero sin acumular tanto contra-momentum que revierta el giro.
+                    int overshoot   = (abs_heading > abs_target * 1.3f);
+                    // gz<12 solo puede salir DESPUÉS de 120 ms mínimos.
                     // (Para giro izquierda, gz≈0 siempre → sale exactamente a los 120 ms.)
-                    int gz_settled = (fabsf(gz_dps) < 12.0f && phase1_elapsed >= 120U);
-                    if (gz_settled || phase1_elapsed >= phase1_max_ms || overshoot) {
+                    int gz_settled  = (fabsf(gz_dps) < 12.0f && phase1_elapsed >= 120U);
+                    // Los encoders detectan llegada al ángulo objetivo (>= 95%) → frenar justo ahí
+                    int enc_reached = (enc_heading_deg >= abs_target * 0.95f && phase1_elapsed >= 60U);
+                    if (gz_settled || phase1_elapsed >= phase1_max_ms || overshoot || enc_reached) {
                         manual_rot_active   = 0;
                         manual_rot_phase    = 0;
                         manual_seq_next_ms  = HAL_GetTick() + 2500U; // pausa 2.5 s desde el fin
@@ -3488,7 +3499,8 @@ static void ControlStep10ms(void)
                     steering_adjustment = 0.0f;
                     if (manual_rot_phase == 0) {
                         // Fase 0: spin con componente de balance + slowdown
-                        float abs_remaining = fabsf(manual_rot_target_deg) - fabsf(manual_rot_heading);
+                        // abs_heading ya es el max(gz, enc) calculado arriba
+                        float abs_remaining = abs_target - abs_heading;
                         float slowdown = (abs_remaining < MANUAL_ROT_SLOWDOWN_DEG)
                                        ? (abs_remaining / MANUAL_ROT_SLOWDOWN_DEG)
                                        : 1.0f;
