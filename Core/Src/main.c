@@ -2667,9 +2667,11 @@ static void ControlStep10ms(void)
                 // Timeout total de seguridad
                 uint32_t timeout_ms = (uint32_t)(abs_target / 90.0f * 3000.0f) + 2000U;
 
-                // Tiempo máximo de fase 0; encoder puede salir antes al 85% del target
+                // Tiempo máximo de fase 0; encoder sale antes según fracción ajustada por ángulo:
+                // 90°→0.85 (funciona bien), 180°→0.70 (menos momentum al entrar al freno).
                 uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 1200.0f);
-                float enc_phase0_thr = (abs_target / 90.0f) * MANUAL_ROT_ENC_TARGET * 0.85f;
+                float enc_exit_frac = 0.85f - fmaxf(0.0f, (abs_target - 90.0f) / 90.0f) * 0.15f;
+                float enc_phase0_thr = (abs_target / 90.0f) * MANUAL_ROT_ENC_TARGET * enc_exit_frac;
 
                 // Tiempo máximo de freno fase 1
                 uint32_t phase1_max_ms = 300U;
