@@ -399,8 +399,8 @@ static float    manual_rot_heading     = 0.0f; // ángulo acumulado por giroscop
 static uint32_t manual_rot_start_ms   = 0;
 static int32_t  manual_rot_enc_r0     = 0;
 static int32_t  manual_rot_enc_l0     = 0;
-static uint32_t manual_auto_rot_last_ms = 0;  // timestamp del último giro automático
-static uint8_t  manual_auto_rot_step    = 0;  // 0=90°der, 1=90°izq, 2=180°der
+static uint32_t manual_seq_next_ms     = 0;   // deadline: siguiente giro no antes de este tick
+static uint8_t  manual_auto_rot_step   = 0;   // 0=90°der, 1=90°izq
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float line_enc_angle_corr     = 0.0f;  // corrección P de angulo por deficit de velocidad encoder
 static float line_reverse_boost     = 0.0f;  // extra de angulo si encoders muestran reversa
@@ -2475,8 +2475,8 @@ static void ControlStep10ms(void)
                 manual_cmd_last_ms     = HAL_GetTick();
                 manual_setpoint_ramped = 0.0f;
                 steering_adjustment    = 0.0f;
-                manual_auto_rot_last_ms = HAL_GetTick();
-                manual_auto_rot_step    = 0;
+                manual_seq_next_ms     = HAL_GetTick() + 2500U; // primera pausa al entrar al modo
+                manual_auto_rot_step   = 0;
             }
         }
 
@@ -2609,17 +2609,20 @@ static void ControlStep10ms(void)
             line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
         } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
 
-            // ── Ciclo automático cada 2.5 s: 90°der → 90°izq → rep ─
+            // ── Ciclo automático: 90°der → pausa 2.5 s → 90°izq → pausa 2.5 s → rep ──
+            // manual_seq_next_ms es el deadline absoluto; el giro no arranca antes de ese tick.
             if (!manual_rot_active && !f_fallen &&
-                (HAL_GetTick() - manual_auto_rot_last_ms) >= 2500U) {
+                HAL_GetTick() >= manual_seq_next_ms) {
                 switch (manual_auto_rot_step) {
                     case 0: manual_rot_target_deg =  90.0f; break;
                     case 1: manual_rot_target_deg = -90.0f; break;
                     default: manual_auto_rot_step = 0; manual_rot_target_deg = 90.0f; break;
                 }
-                manual_auto_rot_step    = (manual_auto_rot_step + 1) % 2;
-                manual_rot_trigger      = 1;
-                manual_auto_rot_last_ms = HAL_GetTick();
+                manual_auto_rot_step = (manual_auto_rot_step + 1) % 2;
+                manual_rot_trigger   = 1;
+                // Bloquear el siguiente disparo hasta que este giro TERMINE + 2.5 s
+                // (se actualiza al final del giro; este valor es solo un respaldo)
+                manual_seq_next_ms = HAL_GetTick() + 10000U;
             }
 
             // ── Giro preciso: arranque por trigger UNER ──────────────────────
@@ -2658,11 +2661,11 @@ static void ControlStep10ms(void)
 
                 if (elapsed_ms > timeout_ms) {
                     // Timeout total: abortar
-                    manual_rot_active       = 0;
-                    manual_rot_phase        = 0;
-                    manual_auto_rot_last_ms = HAL_GetTick();
-                    manual_setpoint_cmd     = 0.0f;
-                    manual_steering_cmd     = 0.0f;
+                    manual_rot_active   = 0;
+                    manual_rot_phase    = 0;
+                    manual_seq_next_ms  = HAL_GetTick() + 2500U; // pausa 2.5 s desde el fin
+                    manual_setpoint_cmd = 0.0f;
+                    manual_steering_cmd = 0.0f;
                     manual_setpoint_ramped  = SETPOINT_ANGLE + setpoint_trim;
                     steering_adjustment     = 0.0f;
                     manual_cmd_last_ms      = HAL_GetTick();
@@ -2680,10 +2683,10 @@ static void ControlStep10ms(void)
                     // (giro izquierda) la condición dispare en la primera iteración sin frenar nada.
                     int gz_settled = (fabsf(gz_dps) < 12.0f && phase1_elapsed >= 300U);
                     if (gz_settled || phase1_elapsed >= phase1_max_ms || overshoot) {
-                        manual_rot_active       = 0;
-                        manual_rot_phase        = 0;
-                        manual_auto_rot_last_ms = HAL_GetTick();
-                        manual_setpoint_cmd     = 0.0f;
+                        manual_rot_active   = 0;
+                        manual_rot_phase    = 0;
+                        manual_seq_next_ms  = HAL_GetTick() + 2500U; // pausa 2.5 s desde el fin
+                        manual_setpoint_cmd = 0.0f;
                         manual_steering_cmd     = 0.0f;
                         manual_setpoint_ramped  = SETPOINT_ANGLE + setpoint_trim;
                         steering_adjustment     = 0.0f;
