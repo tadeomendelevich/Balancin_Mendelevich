@@ -1657,10 +1657,70 @@ void updateDisplay(void) {
                 }
             }
 
-            // --- WiFi icon arriba a la derecha (9x7) ---
+            // --- SP: setpoint activo del balance PID (y=1, arriba del todo) ---
             {
-                const uint16_t ix = 119;
-                const uint16_t iy = 1;
+                char buf[14];
+                float v = dynamic_setpoint_f;
+                uint8_t neg = (v < 0.0f);
+                if (neg) v = -v;
+                uint32_t vi = (uint32_t)v;
+                uint32_t vd = (uint32_t)((v - vi) * 100.0f + 0.5f);
+                if (vd >= 100) { vd = 0; vi++; }
+                snprintf(buf, sizeof(buf), "SP:%c%lu.%02lu", neg ? '-' : '+',
+                         (unsigned long)vi, (unsigned long)vd);
+                uint16_t x = 73;
+                for (char *p = buf; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, 1);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
+
+            // --- KP (y=10) ---
+            {
+                char buf[14];
+                float v = KP_LINE;
+                uint32_t vi = (uint32_t)v;
+                uint32_t vd = (uint32_t)((v - vi) * 1000.0f + 0.5f);
+                if (vd >= 1000) { vd = 0; vi++; }
+                snprintf(buf, sizeof(buf), "KP:%lu.%03lu",
+                         (unsigned long)vi, (unsigned long)vd);
+                uint16_t x = 73;
+                for (char *p = buf; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, 10);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
+
+            // --- ADC7 — sensor lateral pared (y=19) ---
+            {
+                char buf[14];
+                snprintf(buf, sizeof(buf), "A7:%lu", (unsigned long)adcAvg[6]);
+                uint16_t x = 73;
+                for (char *p = buf; *p; p++) {
+                    SSD1306_DrawChar5x7(*p, x, 19);
+                    x += Font_5x7.FontWidth + 1;
+                }
+            }
+
+            // --- separador ---
+            SSD1306_DrawLine(72, 28, 127, 28, SSD1306_COLOR_WHITE);
+
+            // --- sub-estado línea en Font_7x10 centrado (y=32) ---
+            {
+                uint16_t len = 0;
+                for (const char *p = line_mode_str; *p; p++) len++;
+                uint16_t sw = (len > 0) ? (len * 8 - 1) : 0;
+                const uint16_t panel_w = 55;  // x=73..127
+                uint16_t sx = 73 + ((panel_w > sw) ? (panel_w - sw) / 2 : 0);
+                SSD1306_GotoXY(sx, 32);
+                SSD1306_Puts(line_mode_str, &Font_7x10, SSD1306_COLOR_WHITE);
+            }
+
+            // --- WiFi icon abajo izquierda + spinner abajo derecha ---
+            {
+                // WiFi icon (9x7) en x=73, y=55
+                const uint16_t ix = 73;
+                const uint16_t iy = 55;
                 if (f_wifi_connected) {
                     SSD1306_DrawPixel(ix+3,iy+0,SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix+4,iy+0,SSD1306_COLOR_WHITE);
@@ -1684,77 +1744,9 @@ void updateDisplay(void) {
                     SSD1306_DrawLine(ix+1, iy+1, ix+7, iy+5, SSD1306_COLOR_WHITE);
                     SSD1306_DrawLine(ix+7, iy+1, ix+1, iy+5, SSD1306_COLOR_WHITE);
                 }
-            }
 
-            // --- separador superior ---
-            SSD1306_DrawLine(72, 10, 127, 10, SSD1306_COLOR_WHITE);
-
-            // --- SP: setpoint activo del balance PID ---
-            {
-                char buf[14];
-                float v = dynamic_setpoint_f;
-                uint8_t neg = (v < 0.0f);
-                if (neg) v = -v;
-                uint32_t vi = (uint32_t)v;
-                uint32_t vd = (uint32_t)((v - vi) * 100.0f + 0.5f);
-                if (vd >= 100) { vd = 0; vi++; }
-                snprintf(buf, sizeof(buf), "SP:%c%lu.%02lu", neg ? '-' : '+',
-                         (unsigned long)vi, (unsigned long)vd);
-                uint16_t x = 73;
-                for (char *p = buf; *p; p++) {
-                    SSD1306_DrawChar5x7(*p, x, 13);
-                    x += Font_5x7.FontWidth + 1;
-                }
-            }
-
-            // --- KP ---
-            {
-                char buf[14];
-                float v = KP_LINE;
-                uint32_t vi = (uint32_t)v;
-                uint32_t vd = (uint32_t)((v - vi) * 1000.0f + 0.5f);
-                if (vd >= 1000) { vd = 0; vi++; }
-                snprintf(buf, sizeof(buf), "KP:%lu.%03lu",
-                         (unsigned long)vi, (unsigned long)vd);
-                uint16_t x = 73;
-                for (char *p = buf; *p; p++) {
-                    SSD1306_DrawChar5x7(*p, x, 22);
-                    x += Font_5x7.FontWidth + 1;
-                }
-            }
-
-            // --- ADC7 (sensor lateral pared) ---
-            {
-                char buf[14];
-                snprintf(buf, sizeof(buf), "A7:%lu", (unsigned long)adcAvg[6]);
-                uint16_t x = 73;
-                for (char *p = buf; *p; p++) {
-                    SSD1306_DrawChar5x7(*p, x, 31);
-                    x += Font_5x7.FontWidth + 1;
-                }
-            }
-
-            // --- separador inferior ---
-            SSD1306_DrawLine(72, 41, 127, 41, SSD1306_COLOR_WHITE);
-
-            // --- sub-estado línea en Font_7x10 (más grande) centrado ---
-            {
-                uint16_t len = 0;
-                for (const char *p = line_mode_str; *p; p++) len++;
-                uint16_t sw = (len > 0) ? (len * 8 - 1) : 0;
-                const uint16_t panel_w = 55;  // x=73..127
-                uint16_t sx = 73 + ((panel_w > sw) ? (panel_w - sw) / 2 : 0);
-                SSD1306_GotoXY(sx, 43);
-                SSD1306_Puts(line_mode_str, &Font_7x10, SSD1306_COLOR_WHITE);
-            }
-
-            // --- spinner abajo a la derecha ---
-            {
-                const uint16_t sx = 118;
-                const uint16_t sy = 59;
-
+                // Spinner en x=118, y=58
                 static uint8_t spinPhaseLF = 0;
-
                 static const int8_t spokes[8][4] = {
                     { 0, -3,  0, -2},
                     { 2, -2,  1, -1},
@@ -1765,19 +1757,18 @@ void updateDisplay(void) {
                     {-3,  0, -2,  0},
                     {-2, -2, -1, -1},
                 };
-
+                const uint16_t sx = 118;
+                const uint16_t sy = 58;
                 for (uint8_t s = 0; s < 3; s++) {
                     uint8_t idx = (spinPhaseLF + s) % 8;
                     SSD1306_DrawPixel(sx + spokes[idx][0], sy + spokes[idx][1], SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(sx + spokes[idx][2], sy + spokes[idx][3], SSD1306_COLOR_WHITE);
                 }
-
                 uint8_t head = (spinPhaseLF + 3) % 8;
                 SSD1306_DrawPixel(sx + spokes[head][0],     sy + spokes[head][1],     SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(sx + spokes[head][2],     sy + spokes[head][3],     SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(sx + spokes[head][0] + 1, sy + spokes[head][1],     SSD1306_COLOR_WHITE);
                 SSD1306_DrawPixel(sx + spokes[head][2] + 1, sy + spokes[head][3],     SSD1306_COLOR_WHITE);
-
                 spinPhaseLF = (spinPhaseLF + 1) % 8;
             }
         }
