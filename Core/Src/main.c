@@ -3091,19 +3091,7 @@ static void ControlStep10ms(void)
                 float balance_pi_scale = 1.0f;
                 float balance_d_scale  = 1.0f;
 
-                if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
-                    (line_detected || line_state == LINE_STATE_OBJ_PRE_REVERSE_HOLD ||
-                     line_state == LINE_STATE_OBJ_REVERSE ||
-                     line_state == LINE_STATE_OBJ_BRAKE  ||
-                     line_state == LINE_STATE_OBJ_ROTATE ||
-                     line_state == LINE_STATE_LOST_ROTATE ||
-                     line_state == LINE_STATE_LOST_FWD    ||
-                     line_state == LINE_STATE_OBJ_HOLD      ||
-                     line_state == LINE_STATE_OBJ_WALL_APPROACH ||
-                     line_state == LINE_STATE_OBJ_WALL_FWD  ||
-                     line_state == LINE_STATE_OBJ_WALL_TURN ||
-                     line_state == LINE_STATE_LOST          ||
-                     line_state == LINE_STATE_SEARCHING))
+                if (robot_state == ROBOT_STATE_LINE_FOLLOWING)
                     balance_hold_active = 0;
                 else if (!balance_hold_active) {
                     if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
@@ -3253,15 +3241,16 @@ static void ControlStep10ms(void)
                         } else {
                             uint32_t ms_sin_linea = HAL_GetTick() - line_lost_ms;
 
-                            // Sin línea: limpiar steering inmediatamente para evitar
-                            // que balance_hold (pwm_sat≈0) + steering residual hagan girar al robot.
-                            steering_adjustment = 0.0f;
-                            line_integral       = 0.0f;
+                            // Sin línea: conservar steering_adjustment (último valor conocido)
+                            // para que el robot siga corrigiendo hacia la línea.
+                            // El spin ya no es posible: balance_hold excluido en TODO LINE_FOLLOWING.
 
                             if (ms_sin_linea > 2000) {
-                                line_state          = LINE_STATE_LOST;
+                                line_state           = LINE_STATE_LOST;
                                 line_lost_entered_ms = HAL_GetTick();
-                                line_search_dir     = last_line_dir;
+                                line_search_dir      = last_line_dir;
+                                line_integral        = 0.0f;
+                                steering_adjustment  = 0.0f;
                             }
                         }
 
