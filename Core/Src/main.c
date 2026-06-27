@@ -2417,13 +2417,12 @@ static void ControlStep10ms(void)
             line_error_disp = line_error;
 
             // Velocidad deseada cae cuadráticamente con el error de línea.
-            // Sin floor: en curva cerrada (speed_factor→0) desired_vel→0 → PI no acelera.
-            // El límite de freno también escala con speed_factor: en curva cerrada no frena
-            // (evita caída por freno brusco mientras gira); en recta permite hasta -1°.
+            // Floor 25%: garantiza desired_vel>0 incluso en curva cerrada.
+            // Sin floor: speed_factor→0 → line_angle_cmd=0 → pwm_sat→0 → spin puro.
             float speed_factor = fmaxf(0.0f, 1.0f - fabsf(line_error) / 0.45f);
             speed_factor *= speed_factor;
             line_desired_forward_vel = line_detected
-                ? LINE_SPEED_TARGET * speed_factor
+                ? fmaxf(LINE_SPEED_TARGET * 0.25f, LINE_SPEED_TARGET * speed_factor)
                 : 0.0f;
             line_forward_vel = fmaxf(0.0f, -velocity_est_f);
 
@@ -2438,10 +2437,9 @@ static void ControlStep10ms(void)
                     // Sobre-velocidad: decae rápido para soltar el freno sin demora
                     line_vel_integral *= 0.80f;
                 }
-                float brake_limit = -1.0f * speed_factor;  // 0° en curva cerrada, -1° en recta
                 line_angle_cmd = clampf_local(
                     LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral,
-                    brake_limit, LINE_ANGLE
+                    -1.0f, LINE_ANGLE
                 );
             } else {
                 line_vel_integral *= 0.80f;
@@ -3091,7 +3089,7 @@ static void ControlStep10ms(void)
                 float balance_pi_scale = 1.0f;
                 float balance_d_scale  = 1.0f;
 
-                if (robot_state == ROBOT_STATE_LINE_FOLLOWING)
+                if (robot_state == ROBOT_STATE_LINE_FOLLOWING && line_detected)
                     balance_hold_active = 0;
                 else if (!balance_hold_active) {
                     if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
@@ -3243,7 +3241,6 @@ static void ControlStep10ms(void)
 
                             // Sin línea: conservar steering_adjustment (último valor conocido)
                             // para que el robot siga corrigiendo hacia la línea.
-                            // El spin ya no es posible: balance_hold excluido en TODO LINE_FOLLOWING.
 
                             if (ms_sin_linea > 2000) {
                                 line_state           = LINE_STATE_LOST;
