@@ -1634,55 +1634,34 @@ void updateDisplay(void) {
 
         // ----- lado derecho -----
         {
-            const char *robot_mode_str = "IDLE";
-            const char *line_mode_str  = "OFF";
-
-            switch (robot_state) {
-                case ROBOT_STATE_IDLE:           robot_mode_str = "IDLE";  break;
-                case ROBOT_STATE_BALANCE_ONLY:   robot_mode_str = "BAL";   break;
-                case ROBOT_STATE_BALANCE_AND_SPEED: robot_mode_str = "SPEED"; break;
-                case ROBOT_STATE_LINE_FOLLOWING: robot_mode_str = "LINE";  break;
-                case ROBOT_STATE_MANUAL_CONTROL: robot_mode_str = "MAN";   break;
-                case ROBOT_STATE_MOTOR_TEST:     robot_mode_str = "TEST";  break;
-                default:                         robot_mode_str = "UNK";   break;
-            }
+            const char *line_mode_str = "OFF";
 
             if (robot_state != ROBOT_STATE_LINE_FOLLOWING) {
                 line_mode_str = "OFF";
             } else {
                 switch (line_state) {
-                    case LINE_STATE_FOLLOWING:  line_mode_str = "FOLLOW"; break;
-                    case LINE_STATE_LOST:        line_mode_str = "LOST";   break;
-                    case LINE_STATE_SEARCHING:   line_mode_str = "SEARCH"; break;
-                    case LINE_STATE_LOST_ROTATE: line_mode_str = "LROT";   break;
-                    case LINE_STATE_LOST_FWD:    line_mode_str = "LFWD";   break;
+                    case LINE_STATE_FOLLOWING:            line_mode_str = "FOLLOW"; break;
+                    case LINE_STATE_LOST:                 line_mode_str = "LOST";   break;
+                    case LINE_STATE_SEARCHING:            line_mode_str = "SEARCH"; break;
+                    case LINE_STATE_LOST_ROTATE:          line_mode_str = "LROT";   break;
+                    case LINE_STATE_LOST_FWD:             line_mode_str = "LFWD";   break;
                     case LINE_STATE_OBJ_PRE_REVERSE_HOLD: line_mode_str = "WAIT";   break;
-                    case LINE_STATE_OBJ_REVERSE: line_mode_str = "REVERS"; break;
-                    case LINE_STATE_OBJ_BRAKE:   line_mode_str = "BRAKE";  break;
-                    case LINE_STATE_OBJ_ROTATE:  line_mode_str = "ROTATE"; break;
-                    case LINE_STATE_OBJ_HOLD:          line_mode_str = "HOLD";   break;
-                    case LINE_STATE_OBJ_WALL_APPROACH: line_mode_str = "WF_APR"; break;
-                    case LINE_STATE_OBJ_WALL_FWD:      line_mode_str = "WF_FWD"; break;
-                    case LINE_STATE_OBJ_WALL_TURN:     line_mode_str = "WF_TRN"; break;
-                    default:                    line_mode_str = "UNK";    break;
+                    case LINE_STATE_OBJ_REVERSE:          line_mode_str = "REVERS"; break;
+                    case LINE_STATE_OBJ_BRAKE:            line_mode_str = "BRAKE";  break;
+                    case LINE_STATE_OBJ_ROTATE:           line_mode_str = "ROTATE"; break;
+                    case LINE_STATE_OBJ_HOLD:             line_mode_str = "HOLD";   break;
+                    case LINE_STATE_OBJ_WALL_APPROACH:    line_mode_str = "WF_APR"; break;
+                    case LINE_STATE_OBJ_WALL_FWD:         line_mode_str = "WF_FWD"; break;
+                    case LINE_STATE_OBJ_WALL_TURN:        line_mode_str = "WF_TRN"; break;
+                    default:                              line_mode_str = "UNK";    break;
                 }
             }
 
-            // --- fila superior: modo (Font_5x7) + WiFi icon ---
-            {
-                uint16_t x = 73;
-                for (const char *p = robot_mode_str; *p; p++) {
-                    SSD1306_DrawChar5x7(*p, x, 1);
-                    x += Font_5x7.FontWidth + 1;
-                }
-            }
-
-            // WiFi icon arriba a la derecha (9x7)
+            // --- WiFi icon arriba a la derecha (9x7) ---
             {
                 const uint16_t ix = 119;
                 const uint16_t iy = 1;
                 if (f_wifi_connected) {
-                    // outer arc (9px wide)
                     SSD1306_DrawPixel(ix+3,iy+0,SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix+4,iy+0,SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix+5,iy+0,SSD1306_COLOR_WHITE);
@@ -1692,17 +1671,14 @@ void updateDisplay(void) {
                     SSD1306_DrawPixel(ix+7,iy+2,SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix+0,iy+3,SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix+8,iy+3,SSD1306_COLOR_WHITE);
-                    // middle arc (5px wide)
                     SSD1306_DrawPixel(ix+3,iy+3,SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix+4,iy+3,SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix+5,iy+3,SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix+2,iy+4,SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix+6,iy+4,SSD1306_COLOR_WHITE);
-                    // inner arc (3px)
                     SSD1306_DrawPixel(ix+3,iy+5,SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix+4,iy+5,SSD1306_COLOR_WHITE);
                     SSD1306_DrawPixel(ix+5,iy+5,SSD1306_COLOR_WHITE);
-                    // dot
                     SSD1306_DrawPixel(ix+4,iy+6,SSD1306_COLOR_WHITE);
                 } else {
                     SSD1306_DrawLine(ix+1, iy+1, ix+7, iy+5, SSD1306_COLOR_WHITE);
@@ -1761,49 +1737,33 @@ void updateDisplay(void) {
             // --- separador inferior ---
             SSD1306_DrawLine(72, 41, 127, 41, SSD1306_COLOR_WHITE);
 
-            // --- modo línea abajo ---
+            // --- sub-estado línea en Font_7x10 (más grande) centrado ---
             {
-                uint16_t x = 73;
-                for (const char *p = line_mode_str; *p; p++) {
-                    SSD1306_DrawChar5x7(*p, x, 44);
-                    x += Font_5x7.FontWidth + 1;
-                }
-            }
-
-            // --- velocidad encoder ---
-            {
-                char buf[10];
-                float v = velocity_est_f;
-                uint8_t neg = (v < 0.0f);
-                if (neg) v = -v;
-                uint32_t vi = (uint32_t)v;
-                uint32_t vd = (uint32_t)((v - vi) * 100.0f + 0.5f);
-                if (vd >= 100) { vd = 0; vi++; }
-                snprintf(buf, sizeof(buf), "VE:%c%lu.%02lu", neg ? '-' : '+',
-                         (unsigned long)vi, (unsigned long)vd);
-                uint16_t x = 73;
-                for (char *p = buf; *p; p++) {
-                    SSD1306_DrawChar5x7(*p, x, 52);
-                    x += Font_5x7.FontWidth + 1;
-                }
+                uint16_t len = 0;
+                for (const char *p = line_mode_str; *p; p++) len++;
+                uint16_t sw = (len > 0) ? (len * 8 - 1) : 0;
+                const uint16_t panel_w = 55;  // x=73..127
+                uint16_t sx = 73 + ((panel_w > sw) ? (panel_w - sw) / 2 : 0);
+                SSD1306_GotoXY(sx, 43);
+                SSD1306_Puts(line_mode_str, &Font_7x10, SSD1306_COLOR_WHITE);
             }
 
             // --- spinner abajo a la derecha ---
             {
                 const uint16_t sx = 118;
-                const uint16_t sy = 57;
+                const uint16_t sy = 59;
 
                 static uint8_t spinPhaseLF = 0;
 
                 static const int8_t spokes[8][4] = {
-                    { 0, -4,  0, -3},
-                    { 3, -3,  2, -2},
-                    { 4,  0,  3,  0},
-                    { 3,  3,  2,  2},
-                    { 0,  4,  0,  3},
-                    {-3,  3, -2,  2},
-                    {-4,  0, -3,  0},
-                    {-3, -3, -2, -2},
+                    { 0, -3,  0, -2},
+                    { 2, -2,  1, -1},
+                    { 3,  0,  2,  0},
+                    { 2,  2,  1,  1},
+                    { 0,  3,  0,  2},
+                    {-2,  2, -1,  1},
+                    {-3,  0, -2,  0},
+                    {-2, -2, -1, -1},
                 };
 
                 for (uint8_t s = 0; s < 3; s++) {
@@ -2118,6 +2078,103 @@ void updateDisplay(void) {
             }
             SSD1306_GotoXY(65, 53);
             SSD1306_Puts(f_wifi_connected ? "CONECTADO" : "SIN WIFI ", &Font_5x7, SSD1306_COLOR_WHITE);
+        }
+
+    } else if (f_change_display == 6) {
+        // -------------------------------------------------------
+        // PANTALLA 6: Evasión de objeto — estado grande + barras ADC5 y ADC7
+        // -------------------------------------------------------
+
+        // Estado del esquive centrado con Font_7x10 (máxima legibilidad)
+        {
+            const char *obj_str = "OBJ";
+            switch (line_state) {
+                case LINE_STATE_OBJ_PRE_REVERSE_HOLD: obj_str = "WAIT";   break;
+                case LINE_STATE_OBJ_REVERSE:          obj_str = "REVERS"; break;
+                case LINE_STATE_OBJ_BRAKE:            obj_str = "BRAKE";  break;
+                case LINE_STATE_OBJ_ROTATE:           obj_str = "ROTATE"; break;
+                case LINE_STATE_OBJ_HOLD:             obj_str = "HOLD";   break;
+                case LINE_STATE_OBJ_WALL_APPROACH:    obj_str = "WF_APR"; break;
+                case LINE_STATE_OBJ_WALL_FWD:         obj_str = "WF_FWD"; break;
+                case LINE_STATE_OBJ_WALL_TURN:        obj_str = "WF_TRN"; break;
+                default: break;
+            }
+            uint16_t len = 0;
+            for (const char *p = obj_str; *p; p++) len++;
+            uint16_t sw = (len > 0) ? (len * 8 - 1) : 0;  // Font_7x10: 7px + 1px spacing
+            uint16_t sx = (SCREEN_W > sw) ? (SCREEN_W - sw) / 2 : 0;
+            SSD1306_GotoXY(sx, 1);
+            SSD1306_Puts(obj_str, &Font_7x10, SSD1306_COLOR_WHITE);
+        }
+
+        // Divisor horizontal bajo el texto de estado
+        SSD1306_DrawLine(0, 13, SCREEN_W - 1, 13, SSD1306_COLOR_WHITE);
+        // Divisor vertical entre barra ADC5 (izq) y ADC7 (der)
+        SSD1306_DrawLine(63, 13, 63, SCREEN_H - 1, SSD1306_COLOR_WHITE);
+
+        const uint16_t bar_top6   = 22;
+        const uint16_t bar_bot6   = 54;
+        const uint16_t bar_max_h6 = bar_bot6 - bar_top6;  // 32px
+        const uint16_t bar_w6     = 40;
+
+        // --- Barra izquierda: ADC5 (adcAvg[4]) — sensor de objeto frontal ---
+        {
+            const uint16_t bx = (64 - bar_w6) / 2;         // 12
+            uint16_t v = adcAvg[4] > 4095 ? 4095 : adcAvg[4];
+            uint16_t h = (uint32_t)v * bar_max_h6 / 4095;
+
+            // Label "A5" centrado sobre la barra
+            uint16_t lx = bx + (bar_w6 - 2 * (Font_5x7.FontWidth + 1)) / 2;
+            SSD1306_DrawChar5x7('A', lx, 15);
+            SSD1306_DrawChar5x7('5', lx + Font_5x7.FontWidth + 1, 15);
+
+            // Borde de la barra
+            SSD1306_DrawLine(bx,              bar_top6, bx + bar_w6 - 1, bar_top6, SSD1306_COLOR_WHITE);
+            SSD1306_DrawLine(bx,              bar_bot6, bx + bar_w6 - 1, bar_bot6, SSD1306_COLOR_WHITE);
+            SSD1306_DrawLine(bx,              bar_top6, bx,              bar_bot6, SSD1306_COLOR_WHITE);
+            SSD1306_DrawLine(bx + bar_w6 - 1, bar_top6, bx + bar_w6 - 1, bar_bot6, SSD1306_COLOR_WHITE);
+
+            // Relleno proporcional al valor
+            if (h > 0) SSD1306_DrawFilledRectangle(bx + 1, bar_bot6 - h, bar_w6 - 2, h, SSD1306_COLOR_WHITE);
+
+            // Valor numérico debajo
+            char buf[6];
+            snprintf(buf, sizeof(buf), "%4u", (unsigned)v);
+            uint16_t vx = bx;
+            for (char *p = buf; *p; p++) {
+                SSD1306_DrawChar5x7(*p, vx, 57);
+                vx += (uint16_t)(Font_5x7.FontWidth + 1);
+            }
+        }
+
+        // --- Barra derecha: ADC7 (adcAvg[6]) — sensor lateral de pared ---
+        {
+            const uint16_t bx = 64 + (64 - bar_w6) / 2;   // 76
+            uint16_t v = adcAvg[6] > 4095 ? 4095 : adcAvg[6];
+            uint16_t h = (uint32_t)v * bar_max_h6 / 4095;
+
+            // Label "A7" centrado sobre la barra
+            uint16_t lx = bx + (bar_w6 - 2 * (Font_5x7.FontWidth + 1)) / 2;
+            SSD1306_DrawChar5x7('A', lx, 15);
+            SSD1306_DrawChar5x7('7', lx + Font_5x7.FontWidth + 1, 15);
+
+            // Borde de la barra
+            SSD1306_DrawLine(bx,              bar_top6, bx + bar_w6 - 1, bar_top6, SSD1306_COLOR_WHITE);
+            SSD1306_DrawLine(bx,              bar_bot6, bx + bar_w6 - 1, bar_bot6, SSD1306_COLOR_WHITE);
+            SSD1306_DrawLine(bx,              bar_top6, bx,              bar_bot6, SSD1306_COLOR_WHITE);
+            SSD1306_DrawLine(bx + bar_w6 - 1, bar_top6, bx + bar_w6 - 1, bar_bot6, SSD1306_COLOR_WHITE);
+
+            // Relleno proporcional al valor
+            if (h > 0) SSD1306_DrawFilledRectangle(bx + 1, bar_bot6 - h, bar_w6 - 2, h, SSD1306_COLOR_WHITE);
+
+            // Valor numérico debajo
+            char buf[6];
+            snprintf(buf, sizeof(buf), "%4u", (unsigned)v);
+            uint16_t vx = bx;
+            for (char *p = buf; *p; p++) {
+                SSD1306_DrawChar5x7(*p, vx, 57);
+                vx += (uint16_t)(Font_5x7.FontWidth + 1);
+            }
         }
 
     } else {
@@ -2456,6 +2513,21 @@ static void ControlStep10ms(void)
 
         if (robot_state != ROBOT_STATE_LINE_FOLLOWING && prev_robot_state == ROBOT_STATE_LINE_FOLLOWING) {
             f_change_display = display_before_line;  // restaurar display anterior
+        }
+
+        // Sub-estado línea: entrar/salir de modo evasión cambia display 1 ↔ 6
+        {
+            static eLineState prev_line_state_disp = LINE_STATE_FOLLOWING;
+            if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+                int prev_obj = (prev_line_state_disp >= LINE_STATE_OBJ_PRE_REVERSE_HOLD);
+                int curr_obj = (line_state           >= LINE_STATE_OBJ_PRE_REVERSE_HOLD);
+                if (!prev_obj && curr_obj) {
+                    f_change_display = 6;  // entrar en evasión → pantalla OBJ
+                } else if (prev_obj && !curr_obj) {
+                    f_change_display = 1;  // volver al seguidor de línea
+                }
+            }
+            prev_line_state_disp = line_state;
         }
 
         if (robot_state == ROBOT_STATE_IDLE && prev_robot_state != ROBOT_STATE_IDLE) {
