@@ -373,7 +373,8 @@ float LINE_SPEED_TARGET = 1.5f;  // m/s objetivo en seguimiento de línea (ajust
 float OBJ_DETECT_THRESHOLD_f = OBJ_DETECT_THRESHOLD_VAL;  // umbral objeto, ajustable en runtime
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
-static uint32_t   line_lost_ms     = 0;   // tick cuando se perdió la línea
+static uint32_t   line_lost_ms     = 0;   // tick cuando se vio la línea por última vez
+static uint32_t   line_lost_entered_ms = 0; // tick cuando se entró al estado LOST
 static float      line_search_dir  = 1.0f; // dirección de búsqueda (+1 o -1)
 static float      last_line_dir    = 1.0f; // última dirección válida de la línea (+1 o -1)
 static float      line_error_f_d   = 0.0f;
@@ -3232,9 +3233,10 @@ static void ControlStep10ms(void)
                             uint32_t ms_sin_linea = HAL_GetTick() - line_lost_ms;
 
                             if (ms_sin_linea > 2000) {
-                                line_state      = LINE_STATE_LOST;
-                                line_search_dir = last_line_dir;
-                                line_integral   = 0.0f;
+                                line_state          = LINE_STATE_LOST;
+                                line_lost_entered_ms = HAL_GetTick();
+                                line_search_dir     = last_line_dir;
+                                line_integral       = 0.0f;
                                 steering_adjustment = 0.0f;
                             }
                         }
@@ -3255,8 +3257,8 @@ static void ControlStep10ms(void)
                             line_steer_fb_int   = 0.0f;
                             line_state          = LINE_STATE_FOLLOWING;
                         } else if (fabsf(velocity_est_f) < 0.08f &&
-                                   (HAL_GetTick() - line_lost_ms) > 500U) {
-                            // Robot quieto: arrancar giro 180°
+                                   (HAL_GetTick() - line_lost_entered_ms) > 3000U) {
+                            // Robot quieto 3s en LOST: arrancar giro 180°
                             line_state          = LINE_STATE_LOST_ROTATE;
                             obj_rot_initialized = 0;
                             obj_rot_phase       = 0;
@@ -3370,8 +3372,9 @@ static void ControlStep10ms(void)
                             line_state        = LINE_STATE_FOLLOWING;
                         } else if (f_fallen ||
                                    (HAL_GetTick() - line_lost_ms) > LOST_FWD_TIMEOUT) {
-                            line_state   = LINE_STATE_LOST;
-                            line_lost_ms = HAL_GetTick();
+                            line_state           = LINE_STATE_LOST;
+                            line_lost_ms         = HAL_GetTick();
+                            line_lost_entered_ms = HAL_GetTick();
                         }
                         break;
                     }
