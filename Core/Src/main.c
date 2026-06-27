@@ -188,8 +188,8 @@ typedef enum {
 #define LINE_LOST_TIMEOUT_MS   2000    // ms sin línea antes de entrar en búsqueda
 #define LINE_LOST_STEERING     12.0f   // steering suave para cuando recién se pierde la línea
 
-#define OBJ_DETECT_THRESHOLD_VAL   3200.0f   // objeto detectado si ADC < este valor (sin objeto: ~4095, con objeto: <3200)
-#define OBJ_DETECT_DEBOUNCE_CNT    3          // ciclos consecutivos (30 ms) para confirmar objeto
+#define OBJ_DETECT_THRESHOLD_VAL   2000.0f   // objeto detectado si ADC < este valor (sin objeto: ~4095, con objeto: <2000)
+#define OBJ_DETECT_DEBOUNCE_CNT    10         // ciclos consecutivos (100 ms) para confirmar objeto
 #define OBJ_PRE_REVERSE_HOLD_MS    1000U      // tiempo de balance estatico antes de rotar
 // Giro 90° por encoders: medir distancia entre centros de rueda y ajustar aquí
 #define OBJ_ROTATE_TRACK_WIDTH     0.220f    // metros entre centros de ruedas (medido: 220 mm)
