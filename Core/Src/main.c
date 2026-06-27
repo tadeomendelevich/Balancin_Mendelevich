@@ -53,6 +53,7 @@ typedef enum {
     LINE_STATE_LOST,           // Línea perdida, frenando y buscando
     LINE_STATE_SEARCHING,      // Girando suavemente para buscar
     LINE_STATE_LOST_ROTATE,    // Línea perdida + robot quieto: giro 180° para buscarla
+    LINE_STATE_LOST_FWD,       // Post-180°: avanza hacia adelante hasta encontrar la línea
     LINE_STATE_OBJ_PRE_REVERSE_HOLD, // Objeto detectado: balance estático 2s → luego OBJ_ROTATE
     LINE_STATE_OBJ_REVERSE,    // (deshabilitado) reversa breve antes del giro
     LINE_STATE_OBJ_BRAKE,      // (deshabilitado) frena hasta velocidad ≈ 0 antes de girar
@@ -1654,6 +1655,7 @@ void updateDisplay(void) {
                     case LINE_STATE_LOST:        line_mode_str = "LOST";   break;
                     case LINE_STATE_SEARCHING:   line_mode_str = "SEARCH"; break;
                     case LINE_STATE_LOST_ROTATE: line_mode_str = "LROT";   break;
+                    case LINE_STATE_LOST_FWD:    line_mode_str = "LFWD";   break;
                     case LINE_STATE_OBJ_PRE_REVERSE_HOLD: line_mode_str = "WAIT";   break;
                     case LINE_STATE_OBJ_REVERSE: line_mode_str = "REVERS"; break;
                     case LINE_STATE_OBJ_BRAKE:   line_mode_str = "BRAKE";  break;
@@ -2573,6 +2575,12 @@ static void ControlStep10ms(void)
                 brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
+            } else if (line_state == LINE_STATE_LOST_FWD) {
+                // Avance post-180°: mismo ángulo que WALL_APPROACH para ir despacio
+                base_setpoint_target  = OBJ_WALL_APPROACH_ANGLE;
+                brake_setpoint_target = 0.0f;
+                line_enc_angle_corr   = 0.0f;
+                line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_ROTATE ||
                        line_state == LINE_STATE_LOST_ROTATE) {
                 // Rotación: upright sin avance, sin freno de encoders
@@ -3006,6 +3014,7 @@ static void ControlStep10ms(void)
                      line_state == LINE_STATE_OBJ_BRAKE  ||
                      line_state == LINE_STATE_OBJ_ROTATE ||
                      line_state == LINE_STATE_LOST_ROTATE ||
+                     line_state == LINE_STATE_LOST_FWD    ||
                      line_state == LINE_STATE_OBJ_HOLD      ||
                      line_state == LINE_STATE_OBJ_WALL_APPROACH ||
                      line_state == LINE_STATE_OBJ_WALL_FWD  ||
@@ -3269,8 +3278,8 @@ static void ControlStep10ms(void)
                             int vel_ok    = (rv < 2.0f && p1e >= 80U);
                             int overshoot = (lrot_abs_hdg > LROT_ABS_TARGET * 1.2f);
                             if (vel_ok || p1e >= LROT_P1_MAX || overshoot) {
-                                // Volvemos a LOST para re-buscar la línea
-                                line_state          = LINE_STATE_LOST;
+                                // Giro terminado: avanzar hacia adelante para encontrar la línea
+                                line_state          = LINE_STATE_LOST_FWD;
                                 line_lost_ms        = HAL_GetTick();
                                 obj_rot_initialized = 0;
                                 obj_rot_phase       = 0;
@@ -3281,6 +3290,25 @@ static void ControlStep10ms(void)
                                 motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - LROT_BRAKE), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + LROT_BRAKE), -60.0f, 60.0f);
                             }
+                        }
+                        break;
+                    }
+
+                    case LINE_STATE_LOST_FWD:
+                    {
+                        // Post-180°: avanza con ángulo fijo hasta encontrar la línea.
+                        // Timeout 10s de seguridad → vuelve a LOST si no la encuentra.
+                        const uint32_t LOST_FWD_TIMEOUT = 10000U;
+                        steering_adjustment = 0.0f;
+                        if (line_detected) {
+                            line_integral     = 0.0f;
+                            line_error_prev   = 0.0f;
+                            line_lost_ms      = HAL_GetTick();
+                            line_state        = LINE_STATE_FOLLOWING;
+                        } else if (f_fallen ||
+                                   (HAL_GetTick() - line_lost_ms) > LOST_FWD_TIMEOUT) {
+                            line_state   = LINE_STATE_LOST;
+                            line_lost_ms = HAL_GetTick();
                         }
                         break;
                     }
