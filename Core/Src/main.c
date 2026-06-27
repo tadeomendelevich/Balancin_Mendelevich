@@ -1606,16 +1606,34 @@ void updateDisplay(void) {
             const uint16_t bar_width = 7;   // 8×7 + 9×1 = 65 px en área de 70 px
             const uint16_t spacing   = 1;
 
+            // Las barras 1-4 (línea) dejan 5px arriba para el indicador negro/blanco
+            const uint16_t ind_h     = 4;  // altura reservada para indicador (px)
+            const uint16_t bar_line_top = bar_top + ind_h;  // y=6: donde empieza la barra de línea
+
             for (uint8_t i = 0; i < 8; i++) {
                 // ADC 1-4 en orden invertido (igual que antes), ADC 5-8 directo
                 uint8_t adc_idx = (i < 4) ? (3 - i) : i;
                 uint16_t v = adcAvg[adc_idx] > 4095 ? 4095 : adcAvg[adc_idx];
-                uint16_t h = (uint32_t)v * bar_max_h / 4095;
                 uint16_t x0 = spacing + i * (bar_width + spacing);
-                uint16_t y0 = digit_y - 1 - h;
 
-                if (h > 0) {
-                    SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
+                if (i < 4) {
+                    // Barra reducida: empieza en bar_line_top para dejar espacio al indicador
+                    uint16_t line_bar_max_h = digit_y - bar_line_top - 1;
+                    uint16_t h = (uint32_t)v * line_bar_max_h / 4095;
+                    uint16_t y0 = digit_y - 1 - h;
+                    if (h > 0)
+                        SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
+
+                    // Indicador negro/blanco: relleno = negro, borde = blanco
+                    if (adcAvg[adc_idx] > (uint16_t)LINE_THRESHOLD)
+                        SSD1306_DrawFilledRectangle(x0, bar_top, bar_width, ind_h - 1, SSD1306_COLOR_WHITE);
+                    else
+                        SSD1306_DrawRectangle(x0, bar_top, bar_width, ind_h - 1, SSD1306_COLOR_WHITE);
+                } else {
+                    uint16_t h = (uint32_t)v * bar_max_h / 4095;
+                    uint16_t y0 = digit_y - 1 - h;
+                    if (h > 0)
+                        SSD1306_DrawFilledRectangle(x0, y0, bar_width, h, SSD1306_COLOR_WHITE);
                 }
 
                 SSD1306_DrawChar5x7('1' + adc_idx, x0 + 1, digit_y);
@@ -3232,12 +3250,15 @@ static void ControlStep10ms(void)
                         } else {
                             uint32_t ms_sin_linea = HAL_GetTick() - line_lost_ms;
 
+                            // Sin línea: limpiar steering inmediatamente para evitar
+                            // que balance_hold (pwm_sat≈0) + steering residual hagan girar al robot.
+                            steering_adjustment = 0.0f;
+                            line_integral       = 0.0f;
+
                             if (ms_sin_linea > 2000) {
                                 line_state          = LINE_STATE_LOST;
                                 line_lost_entered_ms = HAL_GetTick();
                                 line_search_dir     = last_line_dir;
-                                line_integral       = 0.0f;
-                                steering_adjustment = 0.0f;
                             }
                         }
 
@@ -3641,6 +3662,7 @@ static void ControlStep10ms(void)
                         } else if ((HAL_GetTick() - obj_wall_approach_start_ms) >= OBJ_WALL_APPROACH_TIMEOUT) {
                             line_state                 = LINE_STATE_FOLLOWING;
                             obj_wall_approach_start_ms = 0;
+                            obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
                         }
                         // Mientras avanza: steering neutro, setpoint manejado por bloque de setpoints.
                         steering_adjustment = 0.0f;
@@ -3667,6 +3689,7 @@ static void ControlStep10ms(void)
                             line_lost_ms        = HAL_GetTick();
                             steering_adjustment = 0.0f;
                             obj_wall_fwd_start_ms = 0;
+                            obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
                         } else if (too_close) {
                             // Demasiado cerca: pivot derecha (alejar del obstáculo)
                             line_pivot_active  = 1;
@@ -3699,7 +3722,9 @@ static void ControlStep10ms(void)
                             line_error_prev     = 0.0f;
                             line_error_f_d      = 0.0f;
                             line_lost_ms        = HAL_GetTick();
+                            steering_adjustment = 0.0f;
                             line_pivot_active   = 0;
+                            obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
                         } else if (too_close) {
                             // Demasiado cerca: pivot derecha (alejar del obstáculo)
                             line_pivot_active  = 1;
