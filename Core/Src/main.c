@@ -2417,13 +2417,13 @@ static void ControlStep10ms(void)
             line_error_disp = line_error;
 
             // Velocidad deseada cae cuadráticamente con el error de línea.
-            // Se mantiene un mínimo del 25 % del objetivo cuando la línea está
-            // visible para que el PI de vel nunca comande ángulo de retroceso
-            // al entrar en curva cerrada (sensores de borde 1 ó 4).
+            // Sin floor: en curva cerrada (speed_factor→0) desired_vel→0 → PI no acelera.
+            // El límite de freno también escala con speed_factor: en curva cerrada no frena
+            // (evita caída por freno brusco mientras gira); en recta permite hasta -1°.
             float speed_factor = fmaxf(0.0f, 1.0f - fabsf(line_error) / 0.45f);
             speed_factor *= speed_factor;
             line_desired_forward_vel = line_detected
-                ? fmaxf(LINE_SPEED_TARGET * 0.25f, LINE_SPEED_TARGET * speed_factor)
+                ? LINE_SPEED_TARGET * speed_factor
                 : 0.0f;
             line_forward_vel = fmaxf(0.0f, -velocity_est_f);
 
@@ -2438,9 +2438,10 @@ static void ControlStep10ms(void)
                     // Sobre-velocidad: decae rápido para soltar el freno sin demora
                     line_vel_integral *= 0.80f;
                 }
+                float brake_limit = -1.0f * speed_factor;  // 0° en curva cerrada, -1° en recta
                 line_angle_cmd = clampf_local(
                     LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral,
-                    -1.0f, LINE_ANGLE
+                    brake_limit, LINE_ANGLE
                 );
             } else {
                 line_vel_integral *= 0.80f;
@@ -3100,7 +3101,9 @@ static void ControlStep10ms(void)
                      line_state == LINE_STATE_OBJ_HOLD      ||
                      line_state == LINE_STATE_OBJ_WALL_APPROACH ||
                      line_state == LINE_STATE_OBJ_WALL_FWD  ||
-                     line_state == LINE_STATE_OBJ_WALL_TURN))
+                     line_state == LINE_STATE_OBJ_WALL_TURN ||
+                     line_state == LINE_STATE_LOST          ||
+                     line_state == LINE_STATE_SEARCHING))
                     balance_hold_active = 0;
                 else if (!balance_hold_active) {
                     if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
@@ -3318,13 +3321,14 @@ static void ControlStep10ms(void)
 
                         // Si vuelve a ver la línea, salir inmediatamente
                         if (line_detected) {
-                            line_integral       = 0.0f;
-                            line_error_prev     = 0.0f;
-                            line_lost_ms        = HAL_GetTick();
-                            line_state          = LINE_STATE_FOLLOWING;
-                            obj_rot_initialized = 0;
-                            obj_rot_phase       = 0;
-                            obj_rot_heading     = 0.0f;
+                            line_integral              = 0.0f;
+                            line_error_prev            = 0.0f;
+                            line_lost_ms               = HAL_GetTick();
+                            line_state                 = LINE_STATE_FOLLOWING;
+                            obj_rot_initialized        = 0;
+                            obj_rot_phase              = 0;
+                            obj_rot_heading            = 0.0f;
+                            obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
                             break;
                         }
 
@@ -3634,6 +3638,7 @@ static void ControlStep10ms(void)
                             line_error_f_d    = 0.0f;
                             line_lost_ms      = HAL_GetTick();
                             obj_hold_start_ms = 0;
+                            obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
                         } else if ((HAL_GetTick() - obj_hold_start_ms) >= OBJ_HOLD_DURATION_MS) {
                             line_state                 = LINE_STATE_OBJ_WALL_APPROACH;
                             obj_hold_start_ms          = 0;
@@ -3655,6 +3660,7 @@ static void ControlStep10ms(void)
                         if (f_fallen) {
                             line_state                 = LINE_STATE_FOLLOWING;
                             obj_wall_approach_start_ms = 0;
+                            obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
                         } else if (wall_found) {
                             line_state                 = LINE_STATE_OBJ_WALL_FWD;
                             obj_wall_approach_start_ms = 0;
