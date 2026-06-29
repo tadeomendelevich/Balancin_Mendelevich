@@ -52,7 +52,8 @@ typedef enum {
     LINE_STATE_FOLLOWING = 0,  // Siguiendo línea normalmente
     LINE_STATE_LOST,           // Línea perdida, frenando y buscando
     LINE_STATE_SEARCHING,      // Girando suavemente para buscar
-    LINE_STATE_LOST_ROTATE,    // Línea perdida + robot quieto: giro 180° para buscarla
+    LINE_STATE_LOST_BRAKE,     // Línea perdida: frena hasta velocidad baja antes de girar
+    LINE_STATE_LOST_ROTATE,    // Línea perdida: giro 180° para buscarla
     LINE_STATE_LOST_FWD,       // Post-180°: avanza hacia adelante hasta encontrar la línea
     LINE_STATE_OBJ_PRE_REVERSE_HOLD, // Objeto detectado: balance estático 2s → luego OBJ_ROTATE
     LINE_STATE_OBJ_REVERSE,    // (deshabilitado) reversa breve antes del giro
@@ -427,6 +428,7 @@ static uint32_t obj_detect_ignore_until_ms = 0;  // ignora sensores de objeto ha
 static uint8_t  prev_all_line_black        = 1;  // todos los sensores de línea en negro (robot en el aire)
 static uint32_t all_black_start_ms         = 0;  // tick en que empezaron a verse todos negros
 static uint8_t  f_in_air                   = 0;  // 1 = robot en el aire >2s → motores detenidos
+static uint32_t lrot_brake_start_ms        = 0;  // inicio del frenado previo al giro 180°
 static uint32_t obj_pre_rev_start_ms = 0;
 static uint8_t  obj_rot_initialized  = 0;
 static int32_t  obj_rot_r0           = 0;
@@ -1676,19 +1678,20 @@ void updateDisplay(void) {
                 line_mode_str = "OFF";
             } else {
                 switch (line_state) {
-                    case LINE_STATE_FOLLOWING:            line_mode_str = "FOLLOW"; break;
-                    case LINE_STATE_LOST:                 line_mode_str = "LOST";   break;
-                    case LINE_STATE_SEARCHING:            line_mode_str = "SEARCH"; break;
-                    case LINE_STATE_LOST_ROTATE:          line_mode_str = "LROT";   break;
-                    case LINE_STATE_LOST_FWD:             line_mode_str = "LFWD";   break;
-                    case LINE_STATE_OBJ_PRE_REVERSE_HOLD: line_mode_str = "WAIT";   break;
-                    case LINE_STATE_OBJ_REVERSE:          line_mode_str = "REVERS"; break;
-                    case LINE_STATE_OBJ_BRAKE:            line_mode_str = "BRAKE";  break;
-                    case LINE_STATE_OBJ_ROTATE:           line_mode_str = "ROTATE"; break;
-                    case LINE_STATE_OBJ_HOLD:             line_mode_str = "HOLD";   break;
-                    case LINE_STATE_OBJ_WALL_APPROACH:    line_mode_str = "WF_APR"; break;
-                    case LINE_STATE_OBJ_WALL_FWD:         line_mode_str = "WF_FWD"; break;
-                    case LINE_STATE_OBJ_WALL_TURN:        line_mode_str = "WF_TRN"; break;
+                    case LINE_STATE_FOLLOWING:            line_mode_str = "SIGUE";  break;
+                    case LINE_STATE_LOST:                 line_mode_str = "PERDI";  break;
+                    case LINE_STATE_SEARCHING:            line_mode_str = "BUSCA";  break;
+                    case LINE_STATE_LOST_BRAKE:           line_mode_str = "FRENA";  break;
+                    case LINE_STATE_LOST_ROTATE:          line_mode_str = "GIRO";   break;
+                    case LINE_STATE_LOST_FWD:             line_mode_str = "AVNZA";  break;
+                    case LINE_STATE_OBJ_PRE_REVERSE_HOLD: line_mode_str = "ESPER";  break;
+                    case LINE_STATE_OBJ_REVERSE:          line_mode_str = "RETRO";  break;
+                    case LINE_STATE_OBJ_BRAKE:            line_mode_str = "STOP";   break;
+                    case LINE_STATE_OBJ_ROTATE:           line_mode_str = "ESQUIV"; break;
+                    case LINE_STATE_OBJ_HOLD:             line_mode_str = "PAUSA";  break;
+                    case LINE_STATE_OBJ_WALL_APPROACH:    line_mode_str = "APRCH";  break;
+                    case LINE_STATE_OBJ_WALL_FWD:         line_mode_str = "PARED";  break;
+                    case LINE_STATE_OBJ_WALL_TURN:        line_mode_str = "GIRAP";  break;
                     default:                              line_mode_str = "UNK";    break;
                 }
             }
@@ -2116,14 +2119,14 @@ void updateDisplay(void) {
         {
             const char *obj_str = "OBJ";
             switch (line_state) {
-                case LINE_STATE_OBJ_PRE_REVERSE_HOLD: obj_str = "WAIT";   break;
-                case LINE_STATE_OBJ_REVERSE:          obj_str = "REVERS"; break;
-                case LINE_STATE_OBJ_BRAKE:            obj_str = "BRAKE";  break;
-                case LINE_STATE_OBJ_ROTATE:           obj_str = "ROTATE"; break;
-                case LINE_STATE_OBJ_HOLD:             obj_str = "HOLD";   break;
-                case LINE_STATE_OBJ_WALL_APPROACH:    obj_str = "WF_APR"; break;
-                case LINE_STATE_OBJ_WALL_FWD:         obj_str = "WF_FWD"; break;
-                case LINE_STATE_OBJ_WALL_TURN:        obj_str = "WF_TRN"; break;
+                case LINE_STATE_OBJ_PRE_REVERSE_HOLD: obj_str = "ESPER";  break;
+                case LINE_STATE_OBJ_REVERSE:          obj_str = "RETRO";  break;
+                case LINE_STATE_OBJ_BRAKE:            obj_str = "STOP";   break;
+                case LINE_STATE_OBJ_ROTATE:           obj_str = "ESQUIV"; break;
+                case LINE_STATE_OBJ_HOLD:             obj_str = "PAUSA";  break;
+                case LINE_STATE_OBJ_WALL_APPROACH:    obj_str = "APRCH";  break;
+                case LINE_STATE_OBJ_WALL_FWD:         obj_str = "PARED";  break;
+                case LINE_STATE_OBJ_WALL_TURN:        obj_str = "GIRAP";  break;
                 default: break;
             }
             uint16_t len = 0;
@@ -2688,6 +2691,12 @@ static void ControlStep10ms(void)
                 brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
+            } else if (line_state == LINE_STATE_LOST_BRAKE) {
+                // Frenado previo al giro 180°: upright con freno de encoders
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                line_enc_angle_corr   = 0.0f;
+                line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_ROTATE ||
                        line_state == LINE_STATE_LOST_ROTATE) {
                 // Rotación: upright sin avance, sin freno de encoders
@@ -3038,6 +3047,7 @@ static void ControlStep10ms(void)
                 obj_arc_steer_int    = 0.0f;
                 obj_wall_approach_start_ms = 0;
                 obj_wall_fwd_start_ms      = 0;
+                lrot_brake_start_ms        = 0;
             }
         } else {
             if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
@@ -3278,7 +3288,7 @@ static void ControlStep10ms(void)
                             // Sin línea: conservar steering_adjustment (último valor conocido)
                             // para que el robot siga corrigiendo hacia la línea.
 
-                            if (ms_sin_linea > 800) {
+                            if (ms_sin_linea > 1000) {
                                 line_state           = LINE_STATE_LOST;
                                 line_lost_entered_ms = HAL_GetTick();
                                 line_search_dir      = last_line_dir;
@@ -3294,7 +3304,7 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_LOST:
                     case LINE_STATE_SEARCHING:
-                        // Sin línea: girar 180° inmediatamente.
+                        // Sin línea: frenar primero, luego girar 180°.
                         if (line_detected) {
                             line_seen_since_entry = 1;
                             line_integral       = 0.0f;
@@ -3303,23 +3313,51 @@ static void ControlStep10ms(void)
                             line_steer_fb_int   = 0.0f;
                             line_state          = LINE_STATE_FOLLOWING;
                         } else {
+                            line_state          = LINE_STATE_LOST_BRAKE;
+                            lrot_brake_start_ms = 0;
+                        }
+                        steering_adjustment = 0.0f;
+                        break;
+
+                    case LINE_STATE_LOST_BRAKE:
+                    {
+                        // Frena hasta velocidad baja (o timeout) antes del giro 180°.
+                        const uint32_t LBRAKE_TIMEOUT  = 1500U;
+                        const float    LBRAKE_VEL_THR  = 0.15f;  // m/s
+
+                        if (lrot_brake_start_ms == 0) lrot_brake_start_ms = HAL_GetTick();
+
+                        if (line_detected) {
+                            line_integral        = 0.0f;
+                            line_error_prev      = 0.0f;
+                            line_lost_ms         = HAL_GetTick();
+                            line_steer_fb_int    = 0.0f;
+                            line_state           = LINE_STATE_FOLLOWING;
+                            lrot_brake_start_ms  = 0;
+                            break;
+                        }
+
+                        uint32_t elapsed = HAL_GetTick() - lrot_brake_start_ms;
+                        if (fabsf(velocity_est_f) < LBRAKE_VEL_THR || elapsed >= LBRAKE_TIMEOUT) {
                             line_state          = LINE_STATE_LOST_ROTATE;
                             obj_rot_initialized = 0;
                             obj_rot_phase       = 0;
                             obj_rot_heading     = 0.0f;
                             obj_rot_phase1_ms   = 0;
                             obj_rot_start_ms    = 0;
+                            lrot_brake_start_ms = 0;
                         }
                         steering_adjustment = 0.0f;
                         break;
+                    }
 
                     case LINE_STATE_LOST_ROTATE:
                     {
                         // Giro 180° derecha para buscar la línea perdida.
                         // Misma lógica gz+encoder que OBJ_ROTATE y MANUAL, escalada a 180°.
                         const float  LROT_ENC_TARGET   = 760.0f; // 380*2 counts = 180°
-                        const float  LROT_PIVOT        = 5.0f;
-                        const float  LROT_BRAKE        = 3.0f;
+                        const float  LROT_PIVOT        = 12.0f;
+                        const float  LROT_BRAKE        = 5.0f;
                         const float  LROT_SLOWDOWN_DEG = 55.0f;
                         const float  LROT_ABS_TARGET   = 180.0f;
                         const uint32_t LROT_P0_MAX     = 4000U;  // timeout más largo para giro lento
