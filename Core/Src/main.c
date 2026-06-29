@@ -275,11 +275,13 @@ static volatile uint8_t mpu_req_pending = 0;
 static float roll_deg = 0.0f;	// Ángulo de balanceo (eje Y, usado para el equilibrio)
 static float pitch_deg = 0.0f;	// Ángulo de inclinación (eje X)
 
-uint16_t adcValues[8];
+volatile uint16_t adcValues[8];
 static uint32_t adcSum[BAR_COUNT] = {0};	// Sumas acumuladas de las últimas ADC_AVERAGE_SIZE muestras
 static uint16_t adcBuf[BAR_COUNT][ADC_AVERAGE_SIZE] = {{0}};		// Buffers circulares: [canal][posición en la ventana]
 static uint8_t maIndex = 0;		// Índice circular común para todos los canales
 static uint16_t adcAvg[BAR_COUNT] = {0};
+static volatile uint32_t adc_dma_last_ms = 0;
+static volatile uint8_t  adc_recover_pending = 0;
 
 uint8_t i2c1_tx_busy = 0;
 
@@ -360,7 +362,7 @@ float KV_brake_value;
 // Line Follower Variables
 float KP_LINE = 10.0f;
 float KD_LINE = 2.0f;
-float KI_LINE = 0.0f;
+float KI_LINE = 0.5f;
 float LINE_THRESHOLD = 3000.0f;  // entre piso blanco (~1800) y cinta negra (~3800)
 float LINE_ANGLE = 2.0f;        // inclinación máxima (°) para avanzar en seguimiento de línea
 
@@ -368,13 +370,14 @@ float LINE_ANGLE = 2.0f;        // inclinación máxima (°) para avanzar en seg
 // Medirlos colocando el robot sobre el piso blanco y leyendo adcAvg[] en la pantalla 4.
 // La sustracción de baseline elimina el offset entre sensores y mejora el centroide.
 // COMPLETAR con los valores medidos:
-static const float ADC_BASELINE[4] = { 0.0f, 0.0f, 0.0f, 0.0f };  // s0, s1, s2, s3
+static const float ADC_BASELINE[4] = { 2000.0f, 1550.0f, 1370.0f, 1730.0f };  // s0, s1, s2, s3 — calibrado sobre fondo blanco
 float LINE_SPEED_TARGET = 1.5f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
 float OBJ_DETECT_THRESHOLD_f = OBJ_DETECT_THRESHOLD_VAL;  // umbral objeto, ajustable en runtime
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se vio la línea por última vez
-static uint32_t   line_lost_entered_ms = 0; // tick cuando se entró al estado LOST
+static uint32_t   line_lost_entered_ms = 0; // tick cuando se entró al estado LOST (no usado actualmente)
+static uint8_t    line_seen_since_entry = 0; // evita búsqueda automática antes de adquirir línea
 static float      line_search_dir  = 1.0f; // dirección de búsqueda (+1 o -1)
 static float      last_line_dir    = 1.0f; // última dirección válida de la línea (+1 o -1)
 static float      line_error_f_d   = 0.0f;
@@ -422,6 +425,8 @@ static float prev_error = 0.0f;
 static uint8_t balance_hold_active = 0;
 static uint32_t obj_detect_ignore_until_ms = 0;  // ignora sensores de objeto hasta este tick
 static uint8_t  prev_all_line_black        = 1;  // todos los sensores de línea en negro (robot en el aire)
+static uint32_t all_black_start_ms         = 0;  // tick en que empezaron a verse todos negros
+static uint8_t  f_in_air                   = 0;  // 1 = robot en el aire >2s → motores detenidos
 static uint32_t obj_pre_rev_start_ms = 0;
 static uint8_t  obj_rot_initialized  = 0;
 static int32_t  obj_rot_r0           = 0;
@@ -521,6 +526,7 @@ void ProcessEspRxLimited(void);
 static void ControlStep10ms(void);
 static float ComputeSteeringPID(float speed_r, float speed_l, float sp);
 static void  SteeringPID_Reset(void);
+static void  ADC1_Recover(void);
 static void  I2C1_Recover(void);
 
 static inline uint32_t micros(void) {
@@ -592,6 +598,20 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
     if (hi2c->Instance == I2C1) {
         I2C_Manager_OnError(hi2c);
         i2c1_tx_busy = I2C_Manager_IsBusy();
+    }
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance == ADC1) {
+        adc_dma_last_ms = HAL_GetTick();
+    }
+}
+
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance == ADC1) {
+        adc_recover_pending = 1;
     }
 }
 
@@ -1102,6 +1122,28 @@ void UpdateADC_MovingAverage(void) {
     maIndex = (maIndex + 1) % ADC_AVERAGE_SIZE;	    // Avanza en el buffer circular
 }
 
+static void ADC1_Recover(void)
+{
+    HAL_ADC_Stop_DMA(&hadc1);
+    __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
+    __HAL_DMA_DISABLE(hadc1.DMA_Handle);
+    __HAL_DMA_CLEAR_FLAG(hadc1.DMA_Handle,
+                         DMA_FLAG_TCIF0_4 | DMA_FLAG_HTIF0_4 |
+                         DMA_FLAG_TEIF0_4 | DMA_FLAG_DMEIF0_4 | DMA_FLAG_FEIF0_4);
+    __HAL_DMA_ENABLE(hadc1.DMA_Handle);
+
+    memset(adcSum, 0, sizeof(adcSum));
+    memset(adcBuf, 0, sizeof(adcBuf));
+    memset(adcAvg, 0, sizeof(adcAvg));
+    maIndex = 0;
+
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcValues, 8);
+
+    adc_dma_last_ms = HAL_GetTick();
+    adc_recover_pending = 0;
+    USB_Debug("ADC RECOVER\r\n");
+}
+
 static void esp01_chpd(uint8_t val) {
     // CH_PD_GPIO_Port y CH_PD_Pin vienen de MX_GPIO_Init()
     HAL_GPIO_WritePin(CH_PD_GPIO_Port, CH_PD_Pin,
@@ -1151,31 +1193,6 @@ static float apply_deadbandf(float value, float deadband)
     return 0.0f;
 }
 
-static void UpdateVelocityEstimate(float gyro_rate_dps, float dt_ctrl, float roll_rad, int16_t ay_val)
-{
-    // 1. Aceleración lineal horizontal: quita el componente de gravedad del ay
-    //    ay_val está en cm/s² (981 = 1g). A velocidad cte y ángulo cte: a_lin ≈ 0.
-    //    Durante frenada el acelerómetro ve desaceleración real → vel_from_accel baja activamente.
-    float a_lin_ms2 = ((float)ay_val - 981.0f * sinf(roll_rad)) * 0.01f;  // cm/s² → m/s²
-
-    // Deadband: filtra bias residual de la compensación de gravedad
-    if (fabsf(a_lin_ms2) < 0.07f) a_lin_ms2 = 0.0f;
-
-    // 2. Integrar aceleración para obtener velocidad lineal (m/s)
-    vel_from_accel = VEL_DECAY_ACCEL * vel_from_accel + a_lin_ms2 * dt_ctrl;
-    vel_from_accel = clampf_local(vel_from_accel, -5.0f, 5.0f);
-
-    // 3. Giroscopio: captura transitorios rápidos
-    float vel_gyro = VEL_DECAY * (velocity_est + gyro_rate_dps * dt_ctrl);
-
-    // 4. Filtro complementario: gyro domina AC, accel aporta DC (velocidad sostenida)
-    velocity_est = VEL_CF_ALPHA * vel_gyro
-                 + (1.0f - VEL_CF_ALPHA) * (vel_from_accel * VEL_ACCEL_SCALE);
-    velocity_est = clampf_local(velocity_est, -20.0f, 20.0f);
-
-    // 5. LPF para suavizar el setpoint de freno
-    velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
-}
 
 static float ComputeBrakeSetpointTarget(uint8_t state)
 {
@@ -2393,13 +2410,21 @@ static void ControlStep10ms(void)
 
             line_detected = (w_sum > 0.0f);
 
-            // Detección de "puesto en el piso": los 4 sensores en negro = robot en el aire.
-            // Al transicionar a cualquier otro estado = robot apoyado → ignorar obstáculos 3s.
+            // Detección de "en el aire": todos los 4 sensores en negro.
+            // Si se mantiene >2s → f_in_air=1 → motores detenidos hasta que toque superficie.
+            // Cuando baja al piso (all_black→0) → ignorar obstáculos 3s (mano al soltar).
             {
                 uint8_t all_black = (adcAvg[0] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[1] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[2] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[3] > (uint16_t)LINE_THRESHOLD);
+                if (all_black) {
+                    if (all_black_start_ms == 0) all_black_start_ms = HAL_GetTick();
+                    if ((HAL_GetTick() - all_black_start_ms) > 2000U) f_in_air = 1;
+                } else {
+                    all_black_start_ms = 0;
+                    f_in_air = 0;
+                }
                 if (prev_all_line_black && !all_black)
                     obj_detect_ignore_until_ms = HAL_GetTick() + 3000U;
                 prev_all_line_black = all_black;
@@ -2511,6 +2536,7 @@ static void ControlStep10ms(void)
             speed_right_rps_s   = 0.0f;
             speed_left_rps_s    = 0.0f;
             line_state          = LINE_STATE_FOLLOWING;
+            line_seen_since_entry = 0;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
             base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
@@ -2702,9 +2728,10 @@ static void ControlStep10ms(void)
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else {
-                // Línea perdida: control de posición como BALANCE_ONLY para quedarse quieto.
+                // Línea perdida (LOST/SEARCHING): upright puro.
+                // El robot pasa por LOST un solo ciclo antes de ir a LOST_ROTATE.
                 base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             }
@@ -3201,6 +3228,7 @@ static void ControlStep10ms(void)
                     case LINE_STATE_FOLLOWING:
                     {
                         if (line_detected) {
+                            line_seen_since_entry = 1;
                             line_lost_ms = HAL_GetTick();
 
                             float p_line = KP_LINE * line_error;
@@ -3237,12 +3265,20 @@ static void ControlStep10ms(void)
                             log_d_line = d_line;
 
                         } else {
+                            if (!line_seen_since_entry) {
+                                // Todavía no adquirió la línea desde que se activó el modo:
+                                // mejor quedarse estable que disparar una búsqueda ciega.
+                                line_lost_ms = HAL_GetTick();
+                                line_integral = 0.0f;
+                                steering_adjustment = 0.0f;
+                                break;
+                            }
                             uint32_t ms_sin_linea = HAL_GetTick() - line_lost_ms;
 
                             // Sin línea: conservar steering_adjustment (último valor conocido)
                             // para que el robot siga corrigiendo hacia la línea.
 
-                            if (ms_sin_linea > 2000) {
+                            if (ms_sin_linea > 800) {
                                 line_state           = LINE_STATE_LOST;
                                 line_lost_entered_ms = HAL_GetTick();
                                 line_search_dir      = last_line_dir;
@@ -3258,17 +3294,15 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_LOST:
                     case LINE_STATE_SEARCHING:
-                        // Sin línea: mantener balance con freno de posición.
-                        // Cuando la velocidad cae por debajo del umbral → giro 180° para buscar.
+                        // Sin línea: girar 180° inmediatamente.
                         if (line_detected) {
+                            line_seen_since_entry = 1;
                             line_integral       = 0.0f;
                             line_error_prev     = 0.0f;
                             line_lost_ms        = HAL_GetTick();
                             line_steer_fb_int   = 0.0f;
                             line_state          = LINE_STATE_FOLLOWING;
-                        } else if (fabsf(velocity_est_f) < 0.08f &&
-                                   (HAL_GetTick() - line_lost_entered_ms) > 3000U) {
-                            // Robot quieto 3s en LOST: arrancar giro 180°
+                        } else {
                             line_state          = LINE_STATE_LOST_ROTATE;
                             obj_rot_initialized = 0;
                             obj_rot_phase       = 0;
@@ -3284,11 +3318,11 @@ static void ControlStep10ms(void)
                         // Giro 180° derecha para buscar la línea perdida.
                         // Misma lógica gz+encoder que OBJ_ROTATE y MANUAL, escalada a 180°.
                         const float  LROT_ENC_TARGET   = 760.0f; // 380*2 counts = 180°
-                        const float  LROT_PIVOT        = 15.0f;
-                        const float  LROT_BRAKE        = 5.0f;
+                        const float  LROT_PIVOT        = 5.0f;
+                        const float  LROT_BRAKE        = 3.0f;
                         const float  LROT_SLOWDOWN_DEG = 55.0f;
                         const float  LROT_ABS_TARGET   = 180.0f;
-                        const uint32_t LROT_P0_MAX     = 2400U;  // 1200*2 ms para 180°
+                        const uint32_t LROT_P0_MAX     = 4000U;  // timeout más largo para giro lento
                         const uint32_t LROT_P1_MAX     = 400U;
                         // enc_exit_frac para 180° = 0.85 - 0.15 = 0.70 (mismo que MANUAL)
                         const float  LROT_ENC_FRAC     = 0.70f;
@@ -3307,6 +3341,7 @@ static void ControlStep10ms(void)
 
                         // Si vuelve a ver la línea, salir inmediatamente
                         if (line_detected) {
+                            line_seen_since_entry      = 1;
                             line_integral              = 0.0f;
                             line_error_prev            = 0.0f;
                             line_lost_ms               = HAL_GetTick();
@@ -3377,6 +3412,7 @@ static void ControlStep10ms(void)
                         const uint32_t LOST_FWD_TIMEOUT = 10000U;
                         steering_adjustment = 0.0f;
                         if (line_detected) {
+                            line_seen_since_entry = 1;
                             line_integral     = 0.0f;
                             line_error_prev   = 0.0f;
                             line_lost_ms      = HAL_GetTick();
@@ -3673,6 +3709,7 @@ static void ControlStep10ms(void)
                         uint8_t wall_visible = (wall_adc < OBJ_WALL_THRESHOLD);
                         uint8_t too_close    = (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
                         if (line_detected && !line_ignore) {
+                            line_seen_since_entry = 1;
                             line_state          = LINE_STATE_FOLLOWING;
                             line_integral       = 0.0f;
                             line_obj_rev_vel_integral = 0.0f;
@@ -3708,6 +3745,7 @@ static void ControlStep10ms(void)
                         uint8_t wall_visible = (wall_adc < OBJ_WALL_THRESHOLD);
                         uint8_t too_close    = (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
                         if (line_detected) {
+                            line_seen_since_entry = 1;
                             line_state          = LINE_STATE_FOLLOWING;
                             line_integral       = 0.0f;
                             line_obj_rev_vel_integral = 0.0f;
@@ -3954,6 +3992,12 @@ static void ControlStep10ms(void)
 
 
 
+    // En el aire >2s: detener motores hasta que los sensores de línea vean superficie.
+    if (robot_state == ROBOT_STATE_LINE_FOLLOWING && f_in_air) {
+        motorRightVelocity = 0;
+        motorLeftVelocity  = 0;
+    }
+
     if (robot_state == ROBOT_STATE_MOTOR_TEST) {
         // Modo test: SETMOTORSPEED controla directamente, sin PID ni compensación
         MotorControl(motorRightVelocity, -motorLeftVelocity);
@@ -4085,6 +4129,7 @@ int main(void)
   HAL_UART_Receive_IT(&huart1, &dataRx, 1);
 
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcValues, 8);
+  adc_dma_last_ms = HAL_GetTick();
   HAL_TIM_Base_Start_IT(&htim1);   // 10 ms
   HAL_TIM_Base_Start_IT(&htim2);   // 250 us (si lo vas a usar)
   HAL_TIM_Base_Start_IT(&htim5);   // 2 ms (500 Hz)
@@ -4237,6 +4282,11 @@ int main(void)
 
 	      static uint8_t subtick = 0;
 	      subtick = (subtick + 1) % 10;
+
+          if (adc_recover_pending ||
+              (adc_dma_last_ms != 0 && (HAL_GetTick() - adc_dma_last_ms) > 50U)) {
+              ADC1_Recover();
+          }
 
 	      // Estas dos van siempre — son rápidas y críticas
 	      ESP01_Timeout10ms();
