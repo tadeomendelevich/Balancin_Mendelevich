@@ -1621,7 +1621,7 @@ void updateDisplay(void) {
         {
             const uint16_t bar_top   = 2;
             const uint16_t digit_y   = 55;
-            const uint16_t bar_max_h = digit_y - bar_top - 1;
+            const uint16_t bar_max_h = (digit_y - bar_top - 1) * 3 / 4;   // 75% de la altura máxima
             const uint16_t bar_width = 7;   // 8×7 + 9×1 = 65 px en área de 70 px
             const uint16_t spacing   = 1;
 
@@ -1637,7 +1637,7 @@ void updateDisplay(void) {
 
                 if (i < 4) {
                     // Barra reducida: empieza en bar_line_top para dejar espacio al indicador
-                    uint16_t line_bar_max_h = digit_y - bar_line_top - 1;
+                    uint16_t line_bar_max_h = (digit_y - bar_line_top - 1) * 3 / 4;  // 75%
                     uint16_t h = (uint32_t)v * line_bar_max_h / 4095;
                     uint16_t y0 = digit_y - 1 - h;
                     if (h > 0)
@@ -2445,12 +2445,12 @@ static void ControlStep10ms(void)
             line_error_disp = line_error;
 
             // Velocidad deseada cae cuadráticamente con el error de línea.
-            // Floor 25%: garantiza desired_vel>0 incluso en curva cerrada.
+            // Floor 10%: en curva cerrada el robot frena casi al mínimo (era 25%).
             // Sin floor: speed_factor→0 → line_angle_cmd=0 → pwm_sat→0 → spin puro.
             float speed_factor = fmaxf(0.0f, 1.0f - fabsf(line_error) / 0.45f);
             speed_factor *= speed_factor;
             line_desired_forward_vel = line_detected
-                ? fmaxf(LINE_SPEED_TARGET * 0.25f, LINE_SPEED_TARGET * speed_factor)
+                ? fmaxf(LINE_SPEED_TARGET * 0.10f, LINE_SPEED_TARGET * speed_factor)
                 : 0.0f;
             line_forward_vel = fmaxf(0.0f, -velocity_est_f);
 
@@ -2467,7 +2467,7 @@ static void ControlStep10ms(void)
                 }
                 line_angle_cmd = clampf_local(
                     LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral,
-                    -1.0f, LINE_ANGLE
+                    -1.5f, LINE_ANGLE
                 );
             } else {
                 line_vel_integral *= 0.80f;
@@ -2686,8 +2686,14 @@ static void ControlStep10ms(void)
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_LOST_FWD) {
-                // Avance post-180°: mismo ángulo que WALL_APPROACH para ir despacio
-                base_setpoint_target  = OBJ_WALL_APPROACH_ANGLE;
+                // Avance post-180°: ángulo fijo limitado por overspeed (igual que WALL_FWD).
+                // Frena activamente si supera OBJ_WALL_OVERSPEED_VEL (0.90 m/s).
+                {
+                    float lfwd_vel = fmaxf(0.0f, -velocity_est_f);
+                    base_setpoint_target = (lfwd_vel > OBJ_WALL_OVERSPEED_VEL)
+                                         ? -OBJ_WALL_BRAKE_ANGLE
+                                         :  OBJ_WALL_APPROACH_ANGLE;
+                }
                 brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
@@ -2744,6 +2750,23 @@ static void ControlStep10ms(void)
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             }
+
+            // Limitador global de velocidad: frena en CUALQUIER sub-estado si se supera el target.
+            // Solo actúa en estados de avance (brake_setpoint_target==0 y base>0) que no tienen
+            // su propio control de frenado, y excluye rotaciones donde el pivot no debe frenarse.
+            if (brake_setpoint_target == 0.0f &&
+                base_setpoint_target  >  0.0f &&
+                line_state != LINE_STATE_LOST_ROTATE &&
+                line_state != LINE_STATE_OBJ_ROTATE  &&
+                line_state != LINE_STATE_OBJ_WALL_TURN) {
+                float global_fwd_vel = fmaxf(0.0f, -velocity_est_f);
+                if (global_fwd_vel > LINE_SPEED_TARGET * 0.90f) {
+                    float overspeed_brake = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                    if (overspeed_brake < base_setpoint_target)
+                        base_setpoint_target = overspeed_brake;
+                }
+            }
+
             line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
         } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
 
@@ -2963,11 +2986,11 @@ static void ControlStep10ms(void)
         // Término de posición: integra velocidad para corregir deriva lenta
         dynamic_setpoint_f = base_setpoint_f + brake_setpoint_f;
         dynamic_setpoint_f = clampf_local(dynamic_setpoint_f, -sp_limit, sp_limit);
-        // En modo linea: FOLLOWING frena leve; OBJ_REVERSE permite inclinar mas hacia atras.
+        // En modo linea: FOLLOWING frena hasta -1.5°; OBJ_REVERSE permite inclinar mas hacia atras.
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
             float line_negative_limit = (line_state == LINE_STATE_OBJ_REVERSE)
                                       ? LINE_OBJ_REV_TILT_MAX
-                                      : 1.0f;
+                                      : 1.5f;
             if (dynamic_setpoint_f < -line_negative_limit)
                 dynamic_setpoint_f = -line_negative_limit;
         }
@@ -3357,13 +3380,13 @@ static void ControlStep10ms(void)
                         // Misma lógica gz+encoder que OBJ_ROTATE y MANUAL, escalada a 180°.
                         const float  LROT_ENC_TARGET   = 760.0f; // 380*2 counts = 180°
                         const float  LROT_PIVOT        = 12.0f;
-                        const float  LROT_BRAKE        = 5.0f;
+                        const float  LROT_BRAKE        = 8.0f;   // freno más fuerte (era 5) → menos overshoot
                         const float  LROT_SLOWDOWN_DEG = 55.0f;
                         const float  LROT_ABS_TARGET   = 180.0f;
                         const uint32_t LROT_P0_MAX     = 4000U;  // timeout más largo para giro lento
-                        const uint32_t LROT_P1_MAX     = 400U;
-                        // enc_exit_frac para 180° = 0.85 - 0.15 = 0.70 (mismo que MANUAL)
-                        const float  LROT_ENC_FRAC     = 0.70f;
+                        const uint32_t LROT_P1_MAX     = 500U;   // más tiempo para absorber inercia (era 400)
+                        // enc_exit_frac 0.60: frena al 60% del recorrido → 44% restante para frenar (era 0.70)
+                        const float  LROT_ENC_FRAC     = 0.60f;
 
                         if (!obj_rot_initialized) {
                             __disable_irq();
@@ -3405,7 +3428,7 @@ static void ControlStep10ms(void)
 
                         if (obj_rot_phase == 0) {
                             uint32_t elapsed = HAL_GetTick() - obj_rot_start_ms;
-                            if (lrot_abs_hdg >= LROT_ABS_TARGET * 0.80f ||
+                            if (lrot_abs_hdg >= LROT_ABS_TARGET * 0.70f ||  // antes 0.80 → entraba tarde al freno
                                 lrot_counts  >= lrot_enc_thr ||
                                 elapsed      >= LROT_P0_MAX) {
                                 obj_rot_phase     = 1;
