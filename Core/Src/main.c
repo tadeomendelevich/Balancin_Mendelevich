@@ -3390,7 +3390,7 @@ static void ControlStep10ms(void)
                         const float  LROT_SLOWDOWN_DEG = 55.0f;
                         const float  LROT_ABS_TARGET   = 180.0f;
                         const uint32_t LROT_P0_MAX     = 4000U;  // timeout más largo para giro lento
-                        const uint32_t LROT_P1_MAX     = 500U;   // más tiempo para absorber inercia (era 400)
+                        const uint32_t LROT_P1_MAX     = 1500U;  // ampliado: fase 1 ahora pivotea hasta enc_done
                         // enc_exit_frac 0.60: frena al 60% del recorrido → 44% restante para frenar (era 0.70)
                         const float  LROT_ENC_FRAC     = 0.60f;
 
@@ -3451,11 +3451,12 @@ static void ControlStep10ms(void)
                         }
 
                         if (obj_rot_phase == 1) {
-                            uint32_t p1e = HAL_GetTick() - obj_rot_phase1_ms;
-                            float rv  = (fabsf(speed_right_rps_s) + fabsf(speed_left_rps_s)) * 0.5f;
-                            int vel_ok    = (rv < 2.0f && p1e >= 80U);
-                            int overshoot = (lrot_abs_hdg > LROT_ABS_TARGET * 1.2f);
-                            if (vel_ok || p1e >= LROT_P1_MAX || overshoot) {
+                            uint32_t p1e      = HAL_GetTick() - obj_rot_phase1_ms;
+                            float rv          = (fabsf(speed_right_rps_s) + fabsf(speed_left_rps_s)) * 0.5f;
+                            int enc_done      = (lrot_counts >= LROT_ENC_TARGET);
+                            int vel_ok        = (rv < 2.0f && p1e >= 80U);
+                            int overshoot     = (lrot_abs_hdg > LROT_ABS_TARGET * 1.2f);
+                            if ((enc_done && vel_ok) || p1e >= LROT_P1_MAX || overshoot) {
                                 // Giro terminado: avanzar hacia adelante para encontrar la línea
                                 line_state          = LINE_STATE_LOST_FWD;
                                 line_lost_ms        = HAL_GetTick();
@@ -3463,7 +3464,16 @@ static void ControlStep10ms(void)
                                 obj_rot_phase       = 0;
                                 obj_rot_heading     = 0.0f;
                                 steering_adjustment = 0.0f;
+                            } else if (!enc_done) {
+                                // Encoder aún no llegó al target: seguir pivoteando suave
+                                float remaining = LROT_ENC_TARGET - lrot_counts;
+                                float ramp = fminf(remaining / (LROT_ENC_TARGET * 0.15f), 1.0f);
+                                float pivot = LROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
+                                line_pivot_active  = 1;
+                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
+                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
                             } else {
+                                // Encoder OK, frenando hasta que la velocidad baje
                                 line_pivot_active  = 1;
                                 motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - LROT_BRAKE), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + LROT_BRAKE), -60.0f, 60.0f);
