@@ -367,6 +367,12 @@ float KI_LINE = 0.5f;
 float LINE_THRESHOLD = 3000.0f;  // entre piso blanco (~1800) y cinta negra (~3800)
 float LINE_ANGLE = 2.0f;        // inclinación máxima (°) para avanzar en seguimiento de línea
 
+// Trim del centroide de línea: corrige desplazamiento físico del array de sensores.
+// Positivo = corrige deriva a la DERECHA (array montado a la izquierda del eje del robot).
+// Negativo = corrige deriva a la IZQUIERDA.
+// Ajustar empíricamente: empezar con 0.05, aumentar de a 0.05 hasta que el robot siga centrado.
+static float line_error_trim_f = 0.1f;
+
 // Baseline de cada sensor ADC (valor mínimo sobre superficie blanca, sin línea).
 // Medirlos colocando el robot sobre el piso blanco y leyendo adcAvg[] en la pantalla 4.
 // La sustracción de baseline elimina el offset entre sensores y mejora el centroide.
@@ -2436,7 +2442,7 @@ static void ControlStep10ms(void)
             if (line_detected) {
                 // Numerador cuadrático: coeficientes {+9,+1,-1,-9} (izq=positivo)
                 float num = 9.0f*w[0] + 1.0f*w[1] - 1.0f*w[2] - 9.0f*w[3];
-                line_error = num / (9.0f * w_sum);
+                line_error = num / (9.0f * w_sum) + line_error_trim_f;
 
                 // Umbral más bajo porque sensores internos solo generan ±0.11
                 if (line_error > 0.02f)       last_line_dir =  1.0f;
