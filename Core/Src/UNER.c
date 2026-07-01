@@ -747,20 +747,14 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case ROTATE_180_RIGHT:
-            if (p_robot_state != NULL && *p_robot_state == 4 && p_rot_target_deg && p_rot_trigger) {
-                *p_rot_target_deg = +180.0f;
-                *p_rot_trigger    = 1;
-            }
+            // Deshabilitado temporalmente: solo se permiten giros de 90°.
             putHeaderOnTx(dataTx, ROTATE_180_RIGHT, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);
         break;
 
         case ROTATE_180_LEFT:
-            if (p_robot_state != NULL && *p_robot_state == 4 && p_rot_target_deg && p_rot_trigger) {
-                *p_rot_target_deg = -180.0f;
-                *p_rot_trigger    = 1;
-            }
+            // Deshabilitado temporalmente: solo se permiten giros de 90°.
             putHeaderOnTx(dataTx, ROTATE_180_LEFT, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);

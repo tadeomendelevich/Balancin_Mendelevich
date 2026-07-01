@@ -455,6 +455,9 @@ static uint32_t obj_wall_approach_start_ms = 0;    // timestamp de entrada a WAL
 static uint32_t obj_wall_fwd_start_ms = 0;         // timestamp de entrada a WALL_FWD (para ignorar línea 3s)
 
 volatile uint8_t tick2ms_count = 0;
+static uint8_t encoder_sampler_initialized = 0;
+static uint8_t encoder_right_prev_state = 0;
+static uint8_t encoder_left_prev_state  = 0;
 
 static uint8_t uart_tx_byte = 0;
 
@@ -534,6 +537,7 @@ void ProcessEspRxLimited(void);
 static void ControlStep10ms(void);
 static float ComputeSteeringPID(float speed_r, float speed_l, float sp);
 static void  SteeringPID_Reset(void);
+static void  SampleEncoders250us(void);
 static void  ADC1_Recover(void);
 static void  I2C1_Recover(void);
 
@@ -544,6 +548,40 @@ static inline uint32_t micros(void) {
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void SampleEncoders250us(void)
+{
+    static const int8_t quad_delta[16] = {
+         0, -1, +1,  0,
+        +1,  0,  0, -1,
+        -1,  0,  0, +1,
+         0, +1, -1,  0
+    };
+
+    uint8_t ra = (uint8_t)HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
+    uint8_t rb = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13);
+    uint8_t la = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14);
+    uint8_t lb = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_15);
+
+    uint8_t right_state = (uint8_t)((ra << 1) | rb);
+    uint8_t left_state  = (uint8_t)((la << 1) | lb);
+
+    if (!encoder_sampler_initialized) {
+        encoder_right_prev_state = right_state;
+        encoder_left_prev_state  = left_state;
+        encoder_sampler_initialized = 1;
+        return;
+    }
+
+    uint8_t right_idx = (uint8_t)((encoder_right_prev_state << 2) | right_state);
+    uint8_t left_idx  = (uint8_t)((encoder_left_prev_state  << 2) | left_state);
+
+    encoder_right += quad_delta[right_idx];
+    encoder_left  += quad_delta[left_idx];
+
+    encoder_right_prev_state = right_state;
+    encoder_left_prev_state  = left_state;
+}
+
 SSD1306_Ctx_t ssd_ctx = {
   .hi2c      = &hi2c1,
   .busy_flag = &i2c1_tx_busy
@@ -576,12 +614,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
     if (htim->Instance == TIM2) {        // 250 µs
         is250us = 1;
+        SampleEncoders250us();
     }
 
     if (htim->Instance == TIM5) {        // 2 ms
     	if (tick2ms_count < 10) tick2ms_count++;
-    	EXTI->IMR |= GPIO_PIN_8  | GPIO_PIN_13;  // encoder derecho A y B
-    	EXTI->IMR |= GPIO_PIN_14 | GPIO_PIN_15;  // encoder izquierdo A y B
     }
 }
 
@@ -1070,39 +1107,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         }
     }
 
-    // Encoder RIGHT — canal A (PA8)
-    if (GPIO_Pin == GPIO_PIN_8)
-    {
-        uint8_t a = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
-        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13);
-        if (a == b) encoder_right++; else encoder_right--;
-        EXTI->IMR &= ~GPIO_PIN_8;
-    }
-    // Encoder RIGHT — canal B (PB13), lógica invertida respecto a canal A
-    if (GPIO_Pin == GPIO_PIN_13)
-    {
-        uint8_t a = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
-        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13);
-        if (a != b) encoder_right++; else encoder_right--;
-        EXTI->IMR &= ~GPIO_PIN_13;
-    }
-
-    // Encoder LEFT — canal A (PB14)
-    if (GPIO_Pin == GPIO_PIN_14)
-    {
-        uint8_t a = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14);
-        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_15);
-        if (a == b) encoder_left++; else encoder_left--;
-        EXTI->IMR &= ~GPIO_PIN_14;
-    }
-    // Encoder LEFT — canal B (PB15), lógica invertida respecto a canal A
-    if (GPIO_Pin == GPIO_PIN_15)
-    {
-        uint8_t a = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14);
-        uint8_t b = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_15);
-        if (a != b) encoder_left++; else encoder_left--;
-        EXTI->IMR &= ~GPIO_PIN_15;
-    }
 }
 
 void calculate_tilt(int16_t ax, int16_t ay, int16_t az,
@@ -4193,13 +4197,20 @@ int main(void)
   IWDG->KR  = 0xCCCCU;
 
   // Prioridades de interrupts — CubeMX las resetea a 0 al regenerar; las fijamos acá.
-  // I2C DMA deben estar por debajo de 0 para no competir con ADC_IRQn (prio 0).
-  // EXTI15_10 (encoders PB13/14/15 + MPU PB12) a prio 1 para que el I2C DMA no se pise.
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 1, 0);  // I2C1 RX DMA
-  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 1, 0);  // I2C1 TX DMA
+  // Fix 2026-07-01: DMA de I2C subido a prio 0 (antes empataba en 1 con EXTI15_10),
+  // para que el fin de transacción I2C/MPU siempre pueda preemptar a los encoders.
+  // Con el giro de 180° generando ráfagas de EXTI15_10, el empate dejaba el DMA I2C
+  // pendiente en cola -> freeze de lectura MPU -> PWM congelado al último valor
+  // (alto, en pleno pivot) -> robot "aceleradísimo" y trabado hasta que el IWDG resetea.
+  // Los encoders ya no usan EXTI: se decodifican por muestreo periódico con TIM2 (250 us),
+  // dejando EXTI exclusivamente para MPU_INT y evitando storms/re-entradas compartidas.
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);  // I2C1 RX DMA
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);  // I2C1 TX DMA
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 2, 0);  // ADC1 DMA
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn,    1, 0);  // Encoders (PB13/14/15) + MPU (PB12)
-  HAL_NVIC_SetPriority(TIM5_IRQn,         6, 0);  // TIM5: re-habilitador de encoders, por debajo de encoders (prio 1/5)
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn,    2, 0);  // MPU (PB12)
+  HAL_NVIC_SetPriority(TIM2_IRQn,         3, 0);  // muestreo de encoders, debajo de DMA/I2C y MPU
+  HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);              // PA8 ya no interrumpe
+  HAL_NVIC_SetPriority(TIM5_IRQn,         6, 0);  // libre / no usado por encoders
 
   CDC_Attach_Rx(USBRxData);
   nBytesTx = 0;
@@ -4209,7 +4220,6 @@ int main(void)
   adc_dma_last_ms = HAL_GetTick();
   HAL_TIM_Base_Start_IT(&htim1);   // 10 ms
   HAL_TIM_Base_Start_IT(&htim2);   // 250 us (si lo vas a usar)
-  HAL_TIM_Base_Start_IT(&htim5);   // 2 ms (500 Hz)
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
 
   I2C_Manager_Init();
@@ -5063,22 +5073,19 @@ static void MX_GPIO_Init(void)
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
-  /* Encoder RIGHT — PA8 canal A, PB13 canal B (4x quadrature) */
+  /* Encoder RIGHT — PA8 canal A, PB13 canal B (cuadratura por muestreo con TIM2) */
   GPIO_InitStruct.Pin   = GPIO_PIN_8;
-  GPIO_InitStruct.Mode  = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull  = GPIO_PULLUP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* Encoder RIGHT canal B + Encoder LEFT canal A y B — todos EXTI RISING+FALLING */
+  /* Encoder RIGHT canal B + Encoder LEFT canal A y B — entradas simples, sin EXTI */
   GPIO_InitStruct.Pin   = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
-  GPIO_InitStruct.Mode  = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull  = GPIO_PULLUP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
