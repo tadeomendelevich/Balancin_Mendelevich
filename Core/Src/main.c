@@ -140,9 +140,13 @@ typedef enum {
 
 #define MOTOR_RIGHT_DEADBAND  	1   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
 #define MOTOR_LEFT_DEADBAND   	1   // ídem motor izquierdo — ajustar si el izq. no arranca a PWM bajo
-#define KV_BRAKE                0.0f  // ganancia base (velocidad baja)
-#define KV_BRAKE_STRONG         5.0f  // ganancia extra por encima del umbral
-#define BRAKE_VEL_THRESHOLD     1.5f  // velocidad a partir de la cual se aplica el freno fuerte
+// 2026-07-01: freno más agresivo — antes con KV_BRAKE=0 y umbral=1.5 el robot
+// aceleraba libremente (sin ninguna corrección) hasta 1.5 m/s antes de que
+// arrancara cualquier freno. Ahora hay freno base desde velocidad baja y el
+// freno fuerte arranca mucho antes.
+#define KV_BRAKE                2.0f  // ganancia base (antes 0.0 = sin freno hasta el umbral)
+#define KV_BRAKE_STRONG         8.0f  // ganancia extra por encima del umbral (antes 5.0)
+#define BRAKE_VEL_THRESHOLD     0.6f  // velocidad a partir de la cual se aplica el freno fuerte (antes 1.5)
 #define VEL_DECAY        		0.999f
 #define VEL_DECAY_ACCEL  		0.97f   // decay del integrador del acelerómetro
 
@@ -151,8 +155,8 @@ typedef enum {
 #define VEL_LPF_BETA     		0.35f
 #define BRAKE_VEL_DEADBAND      0.05f
 #define BRAKE_VEL_MAX           4.0f
-#define BRAKE_TILT_MAX          3.0f
-#define BRAKE_TILT_MAX_MANUAL   3.0f
+#define BRAKE_TILT_MAX          5.0f  // subido de 3.0: más margen de inclinación para frenar de verdad (aún lejos de los 60° de caída)
+#define BRAKE_TILT_MAX_MANUAL   5.0f  // ídem
 #define BRAKE_TILT_STEP_BAL     0.5f
 #define BRAKE_TILT_STEP_MAN     0.5f
 #define INTEGRAL_DECAY   		0.990f
@@ -164,7 +168,8 @@ typedef enum {
 #define STEER_I_MAX    15.0f
 #define STEER_OUT_MAX  20.0f
 // Velocity PI (lazo externo de velocidad en seguimiento de línea)
-#define LINE_VEL_KP             3.0f   // ganancia proporcional vel PI
+#define LINE_VEL_KP             3.0f   // ganancia proporcional vel PI (acelerando)
+#define LINE_VEL_KP_BRAKE       7.0f   // ganancia proporcional cuando va sobrevelocidad (frenando) — 2026-07-01
 #define LINE_VEL_KI             1.2f   // ganancia integral vel PI
 #define LINE_VEL_I_MAX          2.5f   // anti-windup vel PI
 #define LINE_ENC_CORR_KP        8.5f   // ganancia P: grados por (m/s de deficit) normalizado
@@ -2472,17 +2477,21 @@ static void ControlStep10ms(void)
             // PI de velocidad → inclinación de avance
             if (line_state == LINE_STATE_FOLLOWING) {
                 float vel_error = line_desired_forward_vel - line_forward_vel;
+                float line_vel_kp_eff;
                 if (vel_error > 0.0f) {
                     // Acelerando: acumula integral solo en positivo
                     line_vel_integral += vel_error * DT_CTRL_FIXED;
                     line_vel_integral = clampf_local(line_vel_integral, 0.0f, LINE_VEL_I_MAX);
+                    line_vel_kp_eff = LINE_VEL_KP;
                 } else {
-                    // Sobre-velocidad: decae rápido para soltar el freno sin demora
+                    // Sobre-velocidad: decae la integral (freno no depende del windup)
+                    // y usa ganancia P más alta para frenar de verdad, no solo soltar el gas.
                     line_vel_integral *= 0.80f;
+                    line_vel_kp_eff = LINE_VEL_KP_BRAKE;
                 }
                 line_angle_cmd = clampf_local(
-                    LINE_VEL_KP * vel_error + LINE_VEL_KI * line_vel_integral,
-                    -1.5f, LINE_ANGLE
+                    line_vel_kp_eff * vel_error + LINE_VEL_KI * line_vel_integral,
+                    -3.0f, LINE_ANGLE
                 );
             } else {
                 line_vel_integral *= 0.80f;
@@ -3001,11 +3010,12 @@ static void ControlStep10ms(void)
         // Término de posición: integra velocidad para corregir deriva lenta
         dynamic_setpoint_f = base_setpoint_f + brake_setpoint_f;
         dynamic_setpoint_f = clampf_local(dynamic_setpoint_f, -sp_limit, sp_limit);
-        // En modo linea: FOLLOWING frena hasta -1.5°; OBJ_REVERSE permite inclinar mas hacia atras.
+        // En modo linea: FOLLOWING frena hasta -3.0° (antes -1.5, freno más agresivo
+        // 2026-07-01); OBJ_REVERSE permite inclinar mas hacia atras.
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
             float line_negative_limit = (line_state == LINE_STATE_OBJ_REVERSE)
                                       ? LINE_OBJ_REV_TILT_MAX
-                                      : 1.5f;
+                                      : 3.0f;
             if (dynamic_setpoint_f < -line_negative_limit)
                 dynamic_setpoint_f = -line_negative_limit;
         }
@@ -3393,13 +3403,21 @@ static void ControlStep10ms(void)
                     {
                         // Giro 180° derecha para buscar la línea perdida.
                         // Misma lógica gz+encoder que OBJ_ROTATE y MANUAL, escalada a 180°.
-                        const float  LROT_ENC_TARGET   = 760.0f; // 380*2 counts = 180°
+                        // 2026-07-01: 760->829->880. Seguía quedando corto en 829; nueva
+                        // pasada de ajuste fino (+~6% más). Si sigue corto, seguir subiendo
+                        // de a ~5-8% por vez.
+                        const float  LROT_ENC_TARGET   = 880.0f;
                         const float  LROT_PIVOT        = 12.0f;
                         const float  LROT_BRAKE        = 8.0f;   // freno más fuerte (era 5) → menos overshoot
                         const float  LROT_SLOWDOWN_DEG = 55.0f;
                         const float  LROT_ABS_TARGET   = 180.0f;
                         const uint32_t LROT_P0_MAX     = 4000U;  // timeout más largo para giro lento
-                        const uint32_t LROT_P1_MAX     = 1500U;  // ampliado: fase 1 ahora pivotea hasta enc_done
+                        // LROT_P1_MAX ahora es solo un colchón de seguridad (motor trabado,
+                        // sensor de encoder fallando, etc.) — la salida normal SIEMPRE espera
+                        // a completar los LROT_ENC_TARGET counts (ver "enc_done" más abajo).
+                        // Antes (1500-1800ms) podía cortar la fase de freno antes de terminar
+                        // el recorrido y contribuía al giro corto.
+                        const uint32_t LROT_P1_MAX     = 6000U;
                         // enc_exit_frac 0.60: frena al 60% del recorrido → 44% restante para frenar (era 0.70)
                         const float  LROT_ENC_FRAC     = 0.60f;
 
