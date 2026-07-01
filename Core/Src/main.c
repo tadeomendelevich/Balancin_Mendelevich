@@ -575,8 +575,13 @@ static void SampleEncoders250us(void)
     uint8_t right_idx = (uint8_t)((encoder_right_prev_state << 2) | right_state);
     uint8_t left_idx  = (uint8_t)((encoder_left_prev_state  << 2) | left_state);
 
-    encoder_right += quad_delta[right_idx];
-    encoder_left  += quad_delta[left_idx];
+    // Signo invertido a propósito: la tabla quad_delta da la convención opuesta
+    // a la que tenía el conteo viejo por EXTI (verificado a mano transición por
+    // transición). Sin este signo, velocity_est_f queda invertido y el freno
+    // traslacional (ComputeBrakeSetpointTarget) empuja en el sentido del
+    // movimiento en lugar de frenarlo -> el robot se acelera en vez de balancear.
+    encoder_right -= quad_delta[right_idx];
+    encoder_left  -= quad_delta[left_idx];
 
     encoder_right_prev_state = right_state;
     encoder_left_prev_state  = left_state;
