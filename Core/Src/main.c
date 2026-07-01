@@ -58,7 +58,9 @@ typedef enum {
     LINE_STATE_LOST_FWD,       // Post-180°: avanza hacia adelante hasta encontrar la línea
     LINE_STATE_EDGE_WAIT,      // Línea perdida por un extremo (curva): espera a frenar antes de girar 90°
     LINE_STATE_EDGE_ROTATE,    // Línea perdida por un extremo: gira 90° hacia ese lado
+    LINE_STATE_EDGE_SETTLE,    // Post-90°: pausa de estabilización antes de avanzar
     LINE_STATE_EDGE_FWD,       // Post-90°: avanza con velocidad controlada hasta encontrar la línea
+    LINE_STATE_GIVEN_UP,       // Ni el giro de 180 ni el de 90 encontraron la línea: reposo total hasta reponerla a mano
     LINE_STATE_OBJ_PRE_REVERSE_HOLD, // Objeto detectado: balance estático 2s → luego OBJ_ROTATE
     LINE_STATE_OBJ_REVERSE,    // (deshabilitado) reversa breve antes del giro
     LINE_STATE_OBJ_BRAKE,      // (deshabilitado) frena hasta velocidad ≈ 0 antes de girar
@@ -144,23 +146,33 @@ typedef enum {
 
 #define MOTOR_RIGHT_DEADBAND  	1   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
 #define MOTOR_LEFT_DEADBAND   	1   // ídem motor izquierdo — ajustar si el izq. no arranca a PWM bajo
-// 2026-07-01: freno más agresivo — antes con KV_BRAKE=0 y umbral=1.5 el robot
-// aceleraba libremente (sin ninguna corrección) hasta 1.5 m/s antes de que
-// arrancara cualquier freno. Ahora hay freno base desde velocidad baja y el
-// freno fuerte arranca mucho antes.
-#define KV_BRAKE                2.0f  // ganancia base (antes 0.0 = sin freno hasta el umbral)
-#define KV_BRAKE_STRONG         8.0f  // ganancia extra por encima del umbral (antes 5.0)
-#define BRAKE_VEL_THRESHOLD     0.6f  // velocidad a partir de la cual se aplica el freno fuerte (antes 1.5)
+// 2026-07-01: freno más agresivo (0/5/1.5) por reportes de aceleración
+// descontrolada. Bajado un poco después: con KV_BRAKE=2.0 base + deadband
+// chico (0.05), el ruido de cuantización de la nueva velocidad por encoders
+// alimentaba una corrección constante y el balance normal (parado, sin
+// perturbación) oscilaba visiblemente. Valores intermedios entre el
+// original y el primer ajuste agresivo.
+#define KV_BRAKE                0.8f  // ganancia base (era 0.0 → 2.0 → 0.8)
+#define KV_BRAKE_STRONG         6.0f  // ganancia extra por encima del umbral (era 5.0 → 8.0 → 6.0)
+#define BRAKE_VEL_THRESHOLD     1.0f  // velocidad a partir de la cual se aplica el freno fuerte (era 1.5 → 0.6 → 1.0)
 #define VEL_DECAY        		0.999f
 #define VEL_DECAY_ACCEL  		0.97f   // decay del integrador del acelerómetro
 
 #define VEL_CF_ALPHA     		0.0f    // peso del giroscopio en el filtro complementario (1=solo gyro, 0=solo accel)
 #define VEL_ACCEL_SCALE  		30.0f   // escala para igualar m/s del accel con unidades del gyro
 #define VEL_LPF_BETA     		0.35f
-#define BRAKE_VEL_DEADBAND      0.05f
+// BRAKE_VEL_DEADBAND calculado a partir del piso de cuantización real del
+// encoder: con ENC_CPR=28 y ciclo de control de 10ms, UN solo count en una
+// sola rueda ya calcula (0.5/(28*0.01))*ENC_VEL_SCALE(0.1775) ≈ 0.32 m/s;
+// si tiquean ambas ruedas en el mismo ciclo, ≈ 0.63 m/s. 0.05-0.12 no
+// filtraba nada de eso — cualquier pulso aislado se leía como "movimiento
+// real" y disparaba freno, causando el bamboleo parado. 0.35 queda apenas
+// por encima del piso mínimo (0.32) para filtrar el ruido de un solo pulso
+// sin tapar una deriva sostenida real.
+#define BRAKE_VEL_DEADBAND      0.35f
 #define BRAKE_VEL_MAX           4.0f
-#define BRAKE_TILT_MAX          5.0f  // subido de 3.0: más margen de inclinación para frenar de verdad (aún lejos de los 60° de caída)
-#define BRAKE_TILT_MAX_MANUAL   5.0f  // ídem
+#define BRAKE_TILT_MAX          4.0f  // era 3.0 → 5.0 → 4.0: compromiso entre frenar de verdad y no sobrecorregir en balance normal
+#define BRAKE_TILT_MAX_MANUAL   4.0f  // ídem
 #define BRAKE_TILT_STEP_BAL     0.5f
 #define BRAKE_TILT_STEP_MAN     0.5f
 #define INTEGRAL_DECAY   		0.990f
@@ -176,6 +188,20 @@ typedef enum {
 #define LINE_VEL_KP_BRAKE       7.0f   // ganancia proporcional cuando va sobrevelocidad (frenando) — 2026-07-01
 #define LINE_VEL_KI             1.2f   // ganancia integral vel PI
 #define LINE_VEL_I_MAX          2.5f   // anti-windup vel PI
+// Avance post-giro (LOST_FWD / EDGE_FWD) — control P continuo en vez del
+// bang-bang viejo (ángulo fijo + freno de -1° solo por encima de 0.90 m/s),
+// que no frenaba nunca hasta cruzar el umbral y podía acelerar sin control
+// si la lectura de velocidad no cruzaba el umbral limpiamente. 2026-07-01.
+// 0.30 quedaba DENTRO del piso de cuantización del encoder (~0.32-0.63 m/s,
+// ver BRAKE_VEL_DEADBAND arriba): el control nunca encontraba un punto
+// estable y terminaba peleando entre acelerar a fondo y frenar a fondo,
+// resultando en que el robot no avanzaba en absoluto. Subido a 0.45, claramente
+// por encima del piso de un solo pulso (~0.32) para que el P tenga margen real.
+#define LOST_FWD_SPEED_TARGET   0.45f  // m/s, avance cauteloso "a ciegas"
+#define LOST_FWD_KP             6.0f   // ganancia P acelerando
+#define LOST_FWD_KP_BRAKE       10.0f  // ganancia P frenando (sobrevelocidad)
+#define LOST_FWD_ANGLE_MAX      2.0f   // ángulo máximo de avance (°)
+#define LOST_FWD_BRAKE_MAX      2.0f   // ángulo máximo de freno activo (°, se aplica en negativo)
 #define LINE_ENC_CORR_KP        8.5f   // ganancia P: grados por (m/s de deficit) normalizado
 #define LINE_ENC_CORR_MAX       4.0f   // angulo extra maximo por deficit de velocidad (grados)
 #define LINE_REV_BOOST_MAX      1.4f   // extra de inclinacion si los encoders muestran reversa
@@ -397,6 +423,7 @@ static uint8_t    line_seen_since_entry = 0; // evita búsqueda automática ante
 static float      line_search_dir  = 1.0f; // dirección de búsqueda (+1 o -1)
 static float      last_line_dir    = 1.0f; // última dirección válida de la línea (+1 o -1)
 static uint8_t    line_was_centered_on_lost = 1; // 1 = venía centrado (ADC del medio) al perder la línea, 0 = venía por los extremos
+static float      line_error_peak_recent = 0.0f; // pico reciente de |line_error| (decae ~0.98/ciclo), evita falso "centrado" cuando el sensor extremo se desvanece justo antes de perder la línea
 static float      line_error_f_d   = 0.0f;
 
 static uint8_t upside_down_count = 0;
@@ -444,6 +471,7 @@ static uint32_t obj_detect_ignore_until_ms = 0;  // ignora sensores de objeto ha
 static uint8_t  prev_all_line_black        = 1;  // todos los sensores de línea en negro (robot en el aire)
 static uint32_t all_black_start_ms         = 0;  // tick en que empezaron a verse todos negros
 static uint8_t  f_in_air                   = 0;  // 1 = robot en el aire >2s → motores detenidos
+static float    accel_motion_f             = 0.0f;  // variación reciente del acelerómetro (EMA), para distinguir "en la mano" de "quieto sobre blanco"
 static uint32_t lrot_brake_start_ms        = 0;  // inicio del frenado previo al giro 180°
 static uint32_t lrot_settle_start_ms       = 0;  // inicio de la pausa de estabilización post-180°
 static uint32_t edge_wait_start_ms         = 0;  // inicio del frenado previo al giro de 90° (perdida por un extremo)
@@ -1714,7 +1742,9 @@ void updateDisplay(void) {
                     case LINE_STATE_LOST_FWD:             line_mode_str = "AVNZA";  break;
                     case LINE_STATE_EDGE_WAIT:             line_mode_str = "EFRENA"; break;
                     case LINE_STATE_EDGE_ROTATE:           line_mode_str = "EGIRO";  break;
+                    case LINE_STATE_EDGE_SETTLE:           line_mode_str = "EESTAB"; break;
                     case LINE_STATE_EDGE_FWD:              line_mode_str = "EAVNZA"; break;
+                    case LINE_STATE_GIVEN_UP:              line_mode_str = "PARADO"; break;
                     case LINE_STATE_OBJ_PRE_REVERSE_HOLD: line_mode_str = "ESPER";  break;
                     case LINE_STATE_OBJ_REVERSE:          line_mode_str = "RETRO";  break;
                     case LINE_STATE_OBJ_BRAKE:            line_mode_str = "STOP";   break;
@@ -2296,6 +2326,23 @@ static void ControlStep10ms(void)
 		MPU6050_GetAccel(&ax, &ay, &az);
 		MPU6050_GetGyro(&gx, &gy, &gz);
 
+		// Métrica de "se está moviendo/manipulando con la mano": suma de |delta|
+		// del acelerómetro crudo entre ciclos, suavizada. Quieto sobre una
+		// superficie (aunque no vea la línea) da un valor bajo y estable; en la
+		// mano, aunque se intente sostener firme, siempre hay variación sostenida.
+		// Usado para distinguir "lo levantaron" de "está parado sobre blanco".
+		static int16_t accel_prev_x = 0, accel_prev_y = 0, accel_prev_z = 0;
+		static uint8_t accel_prev_init = 0;
+		if (!accel_prev_init) {
+			accel_prev_x = ax; accel_prev_y = ay; accel_prev_z = az;
+			accel_prev_init = 1;
+		}
+		float accel_delta = fabsf((float)(ax - accel_prev_x)) +
+		                     fabsf((float)(ay - accel_prev_y)) +
+		                     fabsf((float)(az - accel_prev_z));
+		accel_motion_f += 0.30f * (accel_delta - accel_motion_f);
+		accel_prev_x = ax; accel_prev_y = ay; accel_prev_z = az;
+
 		// Encoder speed — leer conteos acumulados desde IRQ y calcular velocidad
 		static int32_t enc_right_prev = 0;
 		static int32_t enc_left_prev  = 0;
@@ -2444,15 +2491,25 @@ static void ControlStep10ms(void)
 
             line_detected = (w_sum > 0.0f);
 
-            // Detección de "en el aire": todos los 4 sensores en negro.
-            // Si se mantiene >2s → f_in_air=1 → motores detenidos hasta que toque superficie.
+            // Detección de "en el aire": todos los 4 sensores en negro Y el
+            // acelerómetro variando constantemente (= lo tienen en la mano).
+            // Si los 4 sensores están en negro pero el acelerómetro está quieto,
+            // significa que el robot está parado sobre una zona sin línea (no en
+            // el aire) — en ese caso NO se detienen los motores, debe seguir
+            // buscando la línea normalmente (LOST/EDGE). Umbral de movimiento
+            // (ACCEL_MOTION_THRESHOLD) es un punto de partida, ajustar según
+            // pruebas físicas (unidades: LSB crudos del MPU6050 por ciclo, EMA).
+            // Si se mantiene >2s con ambas condiciones → f_in_air=1 → motores
+            // detenidos hasta que toque superficie o se detenga la manipulación.
             // Cuando baja al piso (all_black→0) → ignorar obstáculos 3s (mano al soltar).
             {
+                const float ACCEL_MOTION_THRESHOLD = 300.0f;
                 uint8_t all_black = (adcAvg[0] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[1] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[2] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[3] > (uint16_t)LINE_THRESHOLD);
-                if (all_black) {
+                uint8_t accel_moving = (accel_motion_f > ACCEL_MOTION_THRESHOLD);
+                if (all_black && accel_moving) {
                     if (all_black_start_ms == 0) all_black_start_ms = HAL_GetTick();
                     if ((HAL_GetTick() - all_black_start_ms) > 2000U) f_in_air = 1;
                 } else {
@@ -2472,6 +2529,13 @@ static void ControlStep10ms(void)
                 // Umbral más bajo porque sensores internos solo generan ±0.11
                 if (line_error > 0.02f)       last_line_dir =  1.0f;
                 else if (line_error < -0.02f) last_line_dir = -1.0f;
+
+                // Pico reciente de |line_error| (decae ~0.98/ciclo, memoria de ~0.3-0.5s).
+                // Justo antes de perder la línea del todo, la señal del sensor extremo
+                // suele desvanecerse y el último line_error puntual vuelve a verse
+                // "centrado" aunque la pérdida haya sido por un extremo — este pico
+                // reciente evita ese falso negativo al decidir 90° vs 180°.
+                line_error_peak_recent = fmaxf(fabsf(line_error), line_error_peak_recent * 0.98f);
             }
             line_error_disp = line_error;
 
@@ -2576,6 +2640,7 @@ static void ControlStep10ms(void)
             line_state          = LINE_STATE_FOLLOWING;
             line_seen_since_entry = 0;
             line_was_centered_on_lost = 1;
+            line_error_peak_recent    = 0.0f;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
             base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
@@ -2722,13 +2787,13 @@ static void ControlStep10ms(void)
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_LOST_FWD) {
-                // Avance post-180°: ángulo fijo limitado por overspeed (igual que WALL_FWD).
-                // Frena activamente si supera OBJ_WALL_OVERSPEED_VEL (0.90 m/s).
+                // Avance post-180°: control P continuo de velocidad (ver LOST_FWD_* arriba).
                 {
-                    float lfwd_vel = fmaxf(0.0f, -velocity_est_f);
-                    base_setpoint_target = (lfwd_vel > OBJ_WALL_OVERSPEED_VEL)
-                                         ? -OBJ_WALL_BRAKE_ANGLE
-                                         :  OBJ_WALL_APPROACH_ANGLE;
+                    float lfwd_vel   = fmaxf(0.0f, -velocity_est_f);
+                    float vel_error  = LOST_FWD_SPEED_TARGET - lfwd_vel;
+                    float kp         = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;
+                    base_setpoint_target = clampf_local(kp * vel_error,
+                                                        -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
                 }
                 brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
@@ -2751,15 +2816,29 @@ static void ControlStep10ms(void)
                 brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
+            } else if (line_state == LINE_STATE_EDGE_SETTLE) {
+                // Estabilización post-90°: upright con freno de encoders, sin avance
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                line_enc_angle_corr   = 0.0f;
+                line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_EDGE_FWD) {
-                // Avance post-90°: mismo esquema que LOST_FWD (ángulo fijo + freno por overspeed)
+                // Avance post-90°: mismo control P continuo que LOST_FWD.
                 {
-                    float efwd_vel = fmaxf(0.0f, -velocity_est_f);
-                    base_setpoint_target = (efwd_vel > OBJ_WALL_OVERSPEED_VEL)
-                                         ? -OBJ_WALL_BRAKE_ANGLE
-                                         :  OBJ_WALL_APPROACH_ANGLE;
+                    float efwd_vel   = fmaxf(0.0f, -velocity_est_f);
+                    float vel_error  = LOST_FWD_SPEED_TARGET - efwd_vel;
+                    float kp         = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;
+                    base_setpoint_target = clampf_local(kp * vel_error,
+                                                        -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
                 }
                 brake_setpoint_target = 0.0f;
+                line_enc_angle_corr   = 0.0f;
+                line_reverse_boost    = 0.0f;
+            } else if (line_state == LINE_STATE_GIVEN_UP) {
+                // Reposo total: ni el giro de 180 ni el de 90 encontraron la línea.
+                // Upright con freno de encoders, sin ningún intento de búsqueda.
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_ROTATE ||
@@ -3381,9 +3460,11 @@ static void ControlStep10ms(void)
                                 line_integral        = 0.0f;
                                 steering_adjustment  = 0.0f;
                                 // Snapshot: ¿venía centrado (ADC del medio) o por los extremos?
-                                // line_error retiene el último valor visto (no se resetea al
-                                // perder la línea). 0.15 = umbral empírico entre "centrado" y "borde".
-                                line_was_centered_on_lost = (fabsf(line_error) < 0.15f);
+                                // Usa el PICO reciente de |line_error|, no el último valor
+                                // puntual (que suele desvanecerse hacia el centro justo antes
+                                // de perder la línea del todo). 0.15 = umbral empírico.
+                                line_was_centered_on_lost = (line_error_peak_recent < 0.15f);
+                                line_error_peak_recent    = 0.0f;
                                 // Centrado → secuencia de giro 180° (LOST/LOST_BRAKE/LOST_ROTATE).
                                 // Por un extremo (curva) → secuencia de giro 90° hacia ese lado
                                 // (EDGE_WAIT/EDGE_ROTATE/EDGE_FWD).
@@ -3525,7 +3606,11 @@ static void ControlStep10ms(void)
                             uint32_t p1e      = HAL_GetTick() - obj_rot_phase1_ms;
                             float rv          = (fabsf(speed_right_rps_s) + fabsf(speed_left_rps_s)) * 0.5f;
                             int enc_done      = (lrot_counts >= LROT_ENC_TARGET);
-                            int vel_ok        = (rv < 2.0f && p1e >= 80U);
+                            // 2026-07-01: umbral bajado de 2.0 a 0.5 rev/s — con 2.0 rps
+                            // (~0.35 m/s en la periferia de la rueda) se consideraba "parado"
+                            // con las ruedas todavía girando de verdad, y esa velocidad
+                            // residual se arrastraba a LOST_SETTLE/EDGE_SETTLE sin frenar.
+                            int vel_ok        = (rv < 0.5f && p1e >= 150U);
                             int overshoot     = (lrot_abs_hdg > LROT_ABS_TARGET * 1.2f);
                             if ((enc_done && vel_ok) || p1e >= LROT_P1_MAX || overshoot) {
                                 // Giro terminado: pausa de estabilización antes de avanzar
@@ -3557,9 +3642,12 @@ static void ControlStep10ms(void)
                     {
                         // Post-180°: pausa de estabilización fuerte (upright + freno de
                         // encoders) antes de arrancar a avanzar. Sale por tiempo mínimo
-                        // cumplido Y velocidad/inclinación estabilizadas, o por timeout.
+                        // cumplido Y velocidad/inclinación estabilizadas. El timeout es
+                        // solo un colchón de seguridad (3s, no un corte normal) — antes
+                        // (1200ms) cortaba antes de frenar de verdad y el robot arrancaba
+                        // a avanzar con velocidad residual del giro.
                         const uint32_t LSETTLE_MIN_MS   = 400U;
-                        const uint32_t LSETTLE_TIMEOUT  = 1200U;
+                        const uint32_t LSETTLE_TIMEOUT  = 3000U;
                         const float    LSETTLE_VEL_THR  = 0.10f;   // m/s
                         const float    LSETTLE_TILT_THR = 3.0f;    // grados respecto al setpoint
 
@@ -3592,9 +3680,9 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_LOST_FWD:
                     {
-                        // Post-180°: avanza con ángulo fijo hasta encontrar la línea.
-                        // Timeout 10s de seguridad → vuelve a LOST si no la encuentra.
-                        const uint32_t LOST_FWD_TIMEOUT = 10000U;
+                        // Post-180°: avanza con velocidad controlada hasta encontrar la línea.
+                        // 3s sin encontrarla → reposo total (GIVEN_UP), no reintenta la búsqueda.
+                        const uint32_t LOST_FWD_TIMEOUT = 3000U;
                         steering_adjustment = 0.0f;
                         if (line_detected) {
                             line_seen_since_entry = 1;
@@ -3604,9 +3692,7 @@ static void ControlStep10ms(void)
                             line_state        = LINE_STATE_FOLLOWING;
                         } else if (f_fallen ||
                                    (HAL_GetTick() - line_lost_ms) > LOST_FWD_TIMEOUT) {
-                            line_state           = LINE_STATE_LOST;
-                            line_lost_ms         = HAL_GetTick();
-                            line_lost_entered_ms = HAL_GetTick();
+                            line_state = LINE_STATE_GIVEN_UP;
                         }
                         break;
                     }
@@ -3702,11 +3788,13 @@ static void ControlStep10ms(void)
                             uint32_t p1e  = HAL_GetTick() - obj_rot_phase1_ms;
                             float rv      = (fabsf(speed_right_rps_s) + fabsf(speed_left_rps_s)) * 0.5f;
                             int enc_done  = (erot_counts >= EROT_ENC_TARGET);
-                            int vel_ok    = (rv < 2.0f && p1e >= 80U);
+                            // Ver comentario equivalente en LOST_ROTATE (2026-07-01)
+                            int vel_ok    = (rv < 0.5f && p1e >= 150U);
                             int overshoot = (erot_abs_hdg > EROT_ABS_TARGET * 1.2f);
                             if ((enc_done && vel_ok) || p1e >= EROT_P1_MAX || overshoot) {
-                                line_state          = LINE_STATE_EDGE_FWD;
-                                line_lost_ms        = HAL_GetTick();
+                                // Giro terminado: pausa de estabilización antes de avanzar
+                                line_state          = LINE_STATE_EDGE_SETTLE;
+                                lrot_settle_start_ms = 0;
                                 obj_rot_initialized = 0;
                                 obj_rot_phase       = 0;
                                 obj_rot_heading     = 0.0f;
@@ -3728,11 +3816,47 @@ static void ControlStep10ms(void)
                         break;
                     }
 
+                    case LINE_STATE_EDGE_SETTLE:
+                    {
+                        // Post-90°: pausa de estabilización idéntica a LOST_SETTLE (mismo
+                        // fix 2026-07-01: timeout es colchón de seguridad, no corte normal).
+                        const uint32_t ESETTLE_MIN_MS   = 400U;
+                        const uint32_t ESETTLE_TIMEOUT  = 3000U;
+                        const float    ESETTLE_VEL_THR  = 0.10f;
+                        const float    ESETTLE_TILT_THR = 3.0f;
+
+                        if (lrot_settle_start_ms == 0) lrot_settle_start_ms = HAL_GetTick();
+                        steering_adjustment = 0.0f;
+
+                        if (line_detected) {
+                            line_seen_since_entry = 1;
+                            line_integral         = 0.0f;
+                            line_error_prev       = 0.0f;
+                            line_lost_ms          = HAL_GetTick();
+                            line_state            = LINE_STATE_FOLLOWING;
+                            lrot_settle_start_ms  = 0;
+                            break;
+                        }
+
+                        uint32_t elapsed  = HAL_GetTick() - lrot_settle_start_ms;
+                        float tilt_err    = fabsf(filtered_roll_deg - dynamic_setpoint_f);
+                        int settled       = (elapsed >= ESETTLE_MIN_MS) &&
+                                            (fabsf(velocity_est_f) < ESETTLE_VEL_THR) &&
+                                            (tilt_err < ESETTLE_TILT_THR);
+
+                        if (settled || elapsed >= ESETTLE_TIMEOUT) {
+                            line_state           = LINE_STATE_EDGE_FWD;
+                            line_lost_ms         = HAL_GetTick();
+                            lrot_settle_start_ms = 0;
+                        }
+                        break;
+                    }
+
                     case LINE_STATE_EDGE_FWD:
                     {
                         // Post-90°: avanza con velocidad controlada hasta encontrar la línea.
-                        // Timeout 10s de seguridad -> vuelve a LOST si no la encuentra.
-                        const uint32_t EDGE_FWD_TIMEOUT = 10000U;
+                        // 3s sin encontrarla → reposo total (GIVEN_UP), no reintenta la búsqueda.
+                        const uint32_t EDGE_FWD_TIMEOUT = 3000U;
                         steering_adjustment = 0.0f;
                         if (line_detected) {
                             line_seen_since_entry = 1;
@@ -3742,12 +3866,24 @@ static void ControlStep10ms(void)
                             line_state        = LINE_STATE_FOLLOWING;
                         } else if (f_fallen ||
                                    (HAL_GetTick() - line_lost_ms) > EDGE_FWD_TIMEOUT) {
-                            line_state           = LINE_STATE_LOST;
-                            line_lost_ms         = HAL_GetTick();
-                            line_lost_entered_ms = HAL_GetTick();
+                            line_state = LINE_STATE_GIVEN_UP;
                         }
                         break;
                     }
+
+                    case LINE_STATE_GIVEN_UP:
+                        // Reposo total: ni el giro de 180° ni el de 90° encontraron la línea.
+                        // No hay timeout ni reintento — se queda balanceado en el lugar hasta
+                        // que se detecte la línea de nuevo (el usuario la repone a mano).
+                        steering_adjustment = 0.0f;
+                        if (line_detected) {
+                            line_seen_since_entry = 1;
+                            line_integral       = 0.0f;
+                            line_error_prev     = 0.0f;
+                            line_lost_ms        = HAL_GetTick();
+                            line_state          = LINE_STATE_FOLLOWING;
+                        }
+                        break;
 
                     case LINE_STATE_OBJ_PRE_REVERSE_HOLD:
                     {
