@@ -218,7 +218,10 @@ typedef enum {
 #define LINE_REV_VEL_FULL       0.35f  // m/s de reversa para aplicar boost maximo
 #define LINE_OBJ_REV_SPEED_MAX  0.30f  // m/s objetivo maximo durante reversa por obstaculo
 #define LINE_OBJ_REV_SPEED_MIN  0.10f  // m/s minimo para que la reversa no se quede sin empuje
-#define LINE_OBJ_REV_TILT_MAX   2.0f   // inclinacion maxima hacia atras durante reversa por obstaculo
+// 2026-07-02: subido de 2.0 a 3.5 — con 2.0° a veces no alcanzaba para vencer
+// la fricción estática y arrancar desde parado, el robot se quedaba quieto
+// "queriendo" retroceder sin lograrlo.
+#define LINE_OBJ_REV_TILT_MAX   3.5f   // inclinacion maxima hacia atras durante reversa por obstaculo
 #define LINE_OBJ_REV_STEER_GAIN 0.70f  // escala del PID de linea cuando corrige marcha atras
 #define LINE_OBJ_REV_STEER_MAX  16.0f  // limite de steering durante reversa siguiendo linea
 // Inner steering PI (lazo cerrado con encoder diferencial)
@@ -503,7 +506,6 @@ static uint32_t obj_brake_start_ms   = 0;         // inicio de OBJ_BRAKE (file-s
 static uint32_t obj_pre_rotate_ms    = 0;         // inicio del wait post-freno antes de OBJ_ROTATE
 static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
 static float    obj_arc_steer_int    = 0.0f;      // integral del PI de diferencial en OBJ_ARC
-static float    obj_rev_straight_int = 0.0f;      // integral del PI de enderezamiento en OBJ_REVERSE
 static uint32_t obj_wall_approach_start_ms = 0;    // timestamp de entrada a WALL_APPROACH
 static uint32_t obj_wall_fwd_start_ms = 0;         // timestamp de entrada a WALL_FWD (para ignorar línea 3s)
 
@@ -3274,7 +3276,6 @@ static void ControlStep10ms(void)
                 obj_brake_start_ms   = 0;
                 obj_pre_rotate_ms    = 0;
                 obj_hold_start_ms    = 0;
-                obj_rev_straight_int = 0.0f;
                 obj_arc_steer_int    = 0.0f;
                 obj_wall_approach_start_ms = 0;
                 obj_wall_fwd_start_ms      = 0;
@@ -3376,10 +3377,15 @@ static void ControlStep10ms(void)
                 // post-giro, sin línea detectada) — sin esto, el hold se activaba apenas
                 // el ángulo objetivo rampeaba desde 0° (error chico) y silenciaba el PID
                 // justo cuando debía empujar al robot hacia adelante: se quedaba quieto.
+                // 2026-07-02: mismo bug en OBJ_REVERSE — el robot suele estar bien parado
+                // y nivelado justo al empezar a retroceder por un obstáculo, así que el
+                // hold se activaba de entrada y apagaba el PID antes de poder generar el
+                // ángulo de reversa ("no le da el ángulo para ir hacia atrás").
                 if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
                     (line_detected ||
                      line_state == LINE_STATE_LOST_FWD ||
-                     line_state == LINE_STATE_EDGE_FWD))
+                     line_state == LINE_STATE_EDGE_FWD ||
+                     line_state == LINE_STATE_OBJ_REVERSE))
                     balance_hold_active = 0;
                 else if (!balance_hold_active) {
                     if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
@@ -4125,6 +4131,9 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_OBJ_REVERSE:
                     {
+                        // Vuelto a 200 (~10cm), el valor original — se había alargado
+                        // temporalmente a 1000 (~50cm) para calibrar la rectitud del
+                        // enderezamiento por gyro; ya ajustado, se restaura la distancia normal.
                         const int32_t rev_target_counts = 200; // ~10 cm
 
                         if (!obj_rev_initialized) {
@@ -4133,7 +4142,6 @@ static void ControlStep10ms(void)
                             obj_rev_l0 = encoder_left;
                             __enable_irq();
                             obj_rev_initialized  = 1;
-                            obj_rev_straight_int = 0.0f;
                         }
 
                         __disable_irq();
@@ -4194,16 +4202,18 @@ static void ControlStep10ms(void)
                                 log_i_line = i_line;
                                 log_d_line = d_line;
                             } else {
-                                // PI de enderezamiento: target = rev_dr == rev_dl.
-                                // Si el signo curva al reves, negar diff_err.
-                                float diff_err = (float)(rev_dr - rev_dl);
-                                obj_rev_straight_int += diff_err * DT_CTRL_FIXED;
-                                if (obj_rev_straight_int >  30.0f) obj_rev_straight_int =  30.0f;
-                                if (obj_rev_straight_int < -30.0f) obj_rev_straight_int = -30.0f;
-                                float enc_corr = 3.0f * diff_err + 0.5f * obj_rev_straight_int;
-                                if (enc_corr >  15.0f) enc_corr =  15.0f;
-                                if (enc_corr < -15.0f) enc_corr = -15.0f;
-                                steering_adjustment = enc_corr;
+                                // 2026-07-02 (v2): la corrección por PI de rumbo integrado
+                                // (v1) daba zigzag — probablemente signo/ganancia mal
+                                // calibrados en una fórmula nueva sin validar. Reemplazada
+                                // por el mismo patrón de amortiguación por tasa (gz crudo,
+                                // sin integrar) que YA se usa y funciona en LOST/SEARCHING/
+                                // OBJ_HOLD/OBJ_WALL_FWD/LOST_FWD/EDGE_FWD (half_steer =
+                                // gz_dps*0.3). Acá se multiplica por 0.6 para compensar el
+                                // *0.5 que se aplica después sobre steering_adjustment
+                                // (half_steer = steering_adjustment*0.5), y así terminar
+                                // con el mismo half_steer efectivo que ese patrón probado.
+                                float rev_gz = (float)gz / 131.0f;
+                                steering_adjustment = clampf_local(rev_gz * 0.6f, -15.0f, 15.0f);
                             }
                         }
                         // Setpoint de reversa calculado por PI en la seccion de setpoints.
