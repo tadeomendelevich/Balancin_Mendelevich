@@ -192,7 +192,7 @@ typedef enum {
 #define STEER_OUT_MAX  20.0f
 // Velocity PI (lazo externo de velocidad en seguimiento de línea)
 #define LINE_VEL_KP             3.0f   // ganancia proporcional vel PI (acelerando)
-#define LINE_VEL_KP_BRAKE       7.0f   // ganancia proporcional cuando va sobrevelocidad (frenando) — 2026-07-01
+#define LINE_VEL_KP_BRAKE   	3.0f   // ganancia proporcional cuando va sobrevelocidad (frenando) — 2026-07-01
 #define LINE_VEL_KI             1.2f   // ganancia integral vel PI
 #define LINE_VEL_I_MAX          2.5f   // anti-windup vel PI
 // Avance post-giro (LOST_FWD / EDGE_FWD) — control P continuo en vez del
@@ -420,7 +420,7 @@ static float line_error_trim_f = 0.1f;
 // La sustracción de baseline elimina el offset entre sensores y mejora el centroide.
 // COMPLETAR con los valores medidos:
 static const float ADC_BASELINE[4] = { 2000.0f, 1550.0f, 1370.0f, 1730.0f };  // s0, s1, s2, s3 — calibrado sobre fondo blanco
-float LINE_SPEED_TARGET = 1.5f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
+float LINE_SPEED_TARGET = 2.5f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
 float OBJ_DETECT_THRESHOLD_f = OBJ_DETECT_THRESHOLD_VAL;  // umbral objeto, ajustable en runtime
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
@@ -2581,9 +2581,15 @@ static void ControlStep10ms(void)
             float speed_factor = fmaxf(0.0f, 1.0f - fabsf(line_error) / 0.45f);
             speed_factor *= speed_factor;
             line_desired_forward_vel = line_detected
-                ? fmaxf(LINE_SPEED_TARGET * 0.10f, LINE_SPEED_TARGET * speed_factor)
+                ? fmaxf(LINE_SPEED_TARGET * 0.20f, LINE_SPEED_TARGET * speed_factor)
                 : 0.0f;
-            line_forward_vel = fmaxf(0.0f, -velocity_est_f);
+            // 2026-07-02: deadband aplicado (mismo fix que LOST_FWD/EDGE_FWD) — sin esto,
+            // un solo pulso de encoder en un ciclo (~0.32-0.63 m/s, ver BRAKE_VEL_DEADBAND)
+            // se leía como sobrevelocidad real y disparaba el freno fuerte (LINE_VEL_KP_BRAKE)
+            // constantemente, aunque la velocidad real estuviera cerca del target. Esto
+            // pasaba pese a bajar sp_step_max, porque el disparador se repetía todo el
+            // tiempo por ruido, no por una rampa demasiado rápida.
+            line_forward_vel = apply_deadbandf(fmaxf(0.0f, -velocity_est_f), BRAKE_VEL_DEADBAND);
 
             // PI de velocidad → inclinación de avance
             if (line_state == LINE_STATE_FOLLOWING) {
@@ -2944,8 +2950,17 @@ static void ControlStep10ms(void)
             // Limitador global de velocidad: frena en CUALQUIER sub-estado si se supera el target.
             // Solo actúa en estados de avance (brake_setpoint_target==0 y base>0) que no tienen
             // su propio control de frenado, y excluye rotaciones donde el pivot no debe frenarse.
+            // 2026-07-02: excluido también LINE_STATE_FOLLOWING — ese estado YA regula su
+            // propia velocidad con el PI de línea (LINE_VEL_KP/KP_BRAKE/KI), que calcula un
+            // ángulo de frenado gradual. Este limitador, al no estar excluido, competía con
+            // esa regulación suave: apenas la velocidad cruzaba el 90% del target, TAPABA
+            // el ángulo suave del PI con un frenazo a fondo (ComputeBrakeSetpointTarget,
+            // pensado para frenar del todo en balance estático) en vez de dejar que el PI
+            // termine de regular — eso causaba el "acelera y de golpe frena hasta quedar
+            // totalmente quieto" reportado por el usuario en vez de una regulación fluida.
             if (brake_setpoint_target == 0.0f &&
                 base_setpoint_target  >  0.0f &&
+                line_state != LINE_STATE_FOLLOWING &&
                 line_state != LINE_STATE_LOST_ROTATE &&
                 line_state != LINE_STATE_OBJ_ROTATE  &&
                 line_state != LINE_STATE_EDGE_ROTATE &&
@@ -3150,7 +3165,7 @@ static void ControlStep10ms(void)
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                 sp_step_max = 0.1f;
             } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-                sp_step_max = 0.25f;
+                sp_step_max = 0.15f;
             } else {
                 sp_step_max = 0.1f;
             }
@@ -3266,6 +3281,19 @@ static void ControlStep10ms(void)
                 lrot_brake_start_ms        = 0;
                 lrot_settle_start_ms       = 0;
                 edge_wait_start_ms         = 0;
+                // 2026-07-02: si se cayó mientras esquivaba un obstáculo (cualquier
+                // LINE_STATE_OBJ_*, que son los últimos del enum, de ahí el ">="),
+                // abandona la evasión y vuelve directo a seguir línea normal en vez
+                // de retomar la secuencia de esquive donde había quedado. Ignora
+                // detección de objeto 5s (mismo patrón ya usado en otras transiciones
+                // de salida de evasión) por si el objeto sigue ahí.
+                if (line_state >= LINE_STATE_OBJ_PRE_REVERSE_HOLD) {
+                    line_state                 = LINE_STATE_FOLLOWING;
+                    line_seen_since_entry      = 0;
+                    line_was_centered_on_lost  = 1;
+                    last_detected_edge_only    = 0;
+                    obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
+                }
             }
         } else {
             if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
