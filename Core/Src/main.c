@@ -249,8 +249,12 @@ typedef enum {
 #define OBJ_WALL_VEL_KP_BRAKE      14.0f     // ganancia P frenando (sobrevelocidad)
 #define OBJ_WALL_VEL_KI            1.0f      // ganancia I para sostener la velocidad de crucero
 #define OBJ_WALL_VEL_I_MAX         1.0f      // anti-windup del integral de velocidad
-#define OBJ_WALL_FWD_ANGLE         2.5f      // ángulo máximo de avance en WALL_FWD (°)
+#define OBJ_WALL_FWD_ANGLE         3.5f      // ángulo máximo de avance en WALL_FWD (°)
 #define OBJ_WALL_BRAKE_ANGLE       2.0f      // freno activo máximo por sobrevelocidad en WALL_FWD (°)
+// Antes de arrancar la reversa por pared, si el robot todavía tiene velocidad residual
+// (viniendo de avanzar), frena primero (mismo patrón que OBJ_PRE_REVERSE_HOLD) para no
+// entorpecer la reversa con inercia hacia adelante.
+#define OBJ_WALL_REVERSE_SETTLE_VEL 0.15f    // m/s por debajo del cual se considera "quieto"
 #define OBJ_WALL_PIVOT_POWER       8.0f      // potencia del pivot en WALL_TURN/WALL_FWD
 #define OBJ_WALL_LINE_IGNORE_MS    3000U     // ms al inicio de WALL_FWD en que se ignora la línea
 
@@ -469,6 +473,7 @@ static uint8_t balance_hold_active = 0;
 static uint32_t obj_detect_ignore_until_ms = 0;  // ignora sensores de objeto hasta este tick
 static uint8_t  prev_all_line_black        = 1;  // todos los sensores de línea en negro (robot en el aire)
 static uint32_t all_black_start_ms         = 0;  // tick en que empezaron a verse todos negros
+static uint32_t accel_settled_start_ms     = 0;  // tick desde que el acelerómetro dejó de moverse (0 = todavía moviéndose)
 static uint8_t  f_in_air                   = 0;  // 1 = robot en el aire >2s → motores detenidos
 static float    accel_motion_f             = 0.0f;  // variación reciente del acelerómetro (EMA), para distinguir "en la mano" de "quieto sobre blanco"
 static uint32_t lrot_brake_start_ms        = 0;  // inicio del frenado previo al giro 180°
@@ -2515,11 +2520,25 @@ static void ControlStep10ms(void)
             {
                 const float ACCEL_MOTION_THRESHOLD = 300.0f;
                 const uint32_t PERP_DEBOUNCE_MS = 50U;
+                // Tras dejar de mover el acelerómetro (lo soltaron/apoyaron), el timer de
+                // all_black puede venir arrastrando segundos acumulados desde que estaba
+                // en el aire — sin esto, apoyarlo sobre cualquier zona momentáneamente
+                // oscura (o el punto de partida) disparaba PERP_ROTATE al instante. Exige
+                // además un mínimo de quietud continua del acelerómetro antes de habilitar
+                // el disparo de cruce perpendicular.
+                const uint32_t ACCEL_SETTLE_MS = 400U;
                 uint8_t all_black = (adcAvg[0] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[1] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[2] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[3] > (uint16_t)LINE_THRESHOLD);
                 uint8_t accel_moving = (accel_motion_f > ACCEL_MOTION_THRESHOLD);
+                if (accel_moving) {
+                    accel_settled_start_ms = 0;
+                } else if (accel_settled_start_ms == 0) {
+                    accel_settled_start_ms = HAL_GetTick();
+                }
+                uint8_t accel_settled = (accel_settled_start_ms != 0) &&
+                    ((HAL_GetTick() - accel_settled_start_ms) > ACCEL_SETTLE_MS);
                 if (all_black) {
                     if (all_black_start_ms == 0) all_black_start_ms = HAL_GetTick();
                     uint32_t all_black_elapsed = HAL_GetTick() - all_black_start_ms;
@@ -2528,6 +2547,7 @@ static void ControlStep10ms(void)
                     } else {
                         f_in_air = 0;
                         if (line_state == LINE_STATE_FOLLOWING &&
+                            accel_settled &&
                             all_black_elapsed > PERP_DEBOUNCE_MS) {
                             line_state          = LINE_STATE_PERP_ROTATE;
                             obj_rot_initialized = 0;
@@ -2923,10 +2943,18 @@ static void ControlStep10ms(void)
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_WALL_FWD) {
                 // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás, misma
-                // corrección que la reversa pareja (ver switch más abajo).
+                // corrección que la reversa pareja (ver switch más abajo). Si todavía hay
+                // velocidad residual de avance, frena primero (upright + freno de encoders)
+                // en vez de arrancar la reversa de golpe con inercia hacia adelante.
                 if ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_REVERSE_THOLD) {
-                    base_setpoint_target = -OBJ_WALL_REVERSE_ANGLE;
                     obj_wall_vel_integral = 0.0f;
+                    if (fabsf(velocity_est_f) > OBJ_WALL_REVERSE_SETTLE_VEL) {
+                        base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                        brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                    } else {
+                        base_setpoint_target  = -OBJ_WALL_REVERSE_ANGLE;
+                        brake_setpoint_target = 0.0f;
+                    }
                 } else {
                     // PI de velocidad (mismo patrón que LOST_FWD/EDGE_FWD): regula la
                     // velocidad de crucero con precisión en vez de ángulo fijo + freno
@@ -2947,17 +2975,26 @@ static void ControlStep10ms(void)
                     base_setpoint_target = clampf_local(
                         kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,
                         -OBJ_WALL_BRAKE_ANGLE, OBJ_WALL_FWD_ANGLE);
+                    brake_setpoint_target = 0.0f;
                 }
-                brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_WALL_TURN) {
                 // Wall-following girando: upright puro, motores controlados por line_pivot_active.
-                // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás (reversa pareja).
-                base_setpoint_target  = ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_REVERSE_THOLD)
-                                       ? -OBJ_WALL_REVERSE_ANGLE
-                                       : SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_target = 0.0f;
+                // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás (reversa pareja),
+                // con la misma espera de estabilidad que en OBJ_WALL_FWD antes de arrancar.
+                if ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_REVERSE_THOLD) {
+                    if (fabsf(velocity_est_f) > OBJ_WALL_REVERSE_SETTLE_VEL) {
+                        base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                        brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                    } else {
+                        base_setpoint_target  = -OBJ_WALL_REVERSE_ANGLE;
+                        brake_setpoint_target = 0.0f;
+                    }
+                } else {
+                    base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                    brake_setpoint_target = 0.0f;
+                }
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else {
