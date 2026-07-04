@@ -230,21 +230,28 @@ typedef enum {
 
 #define OBJ_DETECT_THRESHOLD_VAL   3200.0f   // objeto detectado si ADC < este valor (sin objeto: ~4095, con objeto: <2000)
 #define OBJ_DETECT_DEBOUNCE_CNT    10         // ciclos consecutivos (100 ms) para confirmar objeto
-#define OBJ_PRE_REVERSE_HOLD_MS    1000U      // tiempo de balance estatico antes de rotar
+// Pausa antes de retroceder al ver un objeto: antes era un tiempo fijo sin chequear si
+// el robot realmente estaba quieto. Ahora, igual que LOST_SETTLE: sale por tiempo mínimo
+// Y velocidad/inclinación estabilizadas, con un timeout de seguridad más largo (no un
+// corte normal) por si nunca llega a asentarse del todo.
+#define OBJ_PRE_REVERSE_HOLD_MS    1000U      // tiempo mínimo de balance estático antes de retroceder
+#define OBJ_PRE_REVERSE_TIMEOUT    2500U      // colchón de seguridad si nunca se asienta
+#define OBJ_PRE_REVERSE_VEL_THR    0.10f      // m/s por debajo del cual se considera "quieto"
+#define OBJ_PRE_REVERSE_TILT_THR   3.0f       // grados de error respecto al setpoint para considerar "quieto"
 // Giro 90° por encoders: medir distancia entre centros de rueda y ajustar aquí
 #define OBJ_ROTATE_TRACK_WIDTH     0.220f    // metros entre centros de ruedas (medido: 220 mm)
 #define OBJ_HOLD_DURATION_MS       2000U     // ms de balance estatico en OBJ_HOLD antes de wall-following
 #define OBJ_WALL_ADC_IDX           6          // índice del sensor lateral (ADC7 = adcAvg[6])
 #define OBJ_WALL_THRESHOLD         3750.0f   // ADC < umbral → objeto visible; > umbral → perdido
-#define OBJ_WALL_REVERSE_THOLD     250.0f    // ADC7 < este valor → demasiado cerca, reversa pareja
-#define OBJ_WALL_TOO_CLOSE_THOLD   550.0f    // ADC7 entre REVERSE_THOLD y este valor → pivot derecha
+#define OBJ_WALL_REVERSE_THOLD     300.0f    // ADC7 < este valor → demasiado cerca, reversa pareja
+#define OBJ_WALL_TOO_CLOSE_THOLD   1200.0f   // ADC7 entre REVERSE_THOLD y este valor → pivot derecha
 #define OBJ_WALL_REVERSE_ANGLE     3.0f      // grados de inclinación hacia atrás durante la reversa por pared
 #define OBJ_WALL_APPROACH_ANGLE    2.0f      // ángulo de avance lento buscando la pared (°)
 #define OBJ_WALL_APPROACH_TIMEOUT  6000U     // ms máximos buscando la pared antes de rendirse
 // Avance bordeando la pared: PI de velocidad (mismo patrón que LOST_FWD/EDGE_FWD) en vez
 // de ángulo fijo + freno bang-bang por sobrevelocidad — regula la velocidad de crucero
 // con precisión en lugar de acelerar a fondo hasta cruzar el umbral y frenar de golpe.
-#define OBJ_WALL_SPEED_TARGET      0.4f      // m/s, avance cauteloso bordeando la pared
+#define OBJ_WALL_SPEED_TARGET      1.0f      // m/s, avance cauteloso bordeando la pared
 #define OBJ_WALL_VEL_KP            4.0f      // ganancia P acelerando
 #define OBJ_WALL_VEL_KP_BRAKE      14.0f     // ganancia P frenando (sobrevelocidad)
 #define OBJ_WALL_VEL_KI            1.0f      // ganancia I para sostener la velocidad de crucero
@@ -584,7 +591,7 @@ static void ControlStep10ms(void);
 static float ComputeSteeringPID(float speed_r, float speed_l, float sp);
 static void  SteeringPID_Reset(void);
 static void  SampleEncoders250us(void);
-static void  ADC1_Recover(void);
+static void  ADC1_Recover(uint8_t clear_buffers);
 static void  I2C1_Recover(void);
 
 static inline uint32_t micros(void) {
@@ -1185,7 +1192,12 @@ void UpdateADC_MovingAverage(void) {
     maIndex = (maIndex + 1) % ADC_AVERAGE_SIZE;	    // Avanza en el buffer circular
 }
 
-static void ADC1_Recover(void)
+// clear_buffers=1 (recuperación por falla real): además de reiniciar el DMA/ADC, borra
+// el promedio móvil (arranca de 0, como antes). clear_buffers=0 (barrido preventivo
+// periódico, ver USER CODE BEGIN 3): solo reinicia el hardware del DMA/ADC sin tocar
+// adcSum/adcBuf/adcAvg -- evita un bache de "todo blanco" cada vez que corre, ya que el
+// promedio móvil se va actualizando solo con las lecturas nuevas en los próximos ciclos.
+static void ADC1_Recover(uint8_t clear_buffers)
 {
     HAL_ADC_Stop_DMA(&hadc1);
     __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
@@ -1195,10 +1207,12 @@ static void ADC1_Recover(void)
                          DMA_FLAG_TEIF0_4 | DMA_FLAG_DMEIF0_4 | DMA_FLAG_FEIF0_4);
     __HAL_DMA_ENABLE(hadc1.DMA_Handle);
 
-    memset(adcSum, 0, sizeof(adcSum));
-    memset(adcBuf, 0, sizeof(adcBuf));
-    memset(adcAvg, 0, sizeof(adcAvg));
-    maIndex = 0;
+    if (clear_buffers) {
+        memset(adcSum, 0, sizeof(adcSum));
+        memset(adcBuf, 0, sizeof(adcBuf));
+        memset(adcAvg, 0, sizeof(adcAvg));
+        maIndex = 0;
+    }
 
     HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcValues, 8);
 
@@ -4047,7 +4061,16 @@ static void ControlStep10ms(void)
                         line_error_prev     = 0.0f;
                         line_error_f_d      = 0.0f;
 
-                        if ((HAL_GetTick() - obj_pre_rev_start_ms) >= OBJ_PRE_REVERSE_HOLD_MS) {
+                        // Sale por tiempo mínimo Y velocidad/inclinación estabilizadas
+                        // (mismo patrón que LOST_SETTLE); el timeout es solo un colchón
+                        // de seguridad por si nunca llega a asentarse del todo.
+                        uint32_t elapsed  = HAL_GetTick() - obj_pre_rev_start_ms;
+                        float tilt_err    = fabsf(filtered_roll_deg - dynamic_setpoint_f);
+                        int settled       = (elapsed >= OBJ_PRE_REVERSE_HOLD_MS) &&
+                                            (fabsf(velocity_est_f) < OBJ_PRE_REVERSE_VEL_THR) &&
+                                            (tilt_err < OBJ_PRE_REVERSE_TILT_THR);
+
+                        if (settled || elapsed >= OBJ_PRE_REVERSE_TIMEOUT) {
                             line_state          = LINE_STATE_OBJ_REVERSE;
                             obj_pre_rev_start_ms = 0;
                             obj_rev_initialized = 0;
@@ -4952,9 +4975,21 @@ int main(void)
 	      static uint8_t subtick = 0;
 	      subtick = (subtick + 1) % 10;
 
-          if (adc_recover_pending ||
-              (adc_dma_last_ms != 0 && (HAL_GetTick() - adc_dma_last_ms) > 50U)) {
-              ADC1_Recover();
+          // Recuperación periódica preventiva: el watchdog de arriba solo detecta si
+          // TODA la transferencia DMA de 8 canales se frena — si un solo canal queda
+          // trabado en un valor (p.ej. ADC1 después de ver negro y no volver a bajar)
+          // mientras los otros 7 siguen actualizando, ese watchdog nunca se entera.
+          // Forzar un ADC1_Recover() de rutina cada pocos segundos limpia ese caso sin
+          // necesidad de detectar el canal trabado uno por uno.
+          static uint32_t adc_periodic_recover_ms = 0;
+          if (adc_periodic_recover_ms == 0) adc_periodic_recover_ms = HAL_GetTick();
+          uint8_t adc_periodic_due = (HAL_GetTick() - adc_periodic_recover_ms) > 3000U;
+          uint8_t adc_fault = adc_recover_pending ||
+              (adc_dma_last_ms != 0 && (HAL_GetTick() - adc_dma_last_ms) > 50U);
+
+          if (adc_fault || adc_periodic_due) {
+              ADC1_Recover(adc_fault ? 1 : 0);
+              adc_periodic_recover_ms = HAL_GetTick();
           }
 
 	      // Estas dos van siempre — son rápidas y críticas
