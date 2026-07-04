@@ -145,17 +145,11 @@ typedef enum {
 #define UPSIDE_DOWN_ANGLE    	120.0f  // más agresivo para detectar boca abajo antes
 #define DEAD_ZONE_ANGLE      	15.0f   // entre 35° y 120° → zona muerta, motores off
 
-#define MOTOR_RIGHT_DEADBAND  	1   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
-#define MOTOR_LEFT_DEADBAND   	1   // ídem motor izquierdo — ajustar si el izq. no arranca a PWM bajo
-// 2026-07-01: freno más agresivo (0/5/1.5) por reportes de aceleración
-// descontrolada. Bajado un poco después: con KV_BRAKE=2.0 base + deadband
-// chico (0.05), el ruido de cuantización de la nueva velocidad por encoders
-// alimentaba una corrección constante y el balance normal (parado, sin
-// perturbación) oscilaba visiblemente. Valores intermedios entre el
-// original y el primer ajuste agresivo.
-#define KV_BRAKE                0.8f  // ganancia base (era 0.0 → 2.0 → 0.8)
-#define KV_BRAKE_STRONG         6.0f  // ganancia extra por encima del umbral (era 5.0 → 8.0 → 6.0)
-#define BRAKE_VEL_THRESHOLD     1.0f  // velocidad a partir de la cual se aplica el freno fuerte (era 1.5 → 0.6 → 1.0)
+#define MOTOR_RIGHT_DEADBAND  	8   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
+#define MOTOR_LEFT_DEADBAND   	8   // ídem motor izquierdo — ajustar si el izq. no arranca a PWM bajo
+#define KV_BRAKE                0.8f  // ganancia base del freno traslacional
+#define KV_BRAKE_STRONG         6.0f  // ganancia extra por encima del umbral
+#define BRAKE_VEL_THRESHOLD     1.0f  // velocidad a partir de la cual se aplica el freno fuerte
 #define VEL_DECAY        		0.999f
 #define VEL_DECAY_ACCEL  		0.97f   // decay del integrador del acelerómetro
 
@@ -195,19 +189,13 @@ typedef enum {
 #define LINE_VEL_KP_BRAKE   	3.0f   // ganancia proporcional cuando va sobrevelocidad (frenando) — 2026-07-01
 #define LINE_VEL_KI             1.2f   // ganancia integral vel PI
 #define LINE_VEL_I_MAX          2.5f   // anti-windup vel PI
-// Avance post-giro (LOST_FWD / EDGE_FWD) — control P continuo en vez del
-// bang-bang viejo (ángulo fijo + freno de -1° solo por encima de 0.90 m/s),
-// que no frenaba nunca hasta cruzar el umbral y podía acelerar sin control
-// si la lectura de velocidad no cruzaba el umbral limpiamente. 2026-07-01.
-// 0.30 quedaba DENTRO del piso de cuantización del encoder (~0.32-0.63 m/s,
-// ver BRAKE_VEL_DEADBAND arriba): el control nunca encontraba un punto
-// estable y terminaba peleando entre acelerar a fondo y frenar a fondo,
-// resultando en que el robot no avanzaba en absoluto. Subido a 0.45, claramente
-// por encima del piso de un solo pulso (~0.32) para que el P tenga margen real.
-#define LOST_FWD_SPEED_TARGET   0.45f  // m/s, avance cauteloso "a ciegas"
-#define LOST_FWD_KP             6.0f   // ganancia P acelerando
-#define LOST_FWD_KP_BRAKE       10.0f  // ganancia P frenando (sobrevelocidad)
-#define LOST_FWD_ANGLE_MAX      2.0f   // ángulo máximo de avance (°)
+// Avance post-giro (LOST_FWD / EDGE_FWD): PI de velocidad, avance cauteloso "a ciegas".
+#define LOST_FWD_SPEED_TARGET   0.18f  // m/s, avance cauteloso "a ciegas"
+#define LOST_FWD_KP             4.0f   // ganancia P acelerando
+#define LOST_FWD_KP_BRAKE       14.0f  // ganancia P frenando (sobrevelocidad)
+#define LOST_FWD_KI             1.0f   // ganancia I para sostener la velocidad de crucero
+#define LOST_FWD_VEL_I_MAX      1.0f   // anti-windup del integral de velocidad
+#define LOST_FWD_ANGLE_MAX      1.0f   // ángulo máximo de avance (°, antes 2.0)
 #define LOST_FWD_BRAKE_MAX      2.0f   // ángulo máximo de freno activo (°, se aplica en negativo)
 #define LINE_ENC_CORR_KP        8.5f   // ganancia P: grados por (m/s de deficit) normalizado
 #define LINE_ENC_CORR_MAX       4.0f   // angulo extra maximo por deficit de velocidad (grados)
@@ -218,12 +206,18 @@ typedef enum {
 #define LINE_REV_VEL_FULL       0.35f  // m/s de reversa para aplicar boost maximo
 #define LINE_OBJ_REV_SPEED_MAX  0.30f  // m/s objetivo maximo durante reversa por obstaculo
 #define LINE_OBJ_REV_SPEED_MIN  0.10f  // m/s minimo para que la reversa no se quede sin empuje
-// 2026-07-02: subido de 2.0 a 3.5 — con 2.0° a veces no alcanzaba para vencer
-// la fricción estática y arrancar desde parado, el robot se quedaba quieto
-// "queriendo" retroceder sin lograrlo.
-#define LINE_OBJ_REV_TILT_MAX   3.5f   // inclinacion maxima hacia atras durante reversa por obstaculo
+#define LINE_OBJ_REV_TILT_MAX   8.5f   // inclinacion maxima hacia atras durante reversa por obstaculo
+#define LINE_OBJ_REV_VEL_KP    28.0f   // ganancia P dedicada al PI de velocidad en reversa
 #define LINE_OBJ_REV_STEER_GAIN 0.70f  // escala del PID de linea cuando corrige marcha atras
 #define LINE_OBJ_REV_STEER_MAX  16.0f  // limite de steering durante reversa siguiendo linea
+// Corrección de rumbo sin línea: P simple sobre diferencia de velocidad de ruedas,
+// en PWM absoluto (mismas unidades que steering_adjustment/pwm_sat). REV_STRAIGHT_MAX
+// es chico a propósito: nunca puede acercarse a pwm_sat, así que ninguna rueda se
+// queda sin margen. Empezar con KP=0 (ambas ruedas reciben el mismo pwm_sat, sin
+// corrección) y subirlo de a poco una vez confirmado que las dos ruedas giran igual.
+#define REV_STRAIGHT_KP   -1.0f   // PWM por rps de diferencia entre ruedas (0 = sin corrección)
+#define REV_STRAIGHT_MAX   8.0f   // tope absoluto en PWM units
+#define REV_STRAIGHT_SLEW  2.0f   // PWM/ciclo max de cambio (rampa)
 // Inner steering PI (lazo cerrado con encoder diferencial)
 #define LINE_STEER_ENC_SCALE    0.12f  // escala steering_cmd [PWM] → diff_sp [rps]
 #define LINE_STEER_MAX_RPS      2.0f   // límite del setpoint diferencial
@@ -242,7 +236,9 @@ typedef enum {
 #define OBJ_HOLD_DURATION_MS       2000U     // ms de balance estatico en OBJ_HOLD antes de wall-following
 #define OBJ_WALL_ADC_IDX           6          // índice del sensor lateral (ADC7 = adcAvg[6])
 #define OBJ_WALL_THRESHOLD         3750.0f   // ADC < umbral → objeto visible; > umbral → perdido
-#define OBJ_WALL_TOO_CLOSE_THOLD   500.0f    // ADC7 < este valor → demasiado cerca, pivot derecha
+#define OBJ_WALL_REVERSE_THOLD     250.0f    // ADC7 < este valor → demasiado cerca, reversa pareja
+#define OBJ_WALL_TOO_CLOSE_THOLD   550.0f    // ADC7 entre REVERSE_THOLD y este valor → pivot derecha
+#define OBJ_WALL_REVERSE_ANGLE     3.0f      // grados de inclinación hacia atrás durante la reversa por pared
 #define OBJ_WALL_APPROACH_ANGLE    2.0f      // ángulo de avance lento buscando la pared (°)
 #define OBJ_WALL_APPROACH_TIMEOUT  6000U     // ms máximos buscando la pared antes de rendirse
 #define OBJ_WALL_FWD_ANGLE         4.5f      // ángulo máximo de avance en WALL_FWD (°)
@@ -433,12 +429,7 @@ static uint8_t    line_seen_since_entry = 0; // evita búsqueda automática ante
 static float      line_search_dir  = 1.0f; // dirección de búsqueda (+1 o -1)
 static float      last_line_dir    = 1.0f; // última dirección válida de la línea (+1 o -1)
 static uint8_t    line_was_centered_on_lost = 1; // 1 = venía centrado (ADC del medio) al perder la línea, 0 = venía por los extremos
-// 2026-07-01: reemplaza el enfoque de "pico reciente de line_error" (con
-// cualquier decay terminaba clasificando todo como "por el extremo" por
-// el bamboleo normal de curvas, o al revés). En cambio: qué sensor(es)
-// tenían señal en el último ciclo con línea detectada. Si el ÚLTIMO
-// sensor con señal fue un extremo (w[0] o w[3]) SIN soporte de los
-// sensores del medio (w[1]/w[2] en cero), es una pérdida por el extremo.
+// 1 = el último sensor con señal fue un extremo (w[0]/w[3]) sin soporte del medio
 static uint8_t    last_detected_edge_only = 0;
 static float      line_error_f_d   = 0.0f;
 
@@ -453,24 +444,9 @@ static uint8_t  key_click_count = 0;
 
 static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 
-// Giro preciso en modo MANUAL (encoders + giroscopio)
-#define MANUAL_ROT_PIVOT_POWER  15.0f   // PWM de pivot durante el giro
-#define MANUAL_ROT_SLOWDOWN_DEG 55.0f   // grados antes del target para reducir potencia (debe ser > 90*(1-0.55)=40.5 para que realmente se active)
-#define MANUAL_ROT_BRAKE_POWER   5.0f   // contra-pivot suave para frenar inercia sin revertir
-// Counts promedio (|dr|+|dl|)/2 esperados para un giro de 90°.
-// Ajustar con el valor que imprime "ROT_ENC" en USB al terminar cada giro.
-#define MANUAL_ROT_ENC_TARGET  380.0f
-static float    manual_rot_target_deg  = 0.0f;
-static uint8_t  manual_rot_trigger     = 0;    // set por UNER para arrancar
-static uint8_t  manual_rot_active      = 0;    // 1 = giro en curso
-static uint8_t  manual_rot_phase       = 0;    // 0=avance, 1=contra-frenado activo
-static float    manual_rot_heading     = 0.0f; // ángulo acumulado por giroscopio (°)
-static float    manual_rot_enc_counts  = 0.0f; // counts promedio acumulados en el giro actual
-static uint32_t manual_rot_start_ms   = 0;
-static int32_t  manual_rot_enc_r0     = 0;
-static int32_t  manual_rot_enc_l0     = 0;
-static uint32_t manual_seq_next_ms     = 0;   // deadline: siguiente giro no antes de este tick
-static uint8_t  manual_auto_rot_step   = 0;   // 0=90°der, 1=90°izq
+// Con el joystick en reposo, MANUAL retrocede indefinidamente (banco de pruebas de la
+// corrección de OBJ_REVERSE, misma fórmula). El joystick sigue funcionando si se lo usa.
+#define MANUAL_REV_TEST_TILT 3.0f   // grados de inclinación hacia atrás durante el test
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float line_enc_angle_corr     = 0.0f;  // corrección P de angulo por deficit de velocidad encoder
 static float line_reverse_boost     = 0.0f;  // extra de angulo si encoders muestran reversa
@@ -502,6 +478,8 @@ static uint32_t obj_rot_phase1_ms    = 0;    // inicio de fase 1
 static uint8_t  obj_rev_initialized  = 0;         // flag sesión actual de OBJ_REVERSE
 static int32_t  obj_rev_r0           = 0;
 static int32_t  obj_rev_l0           = 0;
+static float    obj_rev_steer_f      = 0.0f;      // corrección de rumbo rampeada, PWM absoluto (sin línea), durante OBJ_REVERSE
+static float    lost_fwd_vel_integral = 0.0f;     // integral del PI de velocidad en LOST_FWD/EDGE_FWD
 static uint32_t obj_brake_start_ms   = 0;         // inicio de OBJ_BRAKE (file-scope para reset en caída)
 static uint32_t obj_pre_rotate_ms    = 0;         // inicio del wait post-freno antes de OBJ_ROTATE
 static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
@@ -2476,6 +2454,7 @@ static void ControlStep10ms(void)
                     line_error_prev     = 0.0f;
                     line_error_f_d      = 0.0f;
                     obj_rev_initialized = 0;
+                    obj_rev_steer_f     = 0.0f;
                     obj_rot_initialized = 0;
                     obj_rot_phase       = 0;
                     obj_rot_heading     = 0.0f;
@@ -2585,12 +2564,7 @@ static void ControlStep10ms(void)
             line_desired_forward_vel = line_detected
                 ? fmaxf(LINE_SPEED_TARGET * 0.20f, LINE_SPEED_TARGET * speed_factor)
                 : 0.0f;
-            // 2026-07-02: deadband aplicado (mismo fix que LOST_FWD/EDGE_FWD) — sin esto,
-            // un solo pulso de encoder en un ciclo (~0.32-0.63 m/s, ver BRAKE_VEL_DEADBAND)
-            // se leía como sobrevelocidad real y disparaba el freno fuerte (LINE_VEL_KP_BRAKE)
-            // constantemente, aunque la velocidad real estuviera cerca del target. Esto
-            // pasaba pese a bajar sp_step_max, porque el disparador se repetía todo el
-            // tiempo por ruido, no por una rampa demasiado rápida.
+            // deadband para filtrar ruido de cuantización de encoders (ver BRAKE_VEL_DEADBAND)
             line_forward_vel = apply_deadbandf(fmaxf(0.0f, -velocity_est_f), BRAKE_VEL_DEADBAND);
 
             // PI de velocidad → inclinación de avance
@@ -2640,7 +2614,7 @@ static void ControlStep10ms(void)
                 }
 
                 float reverse_angle_mag = clampf_local(
-                    LINE_VEL_KP * reverse_vel_error +
+                    LINE_OBJ_REV_VEL_KP * reverse_vel_error +
                     LINE_VEL_KI * line_obj_rev_vel_integral,
                     0.0f,
                     LINE_OBJ_REV_TILT_MAX
@@ -2692,6 +2666,7 @@ static void ControlStep10ms(void)
             line_lost_ms        = HAL_GetTick();
             line_angle_ramped   = 0.0f;
             obj_pre_rev_start_ms = 0;
+            lost_fwd_vel_integral = 0.0f;
         }
 
         if (robot_state != ROBOT_STATE_LINE_FOLLOWING && prev_robot_state == ROBOT_STATE_LINE_FOLLOWING) {
@@ -2744,8 +2719,7 @@ static void ControlStep10ms(void)
                 manual_cmd_last_ms     = HAL_GetTick();
                 manual_setpoint_ramped = 0.0f;
                 steering_adjustment    = 0.0f;
-                manual_seq_next_ms     = HAL_GetTick() + 2500U; // primera pausa al entrar al modo
-                manual_auto_rot_step   = 0;
+                obj_rev_steer_f        = 0.0f;
             }
         }
 
@@ -2831,18 +2805,25 @@ static void ControlStep10ms(void)
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_LOST_FWD) {
-                // Avance post-180°: control P continuo de velocidad (ver LOST_FWD_* arriba).
-                // 2026-07-01: deadband aplicado a lfwd_vel — un solo pulso simultáneo de
-                // ambas ruedas ya lee ~0.63 m/s (por encima del target 0.45) aunque el
-                // robot esté prácticamente quieto, disparando el freno fuerte y haciendo
-                // que retroceda. Mismo BRAKE_VEL_DEADBAND que usa ComputeBrakeSetpointTarget.
+                // Avance post-180°: PI de velocidad (ver LOST_FWD_* arriba), con deadband
+                // (BRAKE_VEL_DEADBAND) y anti-windup igual que el PI de línea normal.
                 {
                     float lfwd_vel_raw = fmaxf(0.0f, -velocity_est_f);
                     float lfwd_vel     = apply_deadbandf(lfwd_vel_raw, BRAKE_VEL_DEADBAND);
                     float vel_error    = LOST_FWD_SPEED_TARGET - lfwd_vel;
                     float kp           = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;
-                    base_setpoint_target = clampf_local(kp * vel_error,
-                                                        -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
+                    if (!late_cycle) {
+                        if (vel_error > 0.0f) {
+                            lost_fwd_vel_integral += vel_error * dt_ctrl;
+                            lost_fwd_vel_integral = clampf_local(
+                                lost_fwd_vel_integral, 0.0f, LOST_FWD_VEL_I_MAX);
+                        } else {
+                            lost_fwd_vel_integral *= 0.80f;
+                        }
+                    }
+                    base_setpoint_target = clampf_local(
+                        kp * vel_error + LOST_FWD_KI * lost_fwd_vel_integral,
+                        -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
                 }
                 brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
@@ -2880,14 +2861,25 @@ static void ControlStep10ms(void)
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_EDGE_FWD) {
-                // Avance post-giro: mismo control P continuo que LOST_FWD, mismo deadband.
+                // Avance post-giro: mismo control PI que LOST_FWD, mismo deadband,
+                // mismo integral compartido (los dos estados son mutuamente excluyentes).
                 {
                     float efwd_vel_raw = fmaxf(0.0f, -velocity_est_f);
                     float efwd_vel     = apply_deadbandf(efwd_vel_raw, BRAKE_VEL_DEADBAND);
                     float vel_error    = LOST_FWD_SPEED_TARGET - efwd_vel;
                     float kp           = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;
-                    base_setpoint_target = clampf_local(kp * vel_error,
-                                                        -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
+                    if (!late_cycle) {
+                        if (vel_error > 0.0f) {
+                            lost_fwd_vel_integral += vel_error * dt_ctrl;
+                            lost_fwd_vel_integral = clampf_local(
+                                lost_fwd_vel_integral, 0.0f, LOST_FWD_VEL_I_MAX);
+                        } else {
+                            lost_fwd_vel_integral *= 0.80f;
+                        }
+                    }
+                    base_setpoint_target = clampf_local(
+                        kp * vel_error + LOST_FWD_KI * lost_fwd_vel_integral,
+                        -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
                 }
                 brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
@@ -2923,7 +2915,11 @@ static void ControlStep10ms(void)
             } else if (line_state == LINE_STATE_OBJ_WALL_FWD) {
                 // Avance por pared: angulo fijo para no bambolear por cuantizacion de encoders.
                 // Solo frena si la velocidad filtrada supera claramente el rango seguro.
-                {
+                // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás, misma
+                // corrección que la reversa pareja (ver switch más abajo).
+                if ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_REVERSE_THOLD) {
+                    base_setpoint_target = -OBJ_WALL_REVERSE_ANGLE;
+                } else {
                     // Camino activo: angulo fijo para avanzar recto; freno solo por sobrevelocidad clara.
                     float wf_fwd_vel = fmaxf(0.0f, -velocity_est_f);
                     float wf_cmd = (wf_fwd_vel > OBJ_WALL_OVERSPEED_VEL)
@@ -2935,8 +2931,11 @@ static void ControlStep10ms(void)
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_WALL_TURN) {
-                // Wall-following girando: upright puro, motores controlados por line_pivot_active
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                // Wall-following girando: upright puro, motores controlados por line_pivot_active.
+                // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás (reversa pareja).
+                base_setpoint_target  = ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_REVERSE_THOLD)
+                                       ? -OBJ_WALL_REVERSE_ANGLE
+                                       : SETPOINT_ANGLE + setpoint_trim;
                 brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
@@ -2951,15 +2950,8 @@ static void ControlStep10ms(void)
 
             // Limitador global de velocidad: frena en CUALQUIER sub-estado si se supera el target.
             // Solo actúa en estados de avance (brake_setpoint_target==0 y base>0) que no tienen
-            // su propio control de frenado, y excluye rotaciones donde el pivot no debe frenarse.
-            // 2026-07-02: excluido también LINE_STATE_FOLLOWING — ese estado YA regula su
-            // propia velocidad con el PI de línea (LINE_VEL_KP/KP_BRAKE/KI), que calcula un
-            // ángulo de frenado gradual. Este limitador, al no estar excluido, competía con
-            // esa regulación suave: apenas la velocidad cruzaba el 90% del target, TAPABA
-            // el ángulo suave del PI con un frenazo a fondo (ComputeBrakeSetpointTarget,
-            // pensado para frenar del todo en balance estático) en vez de dejar que el PI
-            // termine de regular — eso causaba el "acelera y de golpe frena hasta quedar
-            // totalmente quieto" reportado por el usuario en vez de una regulación fluida.
+            // su propio control de frenado; excluye rotaciones y LINE_STATE_FOLLOWING (que ya
+            // regula su propia velocidad con el PI de línea).
             if (brake_setpoint_target == 0.0f &&
                 base_setpoint_target  >  0.0f &&
                 line_state != LINE_STATE_FOLLOWING &&
@@ -2978,120 +2970,17 @@ static void ControlStep10ms(void)
 
             line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
         } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+            // Joystick idle → banco de pruebas de reversa (ver MANUAL_REV_TEST_TILT arriba).
+            uint8_t joystick_idle = (HAL_GetTick() - manual_cmd_last_ms > 60) &&
+                                    fabsf(manual_setpoint_cmd) < 0.01f &&
+                                    fabsf(manual_steering_cmd) < 0.01f;
 
-            // ── Ciclo automático: 90°der → pausa 2.5 s → 90°izq → pausa 2.5 s → rep ──
-            // manual_seq_next_ms == 0  →  desarmado (giro en curso o no iniciado)
-            // manual_seq_next_ms != 0  →  armado; dispara cuando HAL_GetTick() >= deadline
-            if (!manual_rot_active && !f_fallen &&
-                manual_seq_next_ms != 0 &&
-                HAL_GetTick() >= manual_seq_next_ms) {
-                switch (manual_auto_rot_step) {
-                    case 0: manual_rot_target_deg =  90.0f; break;
-                    case 1: manual_rot_target_deg = -90.0f; break;
-                    case 2: manual_rot_target_deg = 180.0f; break;
-                    default: manual_auto_rot_step = 0; manual_rot_target_deg = 90.0f; break;
-                }
-                manual_auto_rot_step = (manual_auto_rot_step + 1) % 3;
-                manual_rot_trigger   = 1;
-                manual_seq_next_ms   = 0; // desarmar; se re-arma al terminar el giro
-            }
-
-            // ── Giro preciso: arranque por trigger UNER ──────────────────────
-            if (manual_rot_trigger && !manual_rot_active && !f_fallen) {
-                manual_rot_active   = 1;
-                manual_rot_trigger  = 0;
-                // seq_next queda en 0 durante toda la rotación
-                manual_rot_phase    = 0;
-                manual_rot_heading  = 0.0f;
-                manual_rot_start_ms = HAL_GetTick();
-                __disable_irq();
-                manual_rot_enc_r0 = encoder_right;
-                manual_rot_enc_l0 = encoder_left;
-                __enable_irq();
-                manual_setpoint_cmd = 0.0f;
-                manual_steering_cmd = 0.0f;
-            }
-
-            if (manual_rot_active) {
-                float gz_dps = (float)gz / 131.0f;
-                manual_rot_heading += gz_dps * DT_CTRL_FIXED;
-
-                // Counts encoder acumulados desde inicio del giro (ambos sentidos)
-                __disable_irq();
-                int32_t enc_dr = encoder_right - manual_rot_enc_r0;
-                int32_t enc_dl = encoder_left  - manual_rot_enc_l0;
-                __enable_irq();
-                manual_rot_enc_counts = (fabsf((float)enc_dr) + fabsf((float)enc_dl)) * 0.5f;
-
-                float abs_target  = fabsf(manual_rot_target_deg);
-                // Heading compuesto: gz (funciona bien CW) + encoder (funciona ambos sentidos)
-                float enc_heading_deg = manual_rot_enc_counts * (90.0f / MANUAL_ROT_ENC_TARGET);
-                float abs_heading = fmaxf(fabsf(manual_rot_heading), enc_heading_deg);
-
-                uint32_t elapsed_ms = HAL_GetTick() - manual_rot_start_ms;
-
-                // Timeout total de seguridad
-                uint32_t timeout_ms = (uint32_t)(abs_target / 90.0f * 3000.0f) + 2000U;
-
-                // Tiempo máximo de fase 0; encoder sale antes según fracción ajustada por ángulo:
-                // 90°→0.85 (funciona bien), 180°→0.70 (menos momentum al entrar al freno).
-                uint32_t phase0_max_ms = (uint32_t)(abs_target / 90.0f * 1200.0f);
-                float enc_exit_frac = 0.85f - fmaxf(0.0f, (abs_target - 90.0f) / 90.0f) * 0.15f;
-                float enc_phase0_thr = (abs_target / 90.0f) * MANUAL_ROT_ENC_TARGET * enc_exit_frac;
-
-                // Tiempo máximo de freno fase 1
-                uint32_t phase1_max_ms = 300U;
-
-                if (elapsed_ms > timeout_ms) {
-                    // Timeout total: abortar
-                    manual_rot_active   = 0;
-                    manual_rot_phase    = 0;
-                    manual_seq_next_ms  = HAL_GetTick() + 2500U;
-                    manual_setpoint_cmd = 0.0f;
-                    manual_steering_cmd = 0.0f;
-                    manual_setpoint_ramped  = SETPOINT_ANGLE + setpoint_trim;
-                    steering_adjustment     = 0.0f;
-                    manual_cmd_last_ms      = HAL_GetTick();
-                    integral                = 0.0f;
-                    brake_setpoint_f        = ComputeBrakeSetpointTarget(robot_state);
-                } else if (manual_rot_phase == 0 &&
-                           (fabsf(manual_rot_heading) >= abs_target * 0.80f ||
-                            manual_rot_enc_counts >= enc_phase0_thr ||
-                            elapsed_ms >= phase0_max_ms)) {
-                    // Al 80% por gz (derecha), al 85% de MANUAL_ROT_ENC_TARGET (ambos), o por tiempo
-                    manual_rot_phase    = 1;
-                    manual_rot_start_ms = HAL_GetTick();
-                } else if (manual_rot_phase == 1) {
-                    uint32_t phase1_elapsed = HAL_GetTick() - manual_rot_start_ms;
-                    int overshoot = (abs_heading > abs_target * 1.3f);
-                    // Salida por velocidad de rueda: cuando las ruedas se detienen → giro completo
-                    float rot_vel = (fabsf(speed_right_rps_s) + fabsf(speed_left_rps_s)) * 0.5f;
-                    int vel_settled = (rot_vel < 2.0f && phase1_elapsed >= 80U);
-                    if (vel_settled || phase1_elapsed >= phase1_max_ms || overshoot) {
-                        // Imprimir counts reales por USB para calibrar MANUAL_ROT_ENC_TARGET
-                        char _dbg[48];
-                        snprintf(_dbg, sizeof(_dbg), "ROT_ENC %.0f dr=%ld dl=%ld\r\n",
-                                 manual_rot_enc_counts, (long)enc_dr, (long)enc_dl);
-                        USB_DebugStr(_dbg);
-                        manual_rot_active   = 0;
-                        manual_rot_phase    = 0;
-                        manual_seq_next_ms  = HAL_GetTick() + 2500U; // pausa 2.5 s desde el fin
-                        manual_setpoint_cmd = 0.0f;
-                        manual_steering_cmd     = 0.0f;
-                        manual_setpoint_ramped  = SETPOINT_ANGLE + setpoint_trim;
-                        steering_adjustment     = 0.0f;
-                        manual_cmd_last_ms      = HAL_GetTick();
-                        integral                = 0.0f;
-                        brake_setpoint_f        = ComputeBrakeSetpointTarget(robot_state);
-                    }
-                }
-
-                // Durante el giro: upright puro, sin avance ni freno traslacional
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+            if (joystick_idle) {
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim - MANUAL_REV_TEST_TILT;
                 brake_setpoint_target = 0.0f;
                 manual_setpoint_ramped = base_setpoint_target;
             } else {
-                // Control manual normal
+                // Control manual normal (joystick)
                 if (HAL_GetTick() - manual_cmd_last_ms > 60) {
                     manual_setpoint_cmd *= 0.96f;
                     manual_steering_cmd *= 0.90f;
@@ -3140,7 +3029,11 @@ static void ControlStep10ms(void)
             base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
         }
 
-        float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f : 5.0f;
+        // Clamp global de setpoint; OBJ_REVERSE tiene excepción propia (9.0) para permitir
+        // más inclinación hacia atrás que el límite general de 5.0.
+        float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f
+                        : (line_state == LINE_STATE_OBJ_REVERSE)         ? 9.0f
+                        : 5.0f;
         base_setpoint_target = clampf_local(base_setpoint_target,
                                             -sp_limit - brake_setpoint_target,
                                              sp_limit - brake_setpoint_target);
@@ -3166,6 +3059,10 @@ static void ControlStep10ms(void)
 
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                 sp_step_max = 0.1f;
+            } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
+                       line_state == LINE_STATE_OBJ_REVERSE) {
+                // Rampa rápida para el empujón inicial de la reversa (vencer fricción estática)
+                sp_step_max = 0.6f;
             } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
                 sp_step_max = 0.15f;
             } else {
@@ -3195,8 +3092,7 @@ static void ControlStep10ms(void)
         // Término de posición: integra velocidad para corregir deriva lenta
         dynamic_setpoint_f = base_setpoint_f + brake_setpoint_f;
         dynamic_setpoint_f = clampf_local(dynamic_setpoint_f, -sp_limit, sp_limit);
-        // En modo linea: FOLLOWING frena hasta -3.0° (antes -1.5, freno más agresivo
-        // 2026-07-01); OBJ_REVERSE permite inclinar mas hacia atras.
+        // En modo línea: FOLLOWING frena hasta -3.0°; OBJ_REVERSE permite inclinar más hacia atrás.
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
             float line_negative_limit = (line_state == LINE_STATE_OBJ_REVERSE)
                                       ? LINE_OBJ_REV_TILT_MAX
@@ -3268,6 +3164,8 @@ static void ControlStep10ms(void)
                 brake_setpoint_f    = 0.0f;
                 pwm_sat_prev        = 0.0f;
                 obj_rev_initialized = 0;
+                obj_rev_steer_f     = 0.0f;
+                lost_fwd_vel_integral = 0.0f;
                 obj_rot_initialized = 0;
                 obj_rot_start_ms    = 0;
                 obj_rot_phase       = 0;
@@ -3282,12 +3180,8 @@ static void ControlStep10ms(void)
                 lrot_brake_start_ms        = 0;
                 lrot_settle_start_ms       = 0;
                 edge_wait_start_ms         = 0;
-                // 2026-07-02: si se cayó mientras esquivaba un obstáculo (cualquier
-                // LINE_STATE_OBJ_*, que son los últimos del enum, de ahí el ">="),
-                // abandona la evasión y vuelve directo a seguir línea normal en vez
-                // de retomar la secuencia de esquive donde había quedado. Ignora
-                // detección de objeto 5s (mismo patrón ya usado en otras transiciones
-                // de salida de evasión) por si el objeto sigue ahí.
+                // Si se cayó durante la evasión (LINE_STATE_OBJ_*, últimos del enum, de ahí
+                // el ">="), abandona la evasión y vuelve a FOLLOWING en vez de retomarla.
                 if (line_state >= LINE_STATE_OBJ_PRE_REVERSE_HOLD) {
                     line_state                 = LINE_STATE_FOLLOWING;
                     line_seen_since_entry      = 0;
@@ -3373,14 +3267,8 @@ static void ControlStep10ms(void)
                 float balance_pi_scale = 1.0f;
                 float balance_d_scale  = 1.0f;
 
-                // 2026-07-01: también se excluye en LOST_FWD/EDGE_FWD (avance a ciegas
-                // post-giro, sin línea detectada) — sin esto, el hold se activaba apenas
-                // el ángulo objetivo rampeaba desde 0° (error chico) y silenciaba el PID
-                // justo cuando debía empujar al robot hacia adelante: se quedaba quieto.
-                // 2026-07-02: mismo bug en OBJ_REVERSE — el robot suele estar bien parado
-                // y nivelado justo al empezar a retroceder por un obstáculo, así que el
-                // hold se activaba de entrada y apagaba el PID antes de poder generar el
-                // ángulo de reversa ("no le da el ángulo para ir hacia atrás").
+                // Excluye también LOST_FWD/EDGE_FWD/OBJ_REVERSE: sin esto, el hold se
+                // activa con error chico y silencia el PID justo cuando debe empujar.
                 if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
                     (line_detected ||
                      line_state == LINE_STATE_LOST_FWD ||
@@ -3627,29 +3515,15 @@ static void ControlStep10ms(void)
                     {
                         // Giro 180° derecha para buscar la línea perdida.
                         // Misma lógica gz+encoder que OBJ_ROTATE y MANUAL, escalada a 180°.
-                        // 2026-07-01: 760->829->880. Seguía quedando corto en 829; nueva
-                        // pasada de ajuste fino (+~6% más). Si sigue corto, seguir subiendo
-                        // de a ~5-8% por vez.
                         const float  LROT_ENC_TARGET   = 880.0f;
-                        const float  LROT_PIVOT        = 14.0f;  // subido de 12: giro un poco más agresivo (2026-07-01)
-                        // Subido de 9 a 16 (2026-07-01): freno mucho más agresivo y fijo por
-                        // un tiempo corto y acotado (ver LROT_BRAKE_DURATION más abajo), en
-                        // vez de intentar frenar con precisión — no hace falta esa precisión,
-                        // solo cortar la rotación rápido y seguir.
-                        const float  LROT_BRAKE        = 16.0f;
+                        const float  LROT_PIVOT        = 14.0f;
+                        const float  LROT_BRAKE        = 16.0f;  // freno fijo y corto, no de precisión
                         const float  LROT_SLOWDOWN_DEG = 55.0f;
                         const float  LROT_ABS_TARGET   = 180.0f;
-                        // 2026-07-01: P0_MAX y P1_MAX acortados de 4000/6000 a 1500/800 —
-                        // con esos valores, si algo impedía completar los counts a tiempo
-                        // (fricción, superficie, etc.) el giro podía tardar hasta ~10s en
-                        // salir por timeout, sintiéndose "pegado en GIRO". Ahora el peor
-                        // caso total (fase 0 + freno fijo de 400ms + colchón fase 1) es
-                        // de ~2.3s. Son colchones de seguridad, no cortes normales — la
-                        // salida normal sigue siendo completar LROT_ENC_TARGET counts.
+                        // P0_MAX/P1_MAX son colchón de seguridad (peor caso ~2.3s), no el corte normal
                         const uint32_t LROT_P0_MAX     = 1500U;
                         const uint32_t LROT_P1_MAX     = 800U;
-                        // enc_exit_frac 0.60: frena al 60% del recorrido → 44% restante para frenar (era 0.70)
-                        const float  LROT_ENC_FRAC     = 0.60f;
+                        const float  LROT_ENC_FRAC     = 0.60f;  // frena al 60% del recorrido
 
                         if (!obj_rot_initialized) {
                             __disable_irq();
@@ -3663,12 +3537,8 @@ static void ControlStep10ms(void)
                             obj_rot_phase1_ms   = 0;
                         }
 
-                        // 2026-07-01: ya NO sale anticipadamente si ve la línea a mitad de
-                        // giro (a pedido del usuario) — una detección parcial/fugaz mientras
-                        // el robot está girando rápido puede ser espuria y cortar el giro a
-                        // mitad de camino deja al robot en mal ángulo. El giro completo
-                        // siempre termina por encoder; recién en LOST_SETTLE/LOST_FWD se
-                        // vuelve a evaluar `line_detected`.
+                        // El giro no sale anticipadamente al ver línea a mitad de camino (podría
+                        // ser una detección espuria); siempre completa por encoder.
                         float lrot_gz = (float)gz / 131.0f;
                         obj_rot_heading += lrot_gz * DT_CTRL_FIXED;
 
@@ -3703,18 +3573,12 @@ static void ControlStep10ms(void)
                             uint32_t p1e      = HAL_GetTick() - obj_rot_phase1_ms;
                             int enc_done      = (lrot_counts >= LROT_ENC_TARGET);
                             int overshoot     = (lrot_abs_hdg > LROT_ABS_TARGET * 1.2f);
-                            // 2026-07-01: sin buscar una velocidad "exacta" — freno fuerte a
-                            // torque fijo (sin escalar) durante un tiempo acotado y corto
-                            // (LROT_BRAKE_DURATION), y sale sí o sí. No tiene sentido quedarse
-                            // pegado en GIRO tratando de afinar la velocidad de frenado.
+                            // Freno fuerte a torque fijo por tiempo corto y acotado, sin
+                            // buscar una velocidad de frenado exacta.
                             const uint32_t LROT_BRAKE_DURATION = 400U;
                             if ((enc_done && p1e >= LROT_BRAKE_DURATION) || p1e >= LROT_P1_MAX || overshoot) {
-                                // 2026-07-01: bypass de LOST_SETTLE a pedido del usuario — apenas
-                                // termina el giro por encoder, arranca a avanzar sin esperar nada.
-                                // (LOST_SETTLE queda en el código sin usar por si se necesita
-                                // reactivar la pausa de estabilización más adelante.)
-                                // Si ya quedó justo sobre la línea al terminar el giro, no hace
-                                // falta avanzar nada: directo a FOLLOWING.
+                                // Bypass de LOST_SETTLE: arranca a avanzar sin esperar. Si ya
+                                // quedó sobre la línea, directo a FOLLOWING.
                                 if (line_detected) {
                                     line_seen_since_entry = 1;
                                     line_integral         = 0.0f;
@@ -3724,6 +3588,7 @@ static void ControlStep10ms(void)
                                 } else {
                                     line_state          = LINE_STATE_LOST_FWD;
                                     line_lost_ms        = HAL_GetTick();
+                                    lost_fwd_vel_integral = 0.0f;
                                 }
                                 obj_rot_initialized = 0;
                                 obj_rot_phase       = 0;
@@ -3784,6 +3649,7 @@ static void ControlStep10ms(void)
                             line_state           = LINE_STATE_LOST_FWD;
                             line_lost_ms         = HAL_GetTick();
                             lrot_settle_start_ms = 0;
+                            lost_fwd_vel_integral = 0.0f;
                         }
                         break;
                     }
@@ -4072,6 +3938,7 @@ static void ControlStep10ms(void)
                             line_state           = LINE_STATE_EDGE_FWD;
                             line_lost_ms         = HAL_GetTick();
                             lrot_settle_start_ms = 0;
+                            lost_fwd_vel_integral = 0.0f;
                         }
                         break;
                     }
@@ -4121,6 +3988,7 @@ static void ControlStep10ms(void)
                             line_state          = LINE_STATE_OBJ_REVERSE;
                             obj_pre_rev_start_ms = 0;
                             obj_rev_initialized = 0;
+                            obj_rev_steer_f     = 0.0f;
                             obj_rot_initialized = 0;
                             obj_rot_phase       = 0;
                             obj_rot_heading     = 0.0f;
@@ -4131,10 +3999,7 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_OBJ_REVERSE:
                     {
-                        // Vuelto a 200 (~10cm), el valor original — se había alargado
-                        // temporalmente a 1000 (~50cm) para calibrar la rectitud del
-                        // enderezamiento por gyro; ya ajustado, se restaura la distancia normal.
-                        const int32_t rev_target_counts = 200; // ~10 cm
+                        const int32_t rev_target_counts = 280; // ~14 cm
 
                         if (!obj_rev_initialized) {
                             __disable_irq();
@@ -4154,6 +4019,7 @@ static void ControlStep10ms(void)
                         if (rev_counts >= rev_target_counts) {
                             line_state          = LINE_STATE_OBJ_BRAKE;
                             obj_rev_initialized = 0;
+                            obj_rev_steer_f     = 0.0f;
                             obj_rot_initialized = 0;
                             obj_rot_phase       = 0;
                             obj_rot_heading     = 0.0f;
@@ -4197,23 +4063,27 @@ static void ControlStep10ms(void)
                                     -LINE_OBJ_REV_STEER_MAX,
                                     LINE_OBJ_REV_STEER_MAX
                                 );
+                                // steering_adjustment y obj_rev_steer_f están en la misma
+                                // escala (PWM absoluto) — sí se puede sincronizar.
+                                obj_rev_steer_f = steering_adjustment;
 
                                 log_p_line = p_line;
                                 log_i_line = i_line;
                                 log_d_line = d_line;
                             } else {
-                                // 2026-07-02 (v2): la corrección por PI de rumbo integrado
-                                // (v1) daba zigzag — probablemente signo/ganancia mal
-                                // calibrados en una fórmula nueva sin validar. Reemplazada
-                                // por el mismo patrón de amortiguación por tasa (gz crudo,
-                                // sin integrar) que YA se usa y funciona en LOST/SEARCHING/
-                                // OBJ_HOLD/OBJ_WALL_FWD/LOST_FWD/EDGE_FWD (half_steer =
-                                // gz_dps*0.3). Acá se multiplica por 0.6 para compensar el
-                                // *0.5 que se aplica después sobre steering_adjustment
-                                // (half_steer = steering_adjustment*0.5), y así terminar
-                                // con el mismo half_steer efectivo que ese patrón probado.
-                                float rev_gz = (float)gz / 131.0f;
-                                steering_adjustment = clampf_local(rev_gz * 0.6f, -15.0f, 15.0f);
+                                // P simple sobre diferencia de velocidad de ruedas, en PWM
+                                // absoluto (ver REV_STRAIGHT_KP arriba). Con KP=0, correction=0
+                                // y ambas ruedas reciben el mismo pwm_sat.
+                                float rate_diff = speed_right_rps_s - speed_left_rps_s;
+                                float corr_target = clampf_local(
+                                    REV_STRAIGHT_KP * rate_diff,
+                                    -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
+                                );
+                                float corr_delta = corr_target - obj_rev_steer_f;
+                                if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
+                                if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
+                                obj_rev_steer_f += corr_delta;
+                                steering_adjustment = obj_rev_steer_f;
                             }
                         }
                         // Setpoint de reversa calculado por PI en la seccion de setpoints.
@@ -4253,15 +4123,14 @@ static void ControlStep10ms(void)
                     case LINE_STATE_OBJ_ROTATE:
                     {
                         // Giro 90° derecha: fase 0 (spin+slowdown) + fase 1 (freno).
-                        // Misma lógica que MANUAL: heading compuesto gz+encoder, slowdown ramp,
-                        // detección de overshoot en fase 1. Dirección fija: derecha (dir=+1).
-                        // Parámetros idénticos al giro MANUAL para comportamiento equivalente
-                        const float  LINE_ROT_ENC_TARGET   = 380.0f; // igual que MANUAL_ROT_ENC_TARGET
-                        const float  LINE_ROT_PIVOT        = 15.0f;  // igual que MANUAL_ROT_PIVOT_POWER
-                        const float  LINE_ROT_BRAKE        = 5.0f;   // igual que MANUAL_ROT_BRAKE_POWER
-                        const float  LINE_ROT_SLOWDOWN_DEG = 55.0f;  // igual que MANUAL_ROT_SLOWDOWN_DEG
-                        const uint32_t LINE_ROT_P0_MAX     = 1200U;  // igual que MANUAL para 90°
-                        const uint32_t LINE_ROT_P1_MAX     = 300U;   // igual que MANUAL
+                        // Heading compuesto gz+encoder, slowdown ramp, detección de overshoot
+                        // en fase 1. Dirección fija: derecha (dir=+1).
+                        const float  LINE_ROT_ENC_TARGET   = 380.0f;
+                        const float  LINE_ROT_PIVOT        = 15.0f;
+                        const float  LINE_ROT_BRAKE        = 5.0f;
+                        const float  LINE_ROT_SLOWDOWN_DEG = 55.0f;
+                        const uint32_t LINE_ROT_P0_MAX     = 1200U;
+                        const uint32_t LINE_ROT_P1_MAX     = 300U;
 
                         if (!obj_rot_initialized) {
                             __disable_irq();
@@ -4389,13 +4258,15 @@ static void ControlStep10ms(void)
                     {
                         // Wall-following: avanza mientras ADC7 ve el objeto.
                         // Si pierde el objeto → pivot izquierda. Si ve línea (tras 3s) → FOLLOWING.
-                        // Si demasiado cerca (ADC7 < TOO_CLOSE) → pivot derecha igual que OBJ_ROTATE.
+                        // ADC7 < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
+                        // TOO_CLOSE_THOLD → pivot derecha igual que OBJ_ROTATE.
                         if (obj_wall_fwd_start_ms == 0)
                             obj_wall_fwd_start_ms = HAL_GetTick();
-                        uint8_t line_ignore = ((HAL_GetTick() - obj_wall_fwd_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
-                        float wall_adc       = (float)adcAvg[OBJ_WALL_ADC_IDX];
-                        uint8_t wall_visible = (wall_adc < OBJ_WALL_THRESHOLD);
-                        uint8_t too_close    = (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
+                        uint8_t line_ignore   = ((HAL_GetTick() - obj_wall_fwd_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
+                        float wall_adc        = (float)adcAvg[OBJ_WALL_ADC_IDX];
+                        uint8_t wall_visible  = (wall_adc < OBJ_WALL_THRESHOLD);
+                        uint8_t wall_reverse  = (wall_adc < OBJ_WALL_REVERSE_THOLD);
+                        uint8_t too_close     = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
                         if (line_detected && !line_ignore) {
                             line_seen_since_entry = 1;
                             line_state          = LINE_STATE_FOLLOWING;
@@ -4407,6 +4278,20 @@ static void ControlStep10ms(void)
                             steering_adjustment = 0.0f;
                             obj_wall_fwd_start_ms = 0;
                             obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
+                        } else if (wall_reverse) {
+                            // Demasiado cerca: reversa pareja (mismo P que LINE_STATE_OBJ_REVERSE,
+                            // ver REV_STRAIGHT_KP/MAX/SLEW). line_pivot_active queda en 0: el
+                            // formato compartido de motores aplica half_steer=steering_adjustment*0.5.
+                            float rate_diff = speed_right_rps_s - speed_left_rps_s;
+                            float corr_target = clampf_local(
+                                REV_STRAIGHT_KP * rate_diff,
+                                -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
+                            );
+                            float corr_delta = corr_target - obj_rev_steer_f;
+                            if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
+                            if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
+                            obj_rev_steer_f += corr_delta;
+                            steering_adjustment = obj_rev_steer_f;
                         } else if (too_close) {
                             // Demasiado cerca: pivot derecha (alejar del obstáculo)
                             line_pivot_active  = 1;
@@ -4421,6 +4306,7 @@ static void ControlStep10ms(void)
                         } else {
                             // Avanza hacia adelante con ángulo fijo; yaw-lock se aplica al calcular motores.
                             steering_adjustment = 0.0f;
+                            obj_rev_steer_f      = 0.0f;
                         }
                         break;
                     }
@@ -4428,10 +4314,12 @@ static void ControlStep10ms(void)
                     case LINE_STATE_OBJ_WALL_TURN:
                     {
                         // Pivot izquierda hasta re-ver el objeto en ADC7 o detectar línea.
-                        // Si demasiado cerca (ADC7 < TOO_CLOSE) → pivot derecha en cambio.
+                        // ADC7 < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
+                        // TOO_CLOSE_THOLD → pivot derecha en cambio.
                         float wall_adc       = (float)adcAvg[OBJ_WALL_ADC_IDX];
                         uint8_t wall_visible = (wall_adc < OBJ_WALL_THRESHOLD);
-                        uint8_t too_close    = (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
+                        uint8_t wall_reverse = (wall_adc < OBJ_WALL_REVERSE_THOLD);
+                        uint8_t too_close    = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
                         if (line_detected) {
                             line_seen_since_entry = 1;
                             line_state          = LINE_STATE_FOLLOWING;
@@ -4443,6 +4331,19 @@ static void ControlStep10ms(void)
                             steering_adjustment = 0.0f;
                             line_pivot_active   = 0;
                             obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
+                        } else if (wall_reverse) {
+                            // Demasiado cerca: reversa pareja (mismo P que LINE_STATE_OBJ_REVERSE,
+                            // ver REV_STRAIGHT_KP/MAX/SLEW). line_pivot_active queda en 0.
+                            float rate_diff = speed_right_rps_s - speed_left_rps_s;
+                            float corr_target = clampf_local(
+                                REV_STRAIGHT_KP * rate_diff,
+                                -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
+                            );
+                            float corr_delta = corr_target - obj_rev_steer_f;
+                            if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
+                            if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
+                            obj_rev_steer_f += corr_delta;
+                            steering_adjustment = obj_rev_steer_f;
                         } else if (too_close) {
                             // Demasiado cerca: pivot derecha (alejar del obstáculo)
                             line_pivot_active  = 1;
@@ -4477,12 +4378,8 @@ static void ControlStep10ms(void)
                 if (!line_pivot_active) {
                     float half_steer = steering_adjustment * 0.5f;
 
-                    // En LOST/SEARCHING/OBJ_HOLD: corrección yaw igual que BALANCE_ONLY.
-                    // OBJ_ROTATE usa steering_adjustment directo (calculado en el case).
-                    // 2026-07-01: agregados LOST_FWD/EDGE_FWD (avance ciego post-giro) —
-                    // faltaban en esta lista pese a ser análogos a OBJ_WALL_FWD (avanzar
-                    // recto buscando algo); sin esto no había ninguna corrección de rumbo
-                    // y el robot podía irse curvando durante la búsqueda.
+                    // En LOST/SEARCHING/OBJ_HOLD/LOST_FWD/EDGE_FWD: corrección yaw igual que
+                    // BALANCE_ONLY. OBJ_ROTATE usa steering_adjustment directo (ver el case).
                     if (line_state == LINE_STATE_LOST     ||
                         line_state == LINE_STATE_SEARCHING ||
                         line_state == LINE_STATE_OBJ_PRE_REVERSE_HOLD ||
@@ -4502,8 +4399,8 @@ static void ControlStep10ms(void)
                     if (mL >  40.0f) mL =  40.0f;
                     if (mL < -40.0f) mL = -40.0f;
 
-                    motorRightVelocity = -(int16_t)mL;
-                    motorLeftVelocity  = -(int16_t)mR;
+                    motorRightVelocity = -(int16_t)lroundf(mL);
+                    motorLeftVelocity  = -(int16_t)lroundf(mR);
                 }
 
             } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
@@ -4512,31 +4409,38 @@ static void ControlStep10ms(void)
                 line_error_prev     = 0.0f;
                 line_state          = LINE_STATE_FOLLOWING;
 
-                if (manual_rot_active) {
-                    // dir > 0 = derecha: right retrocede, left avanza.
-                    float dir = (manual_rot_target_deg >= 0.0f) ? 1.0f : -1.0f;
+                uint8_t joystick_idle = (HAL_GetTick() - manual_cmd_last_ms > 60) &&
+                                        fabsf(manual_setpoint_cmd) < 0.01f &&
+                                        fabsf(manual_steering_cmd) < 0.01f;
 
-                    steering_adjustment = 0.0f;
-                    if (manual_rot_phase == 0) {
-                        // Fase 0: spin con componente de balance + slowdown
-                        // manual_rot_enc_counts ya fue actualizado en el bloque de estado
-                        float _enc_hdg = manual_rot_enc_counts * (90.0f / MANUAL_ROT_ENC_TARGET);
-                        float _abs_hdg = fmaxf(fabsf(manual_rot_heading), _enc_hdg);
-                        float abs_remaining = fabsf(manual_rot_target_deg) - _abs_hdg;
-                        float slowdown = (abs_remaining < MANUAL_ROT_SLOWDOWN_DEG)
-                                       ? (abs_remaining / MANUAL_ROT_SLOWDOWN_DEG)
-                                       : 1.0f;
-                        float pivot = MANUAL_ROT_PIVOT_POWER * fmaxf(slowdown, 0.0f);
-                        motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + dir * pivot), -60.0f, 60.0f);
-                        motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - dir * pivot), -60.0f, 60.0f);
-                    } else {
-                        // Fase 1: contra-rotación CON pwm_sat para mantener balance.
-                        // La diferencia entre ambos motores siempre es 2×BRAKE_POWER (frena la inercia),
-                        // mientras que pwm_sat actúa como modo común y mantiene el equilibrio.
-                        motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - dir * MANUAL_ROT_BRAKE_POWER), -60.0f, 60.0f);
-                        motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + dir * MANUAL_ROT_BRAKE_POWER), -60.0f, 60.0f);
-                    }
+                if (joystick_idle) {
+                    // Test de reversa indefinida: misma corrección P simple que
+                    // LINE_STATE_OBJ_REVERSE (ver REV_STRAIGHT_KP arriba). Con KP=0,
+                    // steering_adjustment=0 y mR=mL=pwm_sat exactamente (paso 0: confirmar
+                    // que ambas ruedas giran antes de subir la ganancia).
+                    float rate_diff = speed_right_rps_s - speed_left_rps_s;
+                    float corr_target = clampf_local(
+                        REV_STRAIGHT_KP * rate_diff,
+                        -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
+                    );
+                    float corr_delta = corr_target - obj_rev_steer_f;
+                    if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
+                    if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
+                    obj_rev_steer_f += corr_delta;
+                    steering_adjustment = obj_rev_steer_f;
+
+                    float half_steer = steering_adjustment * 0.5f;
+                    float mR = pwm_sat - half_steer;
+                    float mL = pwm_sat + half_steer;
+                    if (mR >  100.0f) mR =  100.0f;
+                    if (mR < -100.0f) mR = -100.0f;
+                    if (mL >  100.0f) mL =  100.0f;
+                    if (mL < -100.0f) mL = -100.0f;
+
+                    motorRightVelocity = -(int16_t)lroundf(mL);
+                    motorLeftVelocity  = -(int16_t)lroundf(mR);
                 } else {
+                    // Control manual normal (joystick)
                     {
                         const float STEER_RATE = 1.5f;
                         float steer_delta = manual_steering_cmd - steering_adjustment;
@@ -4559,9 +4463,9 @@ static void ControlStep10ms(void)
                     if (mL >  100.0f) mL =  100.0f;
                     if (mL < -100.0f) mL = -100.0f;
 
-                    motorRightVelocity = -(int16_t)mL;
-                    motorLeftVelocity  = -(int16_t)mR;
-                } // end else (no rotation active)
+                    motorRightVelocity = -(int16_t)lroundf(mL);
+                    motorLeftVelocity  = -(int16_t)lroundf(mR);
+                }
 
             } else if (robot_state != ROBOT_STATE_MOTOR_TEST) {
                 line_integral       = 0.0f;
@@ -4585,8 +4489,8 @@ static void ControlStep10ms(void)
                 if (mL >  100.0f) mL =  100.0f;
                 if (mL < -100.0f) mL = -100.0f;
 
-                motorRightVelocity = -(int16_t)mL;
-                motorLeftVelocity  = -(int16_t)mR;
+                motorRightVelocity = -(int16_t)lroundf(mL);
+                motorLeftVelocity  = -(int16_t)lroundf(mR);
             }
             // ROBOT_STATE_MOTOR_TEST: SETMOTORSPEED controla directamente
         }
@@ -4867,7 +4771,7 @@ int main(void)
   UNER_RegisterFlags(NULL, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
   UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_SPEED_TARGET, NULL);
   UNER_RegisterManualControl(&manual_setpoint_cmd, &manual_steering_cmd, &manual_cmd_last_ms);
-  UNER_RegisterRotationCmd(&manual_rot_target_deg, &manual_rot_trigger);
+  // Comandos ROTATE_90/180/CUSTOM desde Qt quedan sin efecto (no-op seguro en UNER.c)
   UNER_RegisterSetpointTrim(&setpoint_trim);
   UNER_RegisterRobotState(&robot_state);
 
