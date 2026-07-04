@@ -228,7 +228,7 @@ typedef enum {
 #define LINE_LOST_TIMEOUT_MS   2000    // ms sin línea antes de entrar en búsqueda
 #define LINE_LOST_STEERING     12.0f   // steering suave para cuando recién se pierde la línea
 
-#define OBJ_DETECT_THRESHOLD_VAL   2000.0f   // objeto detectado si ADC < este valor (sin objeto: ~4095, con objeto: <2000)
+#define OBJ_DETECT_THRESHOLD_VAL   3200.0f   // objeto detectado si ADC < este valor (sin objeto: ~4095, con objeto: <2000)
 #define OBJ_DETECT_DEBOUNCE_CNT    10         // ciclos consecutivos (100 ms) para confirmar objeto
 #define OBJ_PRE_REVERSE_HOLD_MS    1000U      // tiempo de balance estatico antes de rotar
 // Giro 90° por encoders: medir distancia entre centros de rueda y ajustar aquí
@@ -241,9 +241,16 @@ typedef enum {
 #define OBJ_WALL_REVERSE_ANGLE     3.0f      // grados de inclinación hacia atrás durante la reversa por pared
 #define OBJ_WALL_APPROACH_ANGLE    2.0f      // ángulo de avance lento buscando la pared (°)
 #define OBJ_WALL_APPROACH_TIMEOUT  6000U     // ms máximos buscando la pared antes de rendirse
-#define OBJ_WALL_FWD_ANGLE         4.5f      // ángulo máximo de avance en WALL_FWD (°)
-#define OBJ_WALL_BRAKE_ANGLE       1.0f      // freno activo máximo por sobrevelocidad en WALL_FWD (°)
-#define OBJ_WALL_OVERSPEED_VEL     0.90f     // velocidad medida para frenar; evita regular fino con encoders cuantizados
+// Avance bordeando la pared: PI de velocidad (mismo patrón que LOST_FWD/EDGE_FWD) en vez
+// de ángulo fijo + freno bang-bang por sobrevelocidad — regula la velocidad de crucero
+// con precisión en lugar de acelerar a fondo hasta cruzar el umbral y frenar de golpe.
+#define OBJ_WALL_SPEED_TARGET      0.4f      // m/s, avance cauteloso bordeando la pared
+#define OBJ_WALL_VEL_KP            4.0f      // ganancia P acelerando
+#define OBJ_WALL_VEL_KP_BRAKE      14.0f     // ganancia P frenando (sobrevelocidad)
+#define OBJ_WALL_VEL_KI            1.0f      // ganancia I para sostener la velocidad de crucero
+#define OBJ_WALL_VEL_I_MAX         1.0f      // anti-windup del integral de velocidad
+#define OBJ_WALL_FWD_ANGLE         2.5f      // ángulo máximo de avance en WALL_FWD (°)
+#define OBJ_WALL_BRAKE_ANGLE       2.0f      // freno activo máximo por sobrevelocidad en WALL_FWD (°)
 #define OBJ_WALL_PIVOT_POWER       8.0f      // potencia del pivot en WALL_TURN/WALL_FWD
 #define OBJ_WALL_LINE_IGNORE_MS    3000U     // ms al inicio de WALL_FWD en que se ignora la línea
 
@@ -480,6 +487,7 @@ static int32_t  obj_rev_r0           = 0;
 static int32_t  obj_rev_l0           = 0;
 static float    obj_rev_steer_f      = 0.0f;      // corrección de rumbo rampeada, PWM absoluto (sin línea), durante OBJ_REVERSE
 static float    lost_fwd_vel_integral = 0.0f;     // integral del PI de velocidad en LOST_FWD/EDGE_FWD
+static float    obj_wall_vel_integral = 0.0f;     // integral del PI de velocidad en OBJ_WALL_FWD
 static uint32_t obj_brake_start_ms   = 0;         // inicio de OBJ_BRAKE (file-scope para reset en caída)
 static uint32_t obj_pre_rotate_ms    = 0;         // inicio del wait post-freno antes de OBJ_ROTATE
 static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
@@ -2667,6 +2675,7 @@ static void ControlStep10ms(void)
             line_angle_ramped   = 0.0f;
             obj_pre_rev_start_ms = 0;
             lost_fwd_vel_integral = 0.0f;
+            all_black_start_ms  = 0;
         }
 
         if (robot_state != ROBOT_STATE_LINE_FOLLOWING && prev_robot_state == ROBOT_STATE_LINE_FOLLOWING) {
@@ -2913,19 +2922,31 @@ static void ControlStep10ms(void)
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_WALL_FWD) {
-                // Avance por pared: angulo fijo para no bambolear por cuantizacion de encoders.
-                // Solo frena si la velocidad filtrada supera claramente el rango seguro.
                 // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás, misma
                 // corrección que la reversa pareja (ver switch más abajo).
                 if ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_REVERSE_THOLD) {
                     base_setpoint_target = -OBJ_WALL_REVERSE_ANGLE;
+                    obj_wall_vel_integral = 0.0f;
                 } else {
-                    // Camino activo: angulo fijo para avanzar recto; freno solo por sobrevelocidad clara.
-                    float wf_fwd_vel = fmaxf(0.0f, -velocity_est_f);
-                    float wf_cmd = (wf_fwd_vel > OBJ_WALL_OVERSPEED_VEL)
-                                 ? -OBJ_WALL_BRAKE_ANGLE
-                                 :  OBJ_WALL_FWD_ANGLE;
-                    base_setpoint_target = wf_cmd;
+                    // PI de velocidad (mismo patrón que LOST_FWD/EDGE_FWD): regula la
+                    // velocidad de crucero con precisión en vez de ángulo fijo + freno
+                    // bang-bang, que aceleraba a fondo hasta cruzar el umbral y frenaba de golpe.
+                    float wf_vel_raw = fmaxf(0.0f, -velocity_est_f);
+                    float wf_vel     = apply_deadbandf(wf_vel_raw, BRAKE_VEL_DEADBAND);
+                    float vel_error  = OBJ_WALL_SPEED_TARGET - wf_vel;
+                    float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;
+                    if (!late_cycle) {
+                        if (vel_error > 0.0f) {
+                            obj_wall_vel_integral += vel_error * dt_ctrl;
+                            obj_wall_vel_integral = clampf_local(
+                                obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);
+                        } else {
+                            obj_wall_vel_integral *= 0.80f;
+                        }
+                    }
+                    base_setpoint_target = clampf_local(
+                        kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,
+                        -OBJ_WALL_BRAKE_ANGLE, OBJ_WALL_FWD_ANGLE);
                 }
                 brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
@@ -3166,6 +3187,7 @@ static void ControlStep10ms(void)
                 obj_rev_initialized = 0;
                 obj_rev_steer_f     = 0.0f;
                 lost_fwd_vel_integral = 0.0f;
+                obj_wall_vel_integral = 0.0f;
                 obj_rot_initialized = 0;
                 obj_rot_start_ms    = 0;
                 obj_rot_phase       = 0;
@@ -3889,6 +3911,10 @@ static void ControlStep10ms(void)
                                 obj_rot_phase       = 0;
                                 obj_rot_heading     = 0.0f;
                                 steering_adjustment = 0.0f;
+                                // Sin este reset, si los sensores siguen en negro después del
+                                // giro (no habia linea real), el timer ya vencido re-dispara
+                                // otro PERP_ROTATE en el ciclo siguiente -> giro en círculos.
+                                all_black_start_ms  = 0;
                             } else if (!enc_done) {
                                 float remaining = PROT_ENC_TARGET - prot_counts;
                                 float ramp = fminf(remaining / (PROT_ENC_TARGET * 0.15f), 1.0f);
@@ -3999,7 +4025,7 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_OBJ_REVERSE:
                     {
-                        const int32_t rev_target_counts = 280; // ~14 cm
+                        const int32_t rev_target_counts = 150; // ~10 cm
 
                         if (!obj_rev_initialized) {
                             __disable_irq();
@@ -4129,7 +4155,7 @@ static void ControlStep10ms(void)
                         const float  LINE_ROT_PIVOT        = 15.0f;
                         const float  LINE_ROT_BRAKE        = 5.0f;
                         const float  LINE_ROT_SLOWDOWN_DEG = 55.0f;
-                        const uint32_t LINE_ROT_P0_MAX     = 1200U;
+                        const uint32_t LINE_ROT_P0_MAX     = 1800U;
                         const uint32_t LINE_ROT_P1_MAX     = 300U;
 
                         if (!obj_rot_initialized) {
@@ -4244,6 +4270,7 @@ static void ControlStep10ms(void)
                             line_state                 = LINE_STATE_OBJ_WALL_FWD;
                             obj_wall_approach_start_ms = 0;
                             obj_wall_fwd_start_ms      = HAL_GetTick();
+                            obj_wall_vel_integral      = 0.0f;
                         } else if ((HAL_GetTick() - obj_wall_approach_start_ms) >= OBJ_WALL_APPROACH_TIMEOUT) {
                             line_state                 = LINE_STATE_FOLLOWING;
                             obj_wall_approach_start_ms = 0;
@@ -4355,6 +4382,7 @@ static void ControlStep10ms(void)
                             line_state            = LINE_STATE_OBJ_WALL_FWD;
                             line_pivot_active     = 0;
                             obj_wall_fwd_start_ms = HAL_GetTick();
+                            obj_wall_vel_integral = 0.0f;
                         } else {
                             // Pivot izquierda: signo opuesto a OBJ_ROTATE (que pivotea derecha).
                             line_pivot_active  = 1;
