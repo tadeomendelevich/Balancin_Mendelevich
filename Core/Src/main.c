@@ -3787,9 +3787,9 @@ static void ControlStep10ms(void)
                     {
                         // Giro 180° derecha para buscar la línea perdida.
                         // Misma lógica gz+encoder que OBJ_ROTATE y MANUAL, escalada a 180°.
-                        const float  LROT_ENC_TARGET   = 880.0f;
-                        const float  LROT_PIVOT        = 20.0f;  // antes 14 — poco margen, se veía al probar en banco repetido
-                        const float  LROT_BRAKE        = 16.0f;  // freno fijo y corto, no de precisión
+                        const float  LROT_ENC_TARGET   = 960.0f;  // antes 880 — quedaba corto (~165° reales), reescalado 880*(180/165)
+                        const float  LROT_PIVOT        = 24.0f;  // antes 14→20→24: arranques dispares por pwm_sat residual compitiendo con el pivot
+                        const float  LROT_BRAKE        = 10.0f;  // antes 16 — torque fijo sin medir velocidad remanente, a veces pasaba de frenada y desestabilizaba
                         const float  LROT_SLOWDOWN_DEG = 55.0f;
                         const float  LROT_ABS_TARGET   = 180.0f;
                         // P0_MAX/P1_MAX son colchón de seguridad (peor caso ~2.3s), no el corte normal
@@ -3855,10 +3855,15 @@ static void ControlStep10ms(void)
                         if (obj_rot_phase == 1) {
                             uint32_t p1e      = HAL_GetTick() - obj_rot_phase1_ms;
                             int enc_done      = (lrot_counts >= LROT_ENC_TARGET);
+                            // El freno arranca antes de llegar al 100% (antes esperaba a
+                            // enc_done exacto = actuaba de golpe justo al final, rompiendo el
+                            // equilibrio). Ahora entra al 85% del recorrido; el corte final
+                            // (enc_done + duración) no cambia, así que no acorta el giro.
+                            int enc_near_done = (lrot_counts >= LROT_ENC_TARGET * 0.85f);
                             int overshoot     = (lrot_abs_hdg > LROT_ABS_TARGET * 1.2f);
                             // Freno fuerte a torque fijo por tiempo corto y acotado, sin
                             // buscar una velocidad de frenado exacta.
-                            const uint32_t LROT_BRAKE_DURATION = 400U;
+                            const uint32_t LROT_BRAKE_DURATION = 250U;  // antes 400 — frenaba bien y luego "volvía" un poco (sobrefrenaba en reversa el tiempo que le quedaba)
                             if ((enc_done && p1e >= LROT_BRAKE_DURATION) || p1e >= LROT_P1_MAX || overshoot) {
                                 // Bypass de LOST_SETTLE: arranca a avanzar sin esperar. Si ya
                                 // quedó sobre la línea, directo a FOLLOWING.
@@ -3877,8 +3882,8 @@ static void ControlStep10ms(void)
                                 obj_rot_phase       = 0;
                                 obj_rot_heading     = 0.0f;
                                 steering_adjustment = 0.0f;
-                            } else if (!enc_done) {
-                                // Encoder aún no llegó al target: seguir pivoteando suave
+                            } else if (!enc_near_done) {
+                                // Encoder aún no llegó al 85%: seguir pivoteando suave
                                 float remaining = LROT_ENC_TARGET - lrot_counts;
                                 float ramp = fminf(remaining / (LROT_ENC_TARGET * 0.15f), 1.0f);
                                 float pivot = LROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
@@ -4845,15 +4850,15 @@ static void ControlStep10ms(void)
                     // quieto y ejecuta un giro de 180° con EXACTAMENTE la misma lógica y
                     // constantes que LOST_ROTATE — lo que se calibre acá vale directo para
                     // el giro real del seguidor de línea. Ciclo indefinido.
-                    const float    MROT_ENC_TARGET   = 880.0f;
-                    const float    MROT_PIVOT        = 20.0f;  // antes 14, sincronizado con LOST_ROTATE
-                    const float    MROT_BRAKE        = 16.0f;
+                    const float    MROT_ENC_TARGET   = 920.0f;  // antes 880, sincronizado con LOST_ROTATE
+                    const float    MROT_PIVOT        = 24.0f;  // antes 14→20→24, sincronizado con LOST_ROTATE
+                    const float    MROT_BRAKE        = 10.0f;  // antes 16, sincronizado con LOST_ROTATE
                     const float    MROT_SLOWDOWN_DEG = 55.0f;
                     const float    MROT_ABS_TARGET   = 180.0f;
                     const uint32_t MROT_P0_MAX       = 1500U;
                     const uint32_t MROT_P1_MAX       = 800U;
                     const float    MROT_ENC_FRAC     = 0.60f;
-                    const uint32_t MROT_BRAKE_DURATION = 400U;
+                    const uint32_t MROT_BRAKE_DURATION = 250U;  // antes 400, sincronizado con LOST_ROTATE
                     const uint32_t MROT_WAIT_MS      = 3000U;
 
                     steering_adjustment = 0.0f;
@@ -4916,6 +4921,9 @@ static void ControlStep10ms(void)
                         if (obj_rot_phase == 1) {
                             uint32_t p1e  = HAL_GetTick() - obj_rot_phase1_ms;
                             int enc_done  = (mrot_counts >= MROT_ENC_TARGET);
+                            // Freno arranca al 85% (ver comentario en LOST_ROTATE), no recién
+                            // al 100% — el corte final sigue dependiendo de enc_done completo.
+                            int enc_near_done = (mrot_counts >= MROT_ENC_TARGET * 0.85f);
                             int overshoot = (mrot_abs_hdg > MROT_ABS_TARGET * 1.2f);
                             if ((enc_done && p1e >= MROT_BRAKE_DURATION) || p1e >= MROT_P1_MAX || overshoot) {
                                 // Giro terminado: volver a la espera
@@ -4926,7 +4934,7 @@ static void ControlStep10ms(void)
                                 obj_rot_heading        = 0.0f;
                                 motorRightVelocity = (int16_t)clampf_local(-pwm_sat, -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-pwm_sat, -60.0f, 60.0f);
-                            } else if (!enc_done) {
+                            } else if (!enc_near_done) {
                                 float remaining = MROT_ENC_TARGET - mrot_counts;
                                 float ramp = fminf(remaining / (MROT_ENC_TARGET * 0.15f), 1.0f);
                                 float pivot = MROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
