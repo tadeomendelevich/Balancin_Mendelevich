@@ -78,6 +78,10 @@ static uint32_t *p_manual_tmo = NULL;
 static float   *p_rot_target_deg = NULL;
 static uint8_t *p_rot_trigger    = NULL;
 
+static float *p_odom_x     = NULL;   // Punteros a la pose odométrica en main.c
+static float *p_odom_y     = NULL;
+static float *p_odom_theta = NULL;
+
 static float *p_setpoint_trim = NULL;
 
 static uint8_t last_manual_cmd = 0;
@@ -146,7 +150,9 @@ void UNER_Task(void) {
                 break;
             case NBYTES:
                 unerRx->nBytes = unerRx->buff[unerRx->indexR];
-                unerRx->header = TOKEN;
+                // Mínimo 2 (cmd + checksum): con nBytes=0, el nBytes-- del estado
+                // PAYLOAD underflowea a 255 y el parser se traga 255 bytes.
+                unerRx->header = (unerRx->nBytes >= 2) ? TOKEN : HEADER_U;
                 break;
             case TOKEN:
                 if (unerRx->buff[unerRx->indexR] == ':') {
@@ -843,6 +849,43 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
 			putByteOnTx(dataTx, unerTx->chk);
         	break;
+        case GET_ODOMETRY:
+            if (p_odom_x && p_odom_y && p_odom_theta) {
+                putHeaderOnTx(dataTx, GET_ODOMETRY, 13); // 1 cmd + 3 floats
+
+                myWord.f32 = *p_odom_x;      // X [m] (+ = adelante respecto al origen)
+                putByteOnTx(dataTx, myWord.ui8[0]);
+                putByteOnTx(dataTx, myWord.ui8[1]);
+                putByteOnTx(dataTx, myWord.ui8[2]);
+                putByteOnTx(dataTx, myWord.ui8[3]);
+                myWord.f32 = *p_odom_y;      // Y [m] (lateral)
+                putByteOnTx(dataTx, myWord.ui8[0]);
+                putByteOnTx(dataTx, myWord.ui8[1]);
+                putByteOnTx(dataTx, myWord.ui8[2]);
+                putByteOnTx(dataTx, myWord.ui8[3]);
+                myWord.f32 = *p_odom_theta;  // theta [°] (-180..180]
+                putByteOnTx(dataTx, myWord.ui8[0]);
+                putByteOnTx(dataTx, myWord.ui8[1]);
+                putByteOnTx(dataTx, myWord.ui8[2]);
+                putByteOnTx(dataTx, myWord.ui8[3]);
+
+                putByteOnTx(dataTx, dataTx->chk);
+            } else {
+                putHeaderOnTx(dataTx, GET_ODOMETRY, 2);
+                putByteOnTx(dataTx, ACK);
+                putByteOnTx(dataTx, dataTx->chk);
+            }
+        break;
+
+        case RESET_ODOMETRY:
+            if (p_odom_x)     *p_odom_x     = 0.0f;
+            if (p_odom_y)     *p_odom_y     = 0.0f;
+            if (p_odom_theta) *p_odom_theta = 0.0f;
+            putHeaderOnTx(dataTx, RESET_ODOMETRY, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
         case MODIFY_SETPOINT:
             myWord.ui8[0] = getByteFromRx(dataRx, 1, 0);
             myWord.ui8[1] = getByteFromRx(dataRx, 1, 0);
@@ -891,10 +934,8 @@ void UNER_SendAllSensors(void) {
 	if (ESP01_IsSending())
 	        return;
 
-	unerTx->indexW = 0;
-	unerTx->indexR = 0;
-	unerTx->chk    = 0;
-
+	// (ya no se resetean indexW/indexR: pisaba respuestas de comandos pendientes;
+	// el envío maneja el wrap del ring correctamente)
 	putHeaderOnTx(unerTx, SENDALLSENSORS, 37); // 1 cmd + 16 ADC + 12 MPU + 8 Angle
 
 	myWord.ui16[0] =  (int16_t)p_adcBuf[0]; 		// ADC 1
@@ -1036,6 +1077,12 @@ void UNER_RegisterRotationCmd(float *rotDegPtr, uint8_t *rotTriggerPtr) {
     p_rot_trigger    = rotTriggerPtr;
 }
 
+void UNER_RegisterOdometry(float *xPtr, float *yPtr, float *thetaPtr) {
+    p_odom_x     = xPtr;
+    p_odom_y     = yPtr;
+    p_odom_theta = thetaPtr;
+}
+
 void UNER_RegisterSetpointTrim(float *trimPtr) {
     p_setpoint_trim = trimPtr;
 }
@@ -1045,9 +1092,14 @@ void UNER_SendData(void) {
     uint16_t len = (unerTx->indexW + unerTx->mask + 1 - unerTx->indexR) & unerTx->mask;
     if (!len) return;
 
-    // USB CDC
+    // USB CDC — copiar con wrap: la trama puede cruzar el final del ring buffer,
+    // enviar &buff[indexR] lineal mandaba bytes viejos en vez de la parte envuelta.
     if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED) {
-        usb_enqueue_tx(&unerTx->buff[unerTx->indexR], len);
+        uint8_t tmp[TXBUFSIZE];
+        for (uint16_t i = 0; i < len; i++) {
+            tmp[i] = unerTx->buff[(unerTx->indexR + i) & unerTx->mask];
+        }
+        usb_enqueue_tx(tmp, len);
     }
 
     // UDP (ESP01)
@@ -1067,10 +1119,6 @@ void UNER_SendWifiLogData(WifiLogData_t *data) {
     // sizeof(WifiLogData_t) bytes de payload + 1 byte CMD
     uint8_t payloadLen = sizeof(WifiLogData_t);
 
-    unerTx->indexW = 0;
-    unerTx->indexR = 0;
-    unerTx->chk    = 0;
-
     putHeaderOnTx(unerTx, CMD_WIFI_LOG_DATA, payloadLen + 1);
 
     uint8_t *p = (uint8_t*)data;
@@ -1089,10 +1137,6 @@ void UNER_SendLogData(LogData_t *data) {
     }
 
     uint8_t payloadLen = sizeof(LogData_t);
-
-    unerTx->indexW = 0;
-    unerTx->indexR = 0;
-    unerTx->chk    = 0;
 
     putHeaderOnTx(unerTx, CMD_LOG_DATA, payloadLen);
 

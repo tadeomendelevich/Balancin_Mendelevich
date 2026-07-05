@@ -134,6 +134,8 @@ typedef enum{
     ROTATE_180_RIGHT = 0xD7,   // giro 180° derecha
     ROTATE_180_LEFT  = 0xD8,   // giro 180° izquierda
     ROTATE_CUSTOM    = 0xD9,   // payload: float 4 bytes (°, + = derecha, − = izquierda)
+    GET_ODOMETRY     = 0xDA,   // respuesta: 3 floats little-endian = x[m], y[m], theta[°]
+    RESET_ODOMETRY   = 0xDB,   // pone la pose en (0,0,0°); responde ACK
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -229,6 +231,12 @@ void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLineP
 void UNER_RegisterManualControl(float *spCmdPtr, float *stCmdPtr, uint32_t *tmoPtr);
 
 void UNER_RegisterRotationCmd(float *rotDegPtr, uint8_t *rotTriggerPtr);
+
+/**
+ * @brief Registra los punteros a la pose odométrica (x[m], y[m], theta[°]) de main.c
+ *        para los comandos GET_ODOMETRY / RESET_ODOMETRY.
+ */
+void UNER_RegisterOdometry(float *xPtr, float *yPtr, float *thetaPtr);
 
 void UNER_RegisterSetpointTrim(float *trimPtr);
 

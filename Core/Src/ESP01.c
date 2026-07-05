@@ -376,8 +376,9 @@ void ESP01_Task(){
         connection_watchdog = 0;
     } else {
         connection_watchdog++;
-        // 2000 ticks * 10ms = 20 seconds
-        if (connection_watchdog > 2000) {
+        // OJO: ESP01_Task() se llama desde el subtick 0 de main → cada 100 ms,
+        // no cada 10 ms. 200 ticks * 100 ms = 20 s (con 2000 eran 200 s reales).
+        if (connection_watchdog > 200) {
             if(aDbgStr) aDbgStr(">>> WATCHDOG TIMEOUT: Resetting ESP01...\r\n");
             connection_watchdog = 0;
             esp01ATSate = ESP01ATHARDRST0;

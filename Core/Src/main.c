@@ -214,8 +214,9 @@ typedef enum {
 // Corrección de rumbo sin línea: P simple sobre diferencia de velocidad de ruedas,
 // en PWM absoluto (mismas unidades que steering_adjustment/pwm_sat). REV_STRAIGHT_MAX
 // es chico a propósito: nunca puede acercarse a pwm_sat, así que ninguna rueda se
-// queda sin margen. Empezar con KP=0 (ambas ruedas reciben el mismo pwm_sat, sin
-// corrección) y subirlo de a poco una vez confirmado que las dos ruedas giran igual.
+// queda sin margen. El plan original era arrancar con KP=0 e ir subiendo; el valor
+// actual (-1.0, signo incluido) quedó de las pruebas en el robot — si la corrección
+// empeora la asimetría en vez de corregirla, probar +1.0 (solo cambia el signo).
 #define REV_STRAIGHT_KP   -1.0f   // PWM por rps de diferencia entre ruedas (0 = sin corrección)
 #define REV_STRAIGHT_MAX   8.0f   // tope absoluto en PWM units
 #define REV_STRAIGHT_SLEW  2.0f   // PWM/ciclo max de cambio (rampa)
@@ -351,8 +352,6 @@ static volatile uint8_t  adc_recover_pending = 0;
 
 uint8_t i2c1_tx_busy = 0;
 
-uint8_t *sendAllSensors;
-
 uint8_t dataTx, dataRx;
 static uint8_t unerRxBuffer[RXBUFSIZE];
 static uint8_t unerTxBuffer[TXBUFSIZE];
@@ -361,8 +360,6 @@ _sTx    unerTx;
 static uint8_t esp01RxBuf[ESP01RXBUFAT];
 static uint16_t esp01IwRx = 0;
 static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrante */
-uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
-volatile uint16_t espUSBBufIw, espUSBBufIr;
 
 const char *wifiSSID     = "FCAL";
 const char *wifiPassword = "fcalconcordia.06-2019";
@@ -448,7 +445,6 @@ float OBJ_DETECT_THRESHOLD_f = OBJ_DETECT_THRESHOLD_VAL;  // umbral objeto, ajus
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
 static uint32_t   line_lost_ms     = 0;   // tick cuando se vio la línea por última vez
-static uint32_t   line_lost_entered_ms = 0; // tick cuando se entró al estado LOST (no usado actualmente)
 static uint8_t    line_seen_since_entry = 0; // evita búsqueda automática antes de adquirir línea
 static float      line_search_dir  = 1.0f; // dirección de búsqueda (+1 o -1)
 static float      last_line_dir    = 1.0f; // última dirección válida de la línea (+1 o -1)
@@ -537,6 +533,20 @@ volatile uint8_t mpu_data_ready_for_ctrl = 0;
 
 volatile int32_t encoder_right = 0;
 volatile int32_t encoder_left  = 0;
+
+// ── ODOMETRÍA DE POSE ─────────────────────────────────────────────────────
+// Pose estimada del robot en el plano, integrada a 100 Hz en ControlStep10ms:
+//  - distancia: promedio de encoders (misma escala ENC_CPR/ENC_VEL_SCALE que velocity_est)
+//  - rumbo: gyro Z integrado (menos sensible al slip de ruedas que el diferencial de encoders)
+// Marco de referencia: (0,0) y θ=0 en el punto/orientación donde se hizo el último
+// reset (cambio de modo o comando RESET_ODOMETRY desde Qt). X = adelante inicial,
+// Y = lateral, θ en grados (-180..180]. Se pausa la integración durante caídas.
+// ODOM_THETA_SIGN: si al girar a la DERECHA θ se hace más POSITIVO, invertir a -1.0f
+// (la convención deseada es la matemática estándar: antihorario = positivo).
+#define ODOM_THETA_SIGN  (+1.0f)
+static float odom_x_m       = 0.0f;
+static float odom_y_m       = 0.0f;
+static float odom_theta_deg = 0.0f;
 
 uint8_t steer_pid_enabled    = 0;     // 0 = open-loop (gyro Z), 1 = lazo cerrado encoders
 static float steer_pid_integral   = 0.0f;
@@ -735,6 +745,16 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     }
 }
 
+// Sin este callback, un error de overrun (ORE) aborta la recepción IT y nadie
+// vuelve a armarla: el RX del ESP-01 queda muerto hasta el próximo reset.
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART1) {
+        __HAL_UART_CLEAR_OREFLAG(huart);
+        huart->ErrorCode = HAL_UART_ERROR_NONE;
+        HAL_UART_Receive_IT(&huart1, &dataRx, 1);
+    }
+}
+
 void USB_BufferPush(uint8_t b){
     espUSBBuf[espUSBBufIw++] = b;
     espUSBBufIw &= (ESP_USB_BUF_SIZE - 1);
@@ -864,8 +884,10 @@ void usb_service_tx(void) {
         return;
     }
 
-    // 3) Preparamos el siguiente chunk y lo enviamos
-    uint8_t chunk[64];
+    // 3) Preparamos el siguiente chunk y lo enviamos.
+    // static: CDC_Transmit_FS solo guarda el puntero y la transferencia USB ocurre
+    // después de retornar — un buffer de stack ya liberado corrompería los datos.
+    static uint8_t chunk[64];
     uint16_t cnt = 0;
     while (cnt < 64 && tx_tail != tx_head) {
         chunk[cnt++] = usb_tx_buf[tx_tail];
@@ -2397,6 +2419,21 @@ static void ControlStep10ms(void)
 		speed_right_rps_s = speed_right_rps;
 		speed_left_rps_s  = speed_left_rps;
 
+		// ── ODOMETRÍA DE POSE ────────────────────────────────────────────
+		// Distancia por encoders + rumbo por gyro Z, integrados cada ciclo.
+		// Con la convención de signos actual, deltas positivos = avance
+		// (velocity_est_f negativo = adelante, ver vel_enc arriba).
+		// Durante caídas no se integra: las ruedas pueden girar sin traccionar.
+		if (!f_fallen) {
+			float odom_d = ((float)(delta_right + delta_left) * 0.5f / ENC_CPR) * ENC_VEL_SCALE;
+			odom_theta_deg += ODOM_THETA_SIGN * ((float)gz / 100.0f) * DT_CTRL_FIXED;
+			if      (odom_theta_deg >  180.0f) odom_theta_deg -= 360.0f;
+			else if (odom_theta_deg < -180.0f) odom_theta_deg += 360.0f;
+			float odom_th_rad = odom_theta_deg * (M_PI / 180.0f);
+			odom_x_m += odom_d * cosf(odom_th_rad);
+			odom_y_m += odom_d * sinf(odom_th_rad);
+		}
+
 		// Steering PID de lazo cerrado: disponible mientras speed_r/l están en scope.
 		// steer_correction se usa en la sección de motores BALANCE más adelante.
 		static float steer_correction = 0.0f;
@@ -2425,6 +2462,9 @@ static void ControlStep10ms(void)
 		last_mpu_us = sample_us;
 
 		dt_real = (float)diff_us * 1e-6f;
+		// micros() envuelve cada ~44.7 s (CYCCNT/96 no es potencia de 2): en el ciclo
+		// del wrap diff_us da basura enorme. Solo afecta telemetría (dt_ctrl es fijo).
+		if (dt_real > 1.0f) dt_real = DT_CTRL_FIXED;
 
         // El control usa un dt fijo para desacoplar el PID del jitter del sensor y de las latencias.
         const uint8_t late_cycle = 0;  // ya no tiene sentido detectar ciclos tardíos
@@ -2470,8 +2510,8 @@ static void ControlStep10ms(void)
         float w_sum = 0.0f;
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
             // Detección de objetos: sensores de largo alcance ADC 5-8 (índices 4-7).
-            // Si cualquier sensor supera el umbral durante OBJ_DETECT_DEBOUNCE_CNT ciclos
-            // consecutivos (30 ms), se sale a IDLE y los motores se apagan.
+            // Si cualquier sensor baja del umbral durante OBJ_DETECT_DEBOUNCE_CNT ciclos
+            // consecutivos (10 ciclos = 100 ms), arranca la secuencia de evasión.
             {
                 static uint8_t obj_cnt = 0;
                 uint8_t obj_now = ((float)adcAvg[4] < OBJ_DETECT_THRESHOLD_f ||
@@ -2500,9 +2540,10 @@ static void ControlStep10ms(void)
                 }
             }
 
-            // Usa adcAvg[] (promedio de 15 muestras a 4 kHz = ventana 3.75 ms) en lugar
-            // del snapshot DMA crudo. Evita el retraso del filtro EMA que impedía
-            // alcanzar LINE_THRESHOLD en el primer ciclo sobre la línea.
+            // Usa adcAvg[] en lugar del snapshot DMA crudo. OJO: aunque el ADC convierte
+            // a 4 kHz, UpdateADC_MovingAverage() corre desde is10ms (100 Hz) y toma UN
+            // snapshot por ciclo — con ADC_AVERAGE_SIZE=4 la ventana real es de 40 ms,
+            // no 3.75 ms. Mejora pendiente: promediar en el callback del DMA a 4 kHz.
             // Centroide cuadrático con sustracción de baseline.
             // Sensores a posiciones relativas {-3,-1,+1,+3} × 5.75 mm desde el centro.
             // Peso cuadrático: pos² × sign(pos) → coeficientes {-9,-1,+1,+9}.
@@ -2721,6 +2762,9 @@ static void ControlStep10ms(void)
             obj_pre_rev_start_ms = 0;
             lost_fwd_vel_integral = 0.0f;
             all_black_start_ms  = 0;
+            odom_x_m            = 0.0f;   // odometría: origen = punto de entrada al modo
+            odom_y_m            = 0.0f;
+            odom_theta_deg      = 0.0f;
         }
 
         if (robot_state != ROBOT_STATE_LINE_FOLLOWING && prev_robot_state == ROBOT_STATE_LINE_FOLLOWING) {
@@ -2766,6 +2810,10 @@ static void ControlStep10ms(void)
             base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
             brake_setpoint_f    = 0.0f;
             pwm_sat_prev        = 0.0f;
+
+            odom_x_m       = 0.0f;   // odometría: origen = punto de entrada al modo
+            odom_y_m       = 0.0f;
+            odom_theta_deg = 0.0f;
 
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                 manual_setpoint_cmd    = 0.0f;
@@ -3575,7 +3623,6 @@ static void ControlStep10ms(void)
                             // para que el robot siga corrigiendo hacia la línea.
 
                             if (ms_sin_linea > 1000) {
-                                line_lost_entered_ms = HAL_GetTick();
                                 line_search_dir      = last_line_dir;
                                 line_integral        = 0.0f;
                                 steering_adjustment  = 0.0f;
@@ -3634,7 +3681,9 @@ static void ControlStep10ms(void)
                         }
 
                         uint32_t elapsed = HAL_GetTick() - lrot_brake_start_ms;
-                        if (fabsf(velocity_est_f) < LBRAKE_VEL_THR || elapsed >= LBRAKE_TIMEOUT) {
+                        // deadband: velocity_est_f crudo tiene piso de cuantización ~0.32 m/s
+                        if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) < LBRAKE_VEL_THR ||
+                            elapsed >= LBRAKE_TIMEOUT) {
                             // Solo se llega acá cuando se perdió centrado (ver la rama de
                             // salida de LINE_STATE_FOLLOWING); el caso "por los extremos" va
                             // directo a LINE_STATE_EDGE_WAIT y nunca pasa por este estado.
@@ -3678,7 +3727,7 @@ static void ControlStep10ms(void)
 
                         // El giro no sale anticipadamente al ver línea a mitad de camino (podría
                         // ser una detección espuria); siempre completa por encoder.
-                        float lrot_gz = (float)gz / 131.0f;
+                        float lrot_gz = (float)gz / 100.0f;
                         obj_rot_heading += lrot_gz * DT_CTRL_FIXED;
 
                         __disable_irq();
@@ -3781,7 +3830,7 @@ static void ControlStep10ms(void)
                         uint32_t elapsed  = HAL_GetTick() - lrot_settle_start_ms;
                         float tilt_err    = fabsf(filtered_roll_deg - dynamic_setpoint_f);
                         int settled       = (elapsed >= LSETTLE_MIN_MS) &&
-                                            (fabsf(velocity_est_f) < LSETTLE_VEL_THR) &&
+                                            (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) < LSETTLE_VEL_THR) &&
                                             (tilt_err < LSETTLE_TILT_THR);
 
                         if (settled || elapsed >= LSETTLE_TIMEOUT) {
@@ -3806,8 +3855,9 @@ static void ControlStep10ms(void)
                             line_error_prev   = 0.0f;
                             line_lost_ms      = HAL_GetTick();
                             line_state        = LINE_STATE_FOLLOWING;
-                        } else if (f_fallen ||
-                                   (HAL_GetTick() - line_lost_ms) > LOST_FWD_TIMEOUT) {
+                        } else if ((HAL_GetTick() - line_lost_ms) > LOST_FWD_TIMEOUT) {
+                            // (el chequeo de f_fallen acá era código muerto: todo este switch
+                            // corre dentro de if(!f_fallen))
                             line_state = LINE_STATE_GIVEN_UP;
                         }
                         break;
@@ -3826,7 +3876,9 @@ static void ControlStep10ms(void)
                         steering_adjustment = 0.0f;
 
                         uint32_t elapsed = HAL_GetTick() - edge_wait_start_ms;
-                        if (fabsf(velocity_est_f) < EWAIT_VEL_THR || elapsed >= EWAIT_TIMEOUT) {
+                        // deadband: mismo filtro de ruido de cuantización que LOST_BRAKE
+                        if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) < EWAIT_VEL_THR ||
+                            elapsed >= EWAIT_TIMEOUT) {
                             line_state          = LINE_STATE_EDGE_ROTATE;
                             obj_rot_initialized = 0;
                             obj_rot_phase       = 0;
@@ -3874,7 +3926,7 @@ static void ControlStep10ms(void)
                             obj_rot_phase1_ms   = 0;
                         }
 
-                        float erot_gz = (float)gz / 131.0f;
+                        float erot_gz = (float)gz / 100.0f;
                         obj_rot_heading += erot_gz * DT_CTRL_FIXED;
 
                         __disable_irq();
@@ -3984,7 +4036,7 @@ static void ControlStep10ms(void)
                             obj_rot_phase1_ms   = 0;
                         }
 
-                        float prot_gz = (float)gz / 131.0f;
+                        float prot_gz = (float)gz / 100.0f;
                         obj_rot_heading += prot_gz * DT_CTRL_FIXED;
 
                         __disable_irq();
@@ -4074,7 +4126,7 @@ static void ControlStep10ms(void)
                         uint32_t elapsed  = HAL_GetTick() - lrot_settle_start_ms;
                         float tilt_err    = fabsf(filtered_roll_deg - dynamic_setpoint_f);
                         int settled       = (elapsed >= ESETTLE_MIN_MS) &&
-                                            (fabsf(velocity_est_f) < ESETTLE_VEL_THR) &&
+                                            (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) < ESETTLE_VEL_THR) &&
                                             (tilt_err < ESETTLE_TILT_THR);
 
                         if (settled || elapsed >= ESETTLE_TIMEOUT) {
@@ -4099,8 +4151,8 @@ static void ControlStep10ms(void)
                             line_error_prev   = 0.0f;
                             line_lost_ms      = HAL_GetTick();
                             line_state        = LINE_STATE_FOLLOWING;
-                        } else if (f_fallen ||
-                                   (HAL_GetTick() - line_lost_ms) > EDGE_FWD_TIMEOUT) {
+                        } else if ((HAL_GetTick() - line_lost_ms) > EDGE_FWD_TIMEOUT) {
+                            // (ídem LOST_FWD: f_fallen acá era inalcanzable)
                             line_state = LINE_STATE_GIVEN_UP;
                         }
                         break;
@@ -4256,9 +4308,10 @@ static void ControlStep10ms(void)
                         const uint32_t PRE_ROTATE_MS  = 2000U;
                         if (obj_brake_start_ms == 0) obj_brake_start_ms = HAL_GetTick();
 
-                        // Fase 1: frenar hasta quieto o timeout
+                        // Fase 1: frenar hasta quieto o timeout (deadband: filtra el piso
+                        // de cuantización del encoder, ver BRAKE_VEL_DEADBAND)
                         if (obj_pre_rotate_ms == 0) {
-                            if (fabsf(velocity_est_f) < BRAKE_VEL_THR ||
+                            if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) < BRAKE_VEL_THR ||
                                 (HAL_GetTick() - obj_brake_start_ms) > BRAKE_TIMEOUT) {
                                 obj_pre_rotate_ms = HAL_GetTick();  // arranca fase 2
                             }
@@ -4303,7 +4356,7 @@ static void ControlStep10ms(void)
                         }
 
                         // Heading gz acumulado
-                        float obj_gz_dps = (float)gz / 131.0f;
+                        float obj_gz_dps = (float)gz / 100.0f;
                         obj_rot_heading += obj_gz_dps * DT_CTRL_FIXED;
 
                         __disable_irq();
@@ -4622,7 +4675,7 @@ static void ControlStep10ms(void)
                          line_state == LINE_STATE_OBJ_WALL_CLEAR ||
                          line_state == LINE_STATE_LOST_FWD ||
                          line_state == LINE_STATE_EDGE_FWD)) {
-                        float gz_dps_line = (float)gz / 131.0f;
+                        float gz_dps_line = (float)gz / 100.0f;
                         half_steer = gz_dps_line * 0.3f;
                     }
 
@@ -4709,7 +4762,7 @@ static void ControlStep10ms(void)
                 steering_adjustment = 0.0f;
                 line_state          = LINE_STATE_FOLLOWING;
 
-                float gz_dps = (float)gz / 131.0f;
+                float gz_dps = (float)gz / 100.0f;
                 // steer_pid_enabled=0: corrección open-loop por giroscopio Z (comportamiento original)
                 // steer_pid_enabled=1: corrección de lazo cerrado por encoders
                 float correction = steer_pid_enabled
@@ -5009,6 +5062,7 @@ int main(void)
   // Comandos ROTATE_90/180/CUSTOM desde Qt quedan sin efecto (no-op seguro en UNER.c)
   UNER_RegisterSetpointTrim(&setpoint_trim);
   UNER_RegisterRobotState(&robot_state);
+  UNER_RegisterOdometry(&odom_x_m, &odom_y_m, &odom_theta_deg);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();

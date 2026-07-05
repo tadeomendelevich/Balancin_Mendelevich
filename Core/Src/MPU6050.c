@@ -63,7 +63,7 @@ int MPU6050_Init(void)
     _platform->writeReg(_platform->ctx, MPU6050_ADDR, CONFIG_REG, &data, 1);
 
     // Sample Rate = 1 kHz / (1 + SMPLRT_DIV)
-    // 1 kHz / (1 + 4) = 200 Hz → 5 ms
+    // 1 kHz / (1 + 9) = 100 Hz → 10 ms (sincronizado con el loop de control)
     uint8_t div = 9;
     _platform->writeReg(_platform->ctx, MPU6050_ADDR, 0x19, &div, 1);
 
