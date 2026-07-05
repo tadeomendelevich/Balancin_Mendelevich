@@ -483,8 +483,8 @@ static uint8_t  key_click_count = 0;
 static float manual_setpoint_ramped = 0.0f;  // setpoint de rampa aplicada
 
 // Con el joystick en reposo, MANUAL es el banco de pruebas del giro de 180°:
-// balancea quieto MROT_WAIT_MS y gira 180° (misma lógica que LOST_ROTATE), en
-// ciclo indefinido. El joystick sigue funcionando para reposicionar entre giros.
+// balancea quieto MROT_WAIT_MS y gira 180° con EXACTAMENTE la misma lógica que
+// LOST_ROTATE, en ciclo indefinido. El joystick sigue funcionando para reposicionar.
 static uint8_t  manual_test_rot_active = 0;  // 0 = esperando entre giros, 1 = girando
 static uint32_t manual_test_wait_ms    = 0;  // inicio de la espera entre giros
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
@@ -517,14 +517,6 @@ static int32_t  obj_rot_l0           = 0;
 static uint32_t obj_rot_start_ms     = 0;
 static uint8_t  obj_rot_phase        = 0;    // 0=spin, 1=freno activo
 static float    obj_rot_heading      = 0.0f; // ángulo gz acumulado durante giro
-// Lazo de tasa de los giros (LOST_ROTATE/banco MANUAL, mutuamente excluyentes —
-// se comparten estas variables). rot_yaw_filt_dps: EMA de la tasa de giro medida
-// por gyro, para no reaccionar a cada pico de ruido de vibración de motores.
-// rot_pivot_f: potencia de pivot con slew-rate limitado, para que no salte de
-// golpe entre ciclos aunque el error del lazo lo pida — sin esto el giro se
-// sentía con "potencias distintas" a lo largo del recorrido.
-static float    rot_yaw_filt_dps     = 0.0f;
-static float    rot_pivot_f          = 0.0f;
 static uint32_t obj_rot_phase1_ms    = 0;    // inicio de fase 1
 static uint8_t  obj_rev_initialized  = 0;         // flag sesión actual de OBJ_REVERSE
 static int32_t  obj_rev_r0           = 0;
@@ -3421,8 +3413,6 @@ static void ControlStep10ms(void)
                 obj_rot_phase       = 0;
                 obj_rot_heading     = 0.0f;
                 obj_rot_phase1_ms   = 0;
-                rot_yaw_filt_dps    = 0.0f;
-                rot_pivot_f         = 0.0f;
                 obj_brake_start_ms   = 0;
                 obj_pre_rotate_ms    = 0;
                 obj_hold_start_ms    = 0;
@@ -3797,32 +3787,15 @@ static void ControlStep10ms(void)
                     {
                         // Giro 180° derecha para buscar la línea perdida.
                         // Misma lógica gz+encoder que OBJ_ROTATE y MANUAL, escalada a 180°.
-                        // 2026-07-05: mismos valores que el banco de pruebas de MANUAL
-                        // (MROT_*) — mantener sincronizados. Fase plena hasta el 85%,
-                        // slowdown 40°, pivot 16, freno 8/250ms (16/400 tumbaba al final).
                         const float  LROT_ENC_TARGET   = 880.0f;
-                        const float  LROT_PIVOT        = 16.0f;  // feedforward del lazo de tasa
-                        const float  LROT_BRAKE        = 4.0f;   // tope del freno proporcional (ver abajo)
-                        const float  LROT_BRAKE_KP     = 0.05f;  // PWM de freno por dps de giro remanente
-                        const float  LROT_SLOWDOWN_DEG = 40.0f;
+                        const float  LROT_PIVOT        = 20.0f;  // antes 14 — poco margen, se veía al probar en banco repetido
+                        const float  LROT_BRAKE        = 16.0f;  // freno fijo y corto, no de precisión
+                        const float  LROT_SLOWDOWN_DEG = 55.0f;
                         const float  LROT_ABS_TARGET   = 180.0f;
-                        // P0_MAX/P1_MAX son colchón de seguridad, no el corte normal
+                        // P0_MAX/P1_MAX son colchón de seguridad (peor caso ~2.3s), no el corte normal
                         const uint32_t LROT_P0_MAX     = 1500U;
                         const uint32_t LROT_P1_MAX     = 800U;
-                        const float  LROT_ENC_FRAC     = 0.85f;  // fase plena hasta el 85% del recorrido
-                        // Lazo cerrado de velocidad de giro — ver comentario en el banco de
-                        // pruebas de MANUAL (MROT_*), mantener valores idénticos.
-                        const float  LROT_RATE_DPS     = 260.0f;  // sincronizado con MROT (ajustado en el banco)
-                        const float  LROT_RATE_KP      = 0.10f;
-                        const float  LROT_PIVOT_MIN    = 6.0f;
-                        const float  LROT_PIVOT_MAX    = 50.0f;  // sincronizado con MROT
-                        // 2026-07-05: "potencias distintas a lo largo del giro" — el gyro Z
-                        // crudo tiene ruido de vibración de motores (mismo ruido que causaba
-                        // el tambaleo en balance) y el lazo de tasa reaccionaba a cada pico,
-                        // saltando el pivot ciclo a ciclo. Fix: EMA sobre la medición +
-                        // slew-rate sobre el pivot de salida (cuánto puede cambiar por ciclo).
-                        const float  LROT_YAW_FILT_BETA = 0.35f;
-                        const float  LROT_PIVOT_SLEW     = 3.0f;   // PWM máx de cambio por ciclo (10ms)
+                        const float  LROT_ENC_FRAC     = 0.60f;  // frena al 60% del recorrido
 
                         if (!obj_rot_initialized) {
                             __disable_irq();
@@ -3834,17 +3807,12 @@ static void ControlStep10ms(void)
                             obj_rot_phase       = 0;
                             obj_rot_heading     = 0.0f;
                             obj_rot_phase1_ms   = 0;
-                            rot_yaw_filt_dps    = 0.0f;
-                            rot_pivot_f         = LROT_PIVOT;
                         }
 
                         // El giro no sale anticipadamente al ver línea a mitad de camino (podría
                         // ser una detección espuria); siempre completa por encoder.
                         float lrot_gz = (float)gz / 100.0f;
                         obj_rot_heading += lrot_gz * DT_CTRL_FIXED;
-                        // Filtro de la tasa de giro, actualizado una vez por ciclo (continuo
-                        // entre fase 0 y 1) — ver comentario de LROT_YAW_FILT_BETA arriba.
-                        rot_yaw_filt_dps += LROT_YAW_FILT_BETA * (fabsf(lrot_gz) - rot_yaw_filt_dps);
 
                         __disable_irq();
                         int32_t lrot_dr = encoder_right - obj_rot_r0;
@@ -3852,33 +3820,32 @@ static void ControlStep10ms(void)
                         __enable_irq();
                         float lrot_counts    = (fabsf((float)lrot_dr) + fabsf((float)lrot_dl)) * 0.5f;
                         float lrot_enc_deg   = lrot_counts * (LROT_ABS_TARGET / LROT_ENC_TARGET);
-                        // 2026-07-05: el giro se guía SOLO por encoder (la fuente calibrada,
-                        // 880 counts = 180°). Antes usaba max(gyro, encoder), calibrado cuando
-                        // el gyro sub-leía 24% (bug de escala /131); con el gyro corregido el
-                        // max adelantaba el cambio a la fase débil y el giro quedaba lento y
-                        // a pulsos (gira-frena-gira). El gyro queda solo para el overshoot.
-                        float lrot_abs_hdg   = lrot_enc_deg;
+                        float lrot_abs_hdg   = fmaxf(fabsf(obj_rot_heading), lrot_enc_deg);
                         float lrot_enc_thr   = LROT_ENC_TARGET * LROT_ENC_FRAC;
 
+                        // 2026-07-05: con gz/100 (resolución nueva, 31% más alta que /131) el
+                        // gyro dentro del fmaxf hace pensar que ya se completó el 70% del giro
+                        // antes de que el encoder lo confirme físicamente — entra temprano a la
+                        // fase de terminación (mucho más débil) y el resto del giro se arrastra
+                        // lento y a pulsos. Fix mínimo: la transición de fase se decide SOLO por
+                        // encoder (la fuente que no cambió de escala); el gyro (lrot_abs_hdg)
+                        // queda únicamente para la red de seguridad de sobregiro más abajo.
                         if (obj_rot_phase == 0) {
                             uint32_t elapsed = HAL_GetTick() - obj_rot_start_ms;
-                            if (lrot_abs_hdg >= LROT_ABS_TARGET * 0.70f ||  // antes 0.80 → entraba tarde al freno
-                                lrot_counts  >= lrot_enc_thr ||
+                            if (lrot_counts  >= lrot_enc_thr ||
                                 elapsed      >= LROT_P0_MAX) {
                                 obj_rot_phase     = 1;
                                 obj_rot_phase1_ms = HAL_GetTick();
                             } else {
-                                float remaining = LROT_ABS_TARGET - lrot_abs_hdg;
+                                // Rampa de frenado interna también solo por encoder (mismo
+                                // motivo que la transición de fase, ver comentario arriba) —
+                                // con el gyro inflado, "remaining" se achicaba antes de tiempo
+                                // y bajaba el pivot (ya de por sí solo 14 PWM) durante buena
+                                // parte del giro, no solo cerca del final.
+                                float remaining = LROT_ABS_TARGET - lrot_enc_deg;
                                 float slowdown  = (remaining < LROT_SLOWDOWN_DEG)
                                                 ? (remaining / LROT_SLOWDOWN_DEG) : 1.0f;
-                                float lrot_rate_tgt = LROT_RATE_DPS * fmaxf(slowdown, 0.25f);
-                                float pivot_target = clampf_local(
-                                    LROT_PIVOT + LROT_RATE_KP * (lrot_rate_tgt - rot_yaw_filt_dps),
-                                    LROT_PIVOT_MIN, LROT_PIVOT_MAX);
-                                float pivot_delta = clampf_local(
-                                    pivot_target - rot_pivot_f, -LROT_PIVOT_SLEW, LROT_PIVOT_SLEW);
-                                rot_pivot_f += pivot_delta;
-                                float pivot = rot_pivot_f;
+                                float pivot = LROT_PIVOT * fmaxf(slowdown, 0.0f);
                                 line_pivot_active  = 1;
                                 motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
@@ -3888,13 +3855,11 @@ static void ControlStep10ms(void)
                         if (obj_rot_phase == 1) {
                             uint32_t p1e      = HAL_GetTick() - obj_rot_phase1_ms;
                             int enc_done      = (lrot_counts >= LROT_ENC_TARGET);
-                            int overshoot     = (fabsf(obj_rot_heading) > LROT_ABS_TARGET * 1.2f);
-                            const uint32_t LROT_BRAKE_DURATION = 250U;  // colchón, ver yaw_settled abajo
-                            // 2026-07-05: salida temprana si el giro ya frenó solo (con el
-                            // lazo de tasa llega casi detenido) — sin esto el freno fijo de
-                            // 250ms desestabilizaba el balance al final (ver LROT_BRAKE_KP).
-                            uint8_t lrot_yaw_settled = (rot_yaw_filt_dps < 20.0f);
-                            if ((enc_done && (p1e >= LROT_BRAKE_DURATION || lrot_yaw_settled)) || p1e >= LROT_P1_MAX || overshoot) {
+                            int overshoot     = (lrot_abs_hdg > LROT_ABS_TARGET * 1.2f);
+                            // Freno fuerte a torque fijo por tiempo corto y acotado, sin
+                            // buscar una velocidad de frenado exacta.
+                            const uint32_t LROT_BRAKE_DURATION = 400U;
+                            if ((enc_done && p1e >= LROT_BRAKE_DURATION) || p1e >= LROT_P1_MAX || overshoot) {
                                 // Bypass de LOST_SETTLE: arranca a avanzar sin esperar. Si ya
                                 // quedó sobre la línea, directo a FOLLOWING.
                                 if (line_detected) {
@@ -3913,28 +3878,19 @@ static void ControlStep10ms(void)
                                 obj_rot_heading     = 0.0f;
                                 steering_adjustment = 0.0f;
                             } else if (!enc_done) {
-                                // Terminación con el mismo lazo de tasa (filtrado + slew),
-                                // target reducido (40%)
-                                float pivot_target = clampf_local(
-                                    LROT_PIVOT * 0.5f + LROT_RATE_KP * (LROT_RATE_DPS * 0.4f - rot_yaw_filt_dps),
-                                    4.0f, LROT_PIVOT_MAX * 0.7f);
-                                float pivot_delta = clampf_local(
-                                    pivot_target - rot_pivot_f, -LROT_PIVOT_SLEW, LROT_PIVOT_SLEW);
-                                rot_pivot_f += pivot_delta;
-                                float pivot = rot_pivot_f;
+                                // Encoder aún no llegó al target: seguir pivoteando suave
+                                float remaining = LROT_ENC_TARGET - lrot_counts;
+                                float ramp = fminf(remaining / (LROT_ENC_TARGET * 0.15f), 1.0f);
+                                float pivot = LROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
                                 line_pivot_active  = 1;
                                 motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
                             } else {
-                                // Freno PROPORCIONAL a la velocidad de giro remanente (no
-                                // torque fijo): a full giro frena hasta LROT_BRAKE, a giro
-                                // casi detenido no frena nada — autolimitado, no puede
-                                // invertir el sentido de giro ni desestabilizar el balance.
-                                float lrot_brake_pivot = clampf_local(
-                                    LROT_BRAKE_KP * rot_yaw_filt_dps, 0.0f, LROT_BRAKE);
+                                // Encoder OK: freno fuerte a torque fijo (sin escalar), 400ms
+                                // como mucho (ver LROT_BRAKE_DURATION arriba).
                                 line_pivot_active  = 1;
-                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - lrot_brake_pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + lrot_brake_pivot), -60.0f, 60.0f);
+                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - LROT_BRAKE), -60.0f, 60.0f);
+                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + LROT_BRAKE), -60.0f, 60.0f);
                             }
                         }
                         break;
@@ -4115,9 +4071,7 @@ static void ControlStep10ms(void)
                         __enable_irq();
                         float erot_counts  = (fabsf((float)erot_dr) + fabsf((float)erot_dl)) * 0.5f;
                         float erot_enc_deg = erot_counts * (EROT_ABS_TARGET / EROT_ENC_TARGET);
-                        // Solo encoder (ver comentario en LOST_ROTATE 2026-07-05); gyro
-                        // queda para el overshoot.
-                        float erot_abs_hdg = erot_enc_deg;
+                        float erot_abs_hdg = fmaxf(fabsf(obj_rot_heading), erot_enc_deg);
                         float erot_enc_thr = EROT_ENC_TARGET * EROT_ENC_FRAC;
 
                         if (obj_rot_phase == 0) {
@@ -4141,7 +4095,7 @@ static void ControlStep10ms(void)
                         if (obj_rot_phase == 1) {
                             uint32_t p1e  = HAL_GetTick() - obj_rot_phase1_ms;
                             int enc_done  = (erot_counts >= EROT_ENC_TARGET);
-                            int overshoot = (fabsf(obj_rot_heading) > EROT_ABS_TARGET * 1.2f);
+                            int overshoot = (erot_abs_hdg > EROT_ABS_TARGET * 1.2f);
                             // Ver comentario equivalente en LOST_ROTATE (2026-07-01): freno
                             // fuerte a torque fijo por un tiempo corto y acotado, sin buscar
                             // una velocidad "exacta".
@@ -4166,10 +4120,9 @@ static void ControlStep10ms(void)
                                 obj_rot_heading     = 0.0f;
                                 steering_adjustment = 0.0f;
                             } else if (!enc_done) {
-                                // Potencia de terminación firme (ver LOST_ROTATE 2026-07-05)
                                 float remaining = EROT_ENC_TARGET - erot_counts;
                                 float ramp = fminf(remaining / (EROT_ENC_TARGET * 0.15f), 1.0f);
-                                float pivot = EROT_DIR * EROT_PIVOT * 0.7f * fmaxf(ramp, 0.5f);
+                                float pivot = EROT_DIR * EROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
                                 line_pivot_active  = 1;
                                 motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
@@ -4228,8 +4181,7 @@ static void ControlStep10ms(void)
                         __enable_irq();
                         float prot_counts  = (fabsf((float)prot_dr) + fabsf((float)prot_dl)) * 0.5f;
                         float prot_enc_deg = prot_counts * (PROT_ABS_TARGET / PROT_ENC_TARGET);
-                        // Solo encoder (ver comentario en LOST_ROTATE 2026-07-05)
-                        float prot_abs_hdg = prot_enc_deg;
+                        float prot_abs_hdg = fmaxf(fabsf(obj_rot_heading), prot_enc_deg);
                         float prot_enc_thr = PROT_ENC_TARGET * PROT_ENC_FRAC;
 
                         if (obj_rot_phase == 0) {
@@ -4253,7 +4205,7 @@ static void ControlStep10ms(void)
                         if (obj_rot_phase == 1) {
                             uint32_t p1e      = HAL_GetTick() - obj_rot_phase1_ms;
                             int enc_done      = (prot_counts >= PROT_ENC_TARGET);
-                            int overshoot     = (fabsf(obj_rot_heading) > PROT_ABS_TARGET * 1.2f);
+                            int overshoot     = (prot_abs_hdg > PROT_ABS_TARGET * 1.2f);
                             if ((enc_done && p1e >= PROT_BRAKE_DURATION) || p1e >= PROT_P1_MAX || overshoot) {
                                 line_state          = LINE_STATE_FOLLOWING;
                                 line_seen_since_entry = 1;
@@ -4269,10 +4221,9 @@ static void ControlStep10ms(void)
                                 // otro PERP_ROTATE en el ciclo siguiente -> giro en círculos.
                                 all_black_start_ms  = 0;
                             } else if (!enc_done) {
-                                // Potencia de terminación firme (ver LOST_ROTATE 2026-07-05)
                                 float remaining = PROT_ENC_TARGET - prot_counts;
                                 float ramp = fminf(remaining / (PROT_ENC_TARGET * 0.15f), 1.0f);
-                                float pivot = PROT_DIR * PROT_PIVOT * 0.7f * fmaxf(ramp, 0.5f);
+                                float pivot = PROT_DIR * PROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
                                 line_pivot_active  = 1;
                                 motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
@@ -4894,36 +4845,16 @@ static void ControlStep10ms(void)
                     // quieto y ejecuta un giro de 180° con EXACTAMENTE la misma lógica y
                     // constantes que LOST_ROTATE — lo que se calibre acá vale directo para
                     // el giro real del seguidor de línea. Ciclo indefinido.
-                    // 2026-07-05: giro "muy lento y siempre se cae al final" → fase plena
-                    // hasta el 85% (antes 60%: el 40% del giro lo hacía la fase débil),
-                    // slowdown más corto (40°), más pivot (16), y freno a la mitad
-                    // (8 PWM / 250ms — 16/400ms rebotaba el giro y lo tumbaba).
                     const float    MROT_ENC_TARGET   = 880.0f;
-                    const float    MROT_PIVOT        = 16.0f;   // feedforward del lazo de tasa
-                    const float    MROT_BRAKE        = 4.0f;    // tope del freno proporcional (ver abajo)
-                    const float    MROT_BRAKE_KP     = 0.05f;   // PWM de freno por dps de giro remanente
-                    const float    MROT_SLOWDOWN_DEG = 40.0f;
+                    const float    MROT_PIVOT        = 20.0f;  // antes 14, sincronizado con LOST_ROTATE
+                    const float    MROT_BRAKE        = 16.0f;
+                    const float    MROT_SLOWDOWN_DEG = 55.0f;
                     const float    MROT_ABS_TARGET   = 180.0f;
                     const uint32_t MROT_P0_MAX       = 1500U;
                     const uint32_t MROT_P1_MAX       = 800U;
-                    const float    MROT_ENC_FRAC     = 0.85f;
-                    const uint32_t MROT_BRAKE_DURATION = 250U;
-                    const uint32_t MROT_WAIT_MS      = 2000U;
-                    // Lazo cerrado de velocidad de giro (2026-07-05): el pivot fijo daba
-                    // giros inconsistentes (unos a plena potencia, otros casi sin girar)
-                    // porque pelea a lazo abierto contra la fricción estática y contra el
-                    // pwm_sat del balance (que puede dejar una rueda con comando ~0). Ahora
-                    // pivot = feedforward + P sobre el error de tasa de yaw medida por gyro:
-                    // si gira lento sube solo, si se embala baja solo.
-                    const float    MROT_RATE_DPS     = 260.0f;  // velocidad de giro objetivo
-                    const float    MROT_RATE_KP      = 0.10f;   // PWM extra por dps de error
-                    const float    MROT_PIVOT_MIN    = 6.0f;
-                    const float    MROT_PIVOT_MAX    = 50.0f;
-                    // "Potencias distintas a lo largo del giro" — ver comentario en
-                    // LOST_ROTATE (LROT_YAW_FILT_BETA/PIVOT_SLEW): filtro EMA sobre el gyro
-                    // + slew-rate sobre el pivot para no reaccionar a cada pico de ruido.
-                    const float    MROT_YAW_FILT_BETA = 0.35f;
-                    const float    MROT_PIVOT_SLEW    = 3.0f;   // PWM máx de cambio por ciclo
+                    const float    MROT_ENC_FRAC     = 0.60f;
+                    const uint32_t MROT_BRAKE_DURATION = 400U;
+                    const uint32_t MROT_WAIT_MS      = 3000U;
 
                     steering_adjustment = 0.0f;
 
@@ -4949,13 +4880,10 @@ static void ControlStep10ms(void)
                             obj_rot_phase       = 0;
                             obj_rot_heading     = 0.0f;
                             obj_rot_phase1_ms   = 0;
-                            rot_yaw_filt_dps    = 0.0f;
-                            rot_pivot_f         = MROT_PIVOT;
                         }
 
                         float mrot_gz = (float)gz / 100.0f;
                         obj_rot_heading += mrot_gz * DT_CTRL_FIXED;
-                        rot_yaw_filt_dps += MROT_YAW_FILT_BETA * (fabsf(mrot_gz) - rot_yaw_filt_dps);
 
                         __disable_irq();
                         int32_t mrot_dr = encoder_right - obj_rot_r0;
@@ -4963,30 +4891,23 @@ static void ControlStep10ms(void)
                         __enable_irq();
                         float mrot_counts  = (fabsf((float)mrot_dr) + fabsf((float)mrot_dl)) * 0.5f;
                         float mrot_enc_deg = mrot_counts * (MROT_ABS_TARGET / MROT_ENC_TARGET);
-                        float mrot_abs_hdg = mrot_enc_deg;  // solo encoder, como LOST_ROTATE
+                        float mrot_abs_hdg = fmaxf(fabsf(obj_rot_heading), mrot_enc_deg);
                         float mrot_enc_thr = MROT_ENC_TARGET * MROT_ENC_FRAC;
 
+                        // Transición de fase solo por encoder (ver comentario en LOST_ROTATE);
+                        // mrot_abs_hdg (con gyro) queda solo para el overshoot de abajo.
                         if (obj_rot_phase == 0) {
                             uint32_t elapsed = HAL_GetTick() - obj_rot_start_ms;
-                            if (mrot_abs_hdg >= MROT_ABS_TARGET * 0.70f ||
-                                mrot_counts  >= mrot_enc_thr ||
+                            if (mrot_counts  >= mrot_enc_thr ||
                                 elapsed      >= MROT_P0_MAX) {
                                 obj_rot_phase     = 1;
                                 obj_rot_phase1_ms = HAL_GetTick();
                             } else {
-                                float remaining = MROT_ABS_TARGET - mrot_abs_hdg;
+                                // Rampa solo por encoder (ver comentario en LOST_ROTATE)
+                                float remaining = MROT_ABS_TARGET - mrot_enc_deg;
                                 float slowdown  = (remaining < MROT_SLOWDOWN_DEG)
                                                 ? (remaining / MROT_SLOWDOWN_DEG) : 1.0f;
-                                // Lazo cerrado: el slowdown reduce el TARGET de tasa, no la
-                                // potencia directa (piso 25% para no morir llegando al final)
-                                float rate_target = MROT_RATE_DPS * fmaxf(slowdown, 0.25f);
-                                float pivot_target = clampf_local(
-                                    MROT_PIVOT + MROT_RATE_KP * (rate_target - rot_yaw_filt_dps),
-                                    MROT_PIVOT_MIN, MROT_PIVOT_MAX);
-                                float pivot_delta = clampf_local(
-                                    pivot_target - rot_pivot_f, -MROT_PIVOT_SLEW, MROT_PIVOT_SLEW);
-                                rot_pivot_f += pivot_delta;
-                                float pivot = rot_pivot_f;
+                                float pivot = MROT_PIVOT * fmaxf(slowdown, 0.0f);
                                 motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
                             }
@@ -4995,12 +4916,9 @@ static void ControlStep10ms(void)
                         if (obj_rot_phase == 1) {
                             uint32_t p1e  = HAL_GetTick() - obj_rot_phase1_ms;
                             int enc_done  = (mrot_counts >= MROT_ENC_TARGET);
-                            int overshoot = (fabsf(obj_rot_heading) > MROT_ABS_TARGET * 1.2f);
-                            // Salida temprana si ya frenó solo (ver freno proporcional abajo):
-                            // sin esto, el freno fijo desestabilizaba el balance al terminar.
-                            uint8_t mrot_yaw_settled = (rot_yaw_filt_dps < 20.0f);
-                            if ((enc_done && (p1e >= MROT_BRAKE_DURATION || mrot_yaw_settled)) || p1e >= MROT_P1_MAX || overshoot) {
-                                // Giro terminado: volver a la espera de 2s
+                            int overshoot = (mrot_abs_hdg > MROT_ABS_TARGET * 1.2f);
+                            if ((enc_done && p1e >= MROT_BRAKE_DURATION) || p1e >= MROT_P1_MAX || overshoot) {
+                                // Giro terminado: volver a la espera
                                 manual_test_rot_active = 0;
                                 manual_test_wait_ms    = HAL_GetTick();
                                 obj_rot_initialized    = 0;
@@ -5009,25 +4927,14 @@ static void ControlStep10ms(void)
                                 motorRightVelocity = (int16_t)clampf_local(-pwm_sat, -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-pwm_sat, -60.0f, 60.0f);
                             } else if (!enc_done) {
-                                // Terminación con el mismo lazo de tasa (filtrado + slew),
-                                // target reducido (40%)
-                                float pivot_target = clampf_local(
-                                    MROT_PIVOT * 0.5f + MROT_RATE_KP * (MROT_RATE_DPS * 0.4f - rot_yaw_filt_dps),
-                                    4.0f, MROT_PIVOT_MAX * 0.7f);
-                                float pivot_delta = clampf_local(
-                                    pivot_target - rot_pivot_f, -MROT_PIVOT_SLEW, MROT_PIVOT_SLEW);
-                                rot_pivot_f += pivot_delta;
-                                float pivot = rot_pivot_f;
+                                float remaining = MROT_ENC_TARGET - mrot_counts;
+                                float ramp = fminf(remaining / (MROT_ENC_TARGET * 0.15f), 1.0f);
+                                float pivot = MROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
                                 motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
                             } else {
-                                // Freno proporcional a la velocidad de giro remanente (ver
-                                // comentario equivalente en LOST_ROTATE) — autolimitado, no
-                                // puede invertir el sentido de giro ni tirar el balance.
-                                float mrot_brake_pivot = clampf_local(
-                                    MROT_BRAKE_KP * rot_yaw_filt_dps, 0.0f, MROT_BRAKE);
-                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - mrot_brake_pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + mrot_brake_pivot), -60.0f, 60.0f);
+                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - MROT_BRAKE), -60.0f, 60.0f);
+                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + MROT_BRAKE), -60.0f, 60.0f);
                             }
                         }
                     }
