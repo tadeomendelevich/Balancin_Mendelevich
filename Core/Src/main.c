@@ -172,11 +172,13 @@ typedef enum {
 #define BRAKE_TILT_STEP_BAL     0.5f
 #define BRAKE_TILT_STEP_MAN     0.5f
 // Multiplicador extra sobre ComputeBrakeSetpointTarget, solo para LOST_BRAKE/
-// EDGE_WAIT (el frenado justo al perder la línea del todo). No se sube el
-// freno estándar de balance en general porque reintroduciría la oscilación
-// en balance común ya corregida. 2026-07-01, a pedido del usuario para no
-// alejarse tanto de la línea antes de arrancar a buscarla.
-#define LOST_BRAKE_BOOST        1.6f
+// EDGE_WAIT (el frenado justo al perder la línea del todo). Historia: se subió
+// a 1.6 (2026-07-01) cuando el freno arrancaba 1s tarde, con el robot ya
+// desacelerado solo. 2026-07-05: al adelantar el disparo de pérdida a 300ms,
+// el freno ahora entra a velocidad de crucero plena y con 1.6 el tirón hacia
+// atrás VOLCABA el robot — vuelto a 1.0 (freno estándar de balance, estable a
+// velocidad). Si frena corto, subir de a 0.1, no volver a 1.6.
+#define LOST_BRAKE_BOOST        1.0f
 #define INTEGRAL_DECAY   		0.990f
 
 // Steering PID (lazo cerrado por encoders)
@@ -190,14 +192,31 @@ typedef enum {
 #define LINE_VEL_KP_BRAKE   	3.0f   // ganancia proporcional cuando va sobrevelocidad (frenando) — 2026-07-01
 #define LINE_VEL_KI             1.2f   // ganancia integral vel PI
 #define LINE_VEL_I_MAX          2.5f   // anti-windup vel PI
-// Avance post-giro (LOST_FWD / EDGE_FWD): PI de velocidad, avance cauteloso "a ciegas".
-#define LOST_FWD_SPEED_TARGET   0.18f  // m/s, avance cauteloso "a ciegas"
+// Avance post-giro (LOST_FWD / EDGE_FWD): PI de velocidad.
+// 2026-07-04: con TARGET=0.18 y ANGLE_MAX=1.0° (valores del avance "a ciegas",
+// bajados cuando se aceleraba demasiado) el robot quedaba totalmente detenido en
+// el retorno por odometría: 1° de techo, atenuado por la soft-zone del PID, no
+// vence la fricción estática. Ahora que LOST_FWD navega a un punto conocido, se
+// puede avanzar con más decisión.
+#define LOST_FWD_SPEED_TARGET   0.40f  // m/s (0.18 no arrancaba desde parado)
 #define LOST_FWD_KP             4.0f   // ganancia P acelerando
 #define LOST_FWD_KP_BRAKE       14.0f  // ganancia P frenando (sobrevelocidad)
 #define LOST_FWD_KI             1.0f   // ganancia I para sostener la velocidad de crucero
 #define LOST_FWD_VEL_I_MAX      1.0f   // anti-windup del integral de velocidad
-#define LOST_FWD_ANGLE_MAX      1.0f   // ángulo máximo de avance (°, antes 2.0)
+#define LOST_FWD_ANGLE_MAX      2.5f   // ángulo máximo de avance (°; 1.0 no movía el robot)
 #define LOST_FWD_BRAKE_MAX      2.0f   // ángulo máximo de freno activo (°, se aplica en negativo)
+// Retorno por odometría al punto de pérdida de línea (solo camino "centrado", LOST_FWD):
+// después del giro de 180°, en vez de avanzar a ciegas, navega hacia la pose (x,y)
+// donde se vio la línea por última vez. Steering P sobre el error de rumbo
+// (bearing al objetivo - theta odométrico). Si el robot curva ALEJÁNDOSE del punto,
+// primero verificar ODOM_THETA_SIGN (test del giro de 90°); si theta está bien y aun
+// así corrige al revés, invertir el signo de LOST_RETURN_STEER_KP.
+// Nota de escala: el formato compartido de motores aplica half_steer = steering*0.5,
+// así que el efecto real por rueda es la MITAD de estos valores. Con KP=0.6/MAX=12
+// (valores iniciales) el usuario reportó que "casi no corrige" — subidos 2026-07-05.
+#define LOST_RETURN_STEER_KP    1.5f   // PWM de steering por grado de error de rumbo
+#define LOST_RETURN_STEER_MAX  20.0f   // clamp del steering de navegación
+#define LOST_RETURN_REACHED_M   0.10f  // distancia al punto para considerarlo alcanzado
 #define LINE_ENC_CORR_KP        8.5f   // ganancia P: grados por (m/s de deficit) normalizado
 #define LINE_ENC_CORR_MAX       4.0f   // angulo extra maximo por deficit de velocidad (grados)
 #define LINE_REV_BOOST_MAX      1.4f   // extra de inclinacion si los encoders muestran reversa
@@ -482,6 +501,7 @@ static uint8_t balance_hold_active = 0;
 static uint32_t obj_detect_ignore_until_ms = 0;  // ignora sensores de objeto hasta este tick
 static uint8_t  prev_all_line_black        = 1;  // todos los sensores de línea en negro (robot en el aire)
 static uint32_t all_black_start_ms         = 0;  // tick en que empezaron a verse todos negros
+static uint32_t last_partial_line_ms       = 0;  // último ciclo con línea detectada SIN los 4 en negro (vista "parcial" real, imposible en el aire)
 static uint32_t accel_settled_start_ms     = 0;  // tick desde que el acelerómetro dejó de moverse (0 = todavía moviéndose)
 static uint8_t  f_in_air                   = 0;  // 1 = robot en el aire >2s → motores detenidos
 static float    accel_motion_f             = 0.0f;  // variación reciente del acelerómetro (EMA), para distinguir "en la mano" de "quieto sobre blanco"
@@ -547,6 +567,11 @@ volatile int32_t encoder_left  = 0;
 static float odom_x_m       = 0.0f;
 static float odom_y_m       = 0.0f;
 static float odom_theta_deg = 0.0f;
+// Pose del último punto donde se vio la línea (para el retorno por odometría en
+// LOST_FWD). Se actualiza cada ciclo con línea detectada en FOLLOWING.
+static float   line_loss_x_m       = 0.0f;
+static float   line_loss_y_m       = 0.0f;
+static uint8_t line_loss_pose_valid = 0;
 
 uint8_t steer_pid_enabled    = 0;     // 0 = open-loop (gyro Z), 1 = lazo cerrado encoders
 static float steer_pid_integral   = 0.0f;
@@ -1790,7 +1815,7 @@ void updateDisplay(void) {
                     case LINE_STATE_LOST_BRAKE:           line_mode_str = "FRENA";  break;
                     case LINE_STATE_LOST_ROTATE:          line_mode_str = "GIRO";   break;
                     case LINE_STATE_LOST_SETTLE:          line_mode_str = "ESTAB";  break;
-                    case LINE_STATE_LOST_FWD:             line_mode_str = "AVNZA";  break;
+                    case LINE_STATE_LOST_FWD:             line_mode_str = "VUELVE"; break;
                     case LINE_STATE_EDGE_WAIT:             line_mode_str = "EFRENA"; break;
                     case LINE_STATE_EDGE_ROTATE:           line_mode_str = "EGIRO";  break;
                     case LINE_STATE_EDGE_SETTLE:           line_mode_str = "EESTAB"; break;
@@ -2593,10 +2618,21 @@ static void ControlStep10ms(void)
                 // además un mínimo de quietud continua del acelerómetro antes de habilitar
                 // el disparo de cruce perpendicular.
                 const uint32_t ACCEL_SETTLE_MS = 400U;
+                // Guardas anti "giro fantasma al apoyar el robot" (2026-07-05): un cruce
+                // perpendicular REAL ocurre mientras se sigue la línea — los 4 sensores
+                // pasan de "línea parcial" (línea + blanco a los costados) a todo negro
+                // en un instante, y el todo-negro dura poco. Viniendo del aire, en cambio,
+                // los 4 sensores llevan MUCHO tiempo en negro y nunca hubo vista parcial
+                // (en el aire all_black implica line_detected, así que el timer de línea
+                // no discrimina — esta variable sí).
+                const uint32_t PERP_MAX_ELAPSED_MS  = 800U;  // todo-negro más viejo que esto NO es un cruce
+                const uint32_t PERP_PARTIAL_WIN_MS  = 400U;  // el todo-negro debe empezar a menos de esto de la última vista parcial
                 uint8_t all_black = (adcAvg[0] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[1] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[2] > (uint16_t)LINE_THRESHOLD &&
                                      adcAvg[3] > (uint16_t)LINE_THRESHOLD);
+                if (line_detected && !all_black)
+                    last_partial_line_ms = HAL_GetTick();
                 uint8_t accel_moving = (accel_motion_f > ACCEL_MOTION_THRESHOLD);
                 if (accel_moving) {
                     accel_settled_start_ms = 0;
@@ -2614,7 +2650,10 @@ static void ControlStep10ms(void)
                         f_in_air = 0;
                         if (line_state == LINE_STATE_FOLLOWING &&
                             accel_settled &&
-                            all_black_elapsed > PERP_DEBOUNCE_MS) {
+                            all_black_elapsed > PERP_DEBOUNCE_MS &&
+                            all_black_elapsed < PERP_MAX_ELAPSED_MS &&
+                            last_partial_line_ms != 0 &&
+                            (all_black_start_ms - last_partial_line_ms) < PERP_PARTIAL_WIN_MS) {
                             line_state          = LINE_STATE_PERP_ROTATE;
                             obj_rot_initialized = 0;
                             obj_rot_phase       = 0;
@@ -2762,9 +2801,11 @@ static void ControlStep10ms(void)
             obj_pre_rev_start_ms = 0;
             lost_fwd_vel_integral = 0.0f;
             all_black_start_ms  = 0;
+            last_partial_line_ms = 0;
             odom_x_m            = 0.0f;   // odometría: origen = punto de entrada al modo
             odom_y_m            = 0.0f;
             odom_theta_deg      = 0.0f;
+            line_loss_pose_valid = 0;     // snapshot viejo queda en el marco anterior
         }
 
         if (robot_state != ROBOT_STATE_LINE_FOLLOWING && prev_robot_state == ROBOT_STATE_LINE_FOLLOWING) {
@@ -3575,6 +3616,12 @@ static void ControlStep10ms(void)
                             line_seen_since_entry = 1;
                             line_lost_ms = HAL_GetTick();
 
+                            // Snapshot de pose para el retorno por odometría: si más
+                            // adelante se pierde la línea, este es el punto al que volver.
+                            line_loss_x_m        = odom_x_m;
+                            line_loss_y_m        = odom_y_m;
+                            line_loss_pose_valid = 1;
+
                             float p_line = KP_LINE * line_error;
 
                             if (!late_cycle) {
@@ -3622,7 +3669,10 @@ static void ControlStep10ms(void)
                             // Sin línea: conservar steering_adjustment (último valor conocido)
                             // para que el robot siga corrigiendo hacia la línea.
 
-                            if (ms_sin_linea > 1000) {
+                            // 300ms (antes 1000): frenar apenas se confirma la pérdida para
+                            // no alejarse tanto del punto — a 1 m/s son ~70cm menos de
+                            // recorrido. Suficiente para filtrar parpadeos de sensor.
+                            if (ms_sin_linea > 300) {
                                 line_search_dir      = last_line_dir;
                                 line_integral        = 0.0f;
                                 steering_adjustment  = 0.0f;
@@ -3844,21 +3894,50 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_LOST_FWD:
                     {
-                        // Post-180°: avanza con velocidad controlada hasta encontrar la línea.
-                        // 5s sin encontrarla (antes 3s) → reposo total (GIVEN_UP), no reintenta
-                        // la búsqueda. Más tiempo para darle chance de reencontrar la línea.
-                        const uint32_t LOST_FWD_TIMEOUT = 5000U;
-                        steering_adjustment = 0.0f;
+                        // Post-180°: RETORNO POR ODOMETRÍA — en vez de avanzar a ciegas,
+                        // navega hacia la pose donde se vio la línea por última vez
+                        // (line_loss_x/y_m): steering P sobre el error de rumbo entre el
+                        // bearing al objetivo y theta odométrico. La velocidad la sigue
+                        // regulando el PI del bloque de setpoints (LOST_FWD_*).
+                        // Salidas: línea detectada → FOLLOWING; punto alcanzado sin línea
+                        // → GIVEN_UP; timeout como colchón de seguridad (10s, subido de
+                        // 5s a pedido del usuario para dar más tiempo de búsqueda).
+                        const uint32_t LOST_FWD_TIMEOUT = 10000U;
                         if (line_detected) {
                             line_seen_since_entry = 1;
                             line_integral     = 0.0f;
                             line_error_prev   = 0.0f;
                             line_lost_ms      = HAL_GetTick();
                             line_state        = LINE_STATE_FOLLOWING;
+                            steering_adjustment = 0.0f;
                         } else if ((HAL_GetTick() - line_lost_ms) > LOST_FWD_TIMEOUT) {
-                            // (el chequeo de f_fallen acá era código muerto: todo este switch
-                            // corre dentro de if(!f_fallen))
                             line_state = LINE_STATE_GIVEN_UP;
+                            steering_adjustment = 0.0f;
+                        } else if (line_loss_pose_valid) {
+                            float ret_dx   = line_loss_x_m - odom_x_m;
+                            float ret_dy   = line_loss_y_m - odom_y_m;
+                            float ret_dist = sqrtf(ret_dx * ret_dx + ret_dy * ret_dy);
+                            if (ret_dist < LOST_RETURN_REACHED_M) {
+                                // Llegó al punto de pérdida y la línea no está: reposo
+                                // (GIVEN_UP retoma solo si la línea vuelve a aparecer).
+                                line_state = LINE_STATE_GIVEN_UP;
+                                steering_adjustment = 0.0f;
+                            } else {
+                                float ret_bearing = atan2f(ret_dy, ret_dx) * (180.0f / M_PI);
+                                float ret_herr    = ret_bearing - odom_theta_deg;
+                                if      (ret_herr >  180.0f) ret_herr -= 360.0f;
+                                else if (ret_herr < -180.0f) ret_herr += 360.0f;
+                                // Signo: steering positivo genera gz negativo (misma
+                                // convención que el amortiguador gz*0.3), y theta integra
+                                // ODOM_THETA_SIGN*gz — de ahí el -ODOM_THETA_SIGN.
+                                steering_adjustment = clampf_local(
+                                    -ODOM_THETA_SIGN * LOST_RETURN_STEER_KP * ret_herr,
+                                    -LOST_RETURN_STEER_MAX, LOST_RETURN_STEER_MAX);
+                            }
+                        } else {
+                            // Sin snapshot válido (recién entrado al modo): avance recto
+                            // con el comportamiento anterior (yaw-assist por gyro).
+                            steering_adjustment = 0.0f;
                         }
                         break;
                     }
