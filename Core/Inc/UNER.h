@@ -136,6 +136,7 @@ typedef enum{
     ROTATE_CUSTOM    = 0xD9,   // payload: float 4 bytes (°, + = derecha, − = izquierda)
     GET_ODOMETRY     = 0xDA,   // respuesta: 3 floats little-endian = x[m], y[m], theta[°]
     RESET_ODOMETRY   = 0xDB,   // pone la pose en (0,0,0°); responde ACK
+    CMD_WIFI_ODOM_DATA = 0xDC, // push periódico (no pedido) de WifiOdomData_t, ver struct
 	ACK = 0x0D,
     UNKNOWN = 0xFF
 }_eCmd;
@@ -181,6 +182,21 @@ typedef struct __attribute__((packed)) {
     uint16_t adc3;
     uint16_t adc4;
 } WifiLogData_t;
+
+// Push periódico y liviano (2 Hz por defecto) de pose + posición de línea, para
+// graficar mapa XY y franja de línea en Qt sin depender de ACTIVATE_WIFI_LOG.
+// Se envía solo mientras hay conexión WiFi activa (ver f_wifi_connected en main.c).
+typedef struct __attribute__((packed)) {
+    uint16_t seq;              // incremental, uno por envío — para medir pérdida de paquetes en Qt
+    uint32_t t_ms;
+    float    x_m;             // odometría: X [m]
+    float    y_m;              // odometría: Y [m]
+    float    theta_deg;        // odometría: rumbo [-180..180]°
+    float    line_error;       // posición del centroide de línea (0=centrado), 0 si no detectada
+    uint8_t  line_detected;    // 1 si en este ciclo se vio la línea
+    uint8_t  robot_state;      // eRobotState
+    uint8_t  line_state;       // eLineState (solo válido si robot_state==LINE_FOLLOWING)
+} WifiOdomData_t;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr);
 
@@ -245,6 +261,8 @@ void UNER_RegisterRobotState(uint8_t *robotStatePtr);
 void UNER_SendLogData(LogData_t *data);
 
 void UNER_SendWifiLogData(WifiLogData_t *data);
+
+void UNER_SendWifiOdomData(WifiOdomData_t *data);
 
 void UNER_SendData(void);
 

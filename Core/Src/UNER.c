@@ -674,7 +674,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
         case MOVE_FORWARD:
             if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = 4.0f; // degree forward
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = 1.0f; // m/s deseados hacia adelante (ver MANUAL_SPEED_MAX en main.c)
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
                 last_manual_cmd = MOVE_FORWARD;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
@@ -686,7 +686,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
         case MOVE_BACKWARD:
             if (p_robot_state != NULL && *p_robot_state == 4) {
-                if (p_manual_sp_cmd) *p_manual_sp_cmd = -4.0f; // degree backward
+                if (p_manual_sp_cmd) *p_manual_sp_cmd = -1.0f; // m/s deseados hacia atrás
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
                 last_manual_cmd = MOVE_BACKWARD;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
@@ -1120,6 +1120,25 @@ void UNER_SendWifiLogData(WifiLogData_t *data) {
     uint8_t payloadLen = sizeof(WifiLogData_t);
 
     putHeaderOnTx(unerTx, CMD_WIFI_LOG_DATA, payloadLen + 1);
+
+    uint8_t *p = (uint8_t*)data;
+    for (uint8_t i = 0; i < payloadLen; i++) {
+        putByteOnTx(unerTx, p[i]);
+    }
+
+    putByteOnTx(unerTx, unerTx->chk);
+
+    UNER_SendData();
+}
+
+void UNER_SendWifiOdomData(WifiOdomData_t *data) {
+    if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending()) {
+        return;
+    }
+
+    uint8_t payloadLen = sizeof(WifiOdomData_t);
+
+    putHeaderOnTx(unerTx, CMD_WIFI_ODOM_DATA, payloadLen + 1);
 
     uint8_t *p = (uint8_t*)data;
     for (uint8_t i = 0; i < payloadLen; i++) {
