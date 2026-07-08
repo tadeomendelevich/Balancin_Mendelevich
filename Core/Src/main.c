@@ -294,21 +294,21 @@ typedef enum {
 #define OBJ_WALL_ADC_HYST          160.0f    // histéresis de umbrales visible/cerca/reversa
 #define OBJ_WALL_ADC_DEBOUNCE_CNT  4         // ciclos consecutivos (40 ms) para aceptar un cruce
 #define OBJ_WALL_ADC_TARGET        2850.0f   // distancia lateral deseada: menor=cerca, mayor=lejos
-#define OBJ_WALL_PROP_KP           0.010f    // PWM de steering por cuenta ADC de error lateral
-#define OBJ_WALL_PROP_STEER_MAX    9.0f      // límite del corrector proporcional de distancia
-#define OBJ_WALL_REVERSE_ANGLE     3.0f      // grados de inclinación hacia atrás durante la reversa por pared
+#define OBJ_WALL_PROP_KP           0.006f    // PWM de steering por cuenta ADC de error lateral
+#define OBJ_WALL_PROP_STEER_MAX    5.0f      // límite del corrector proporcional de distancia
+#define OBJ_WALL_REVERSE_ANGLE     2.2f      // grados de inclinación hacia atrás durante la reversa por pared
 #define OBJ_WALL_REVERSE_CLEAR_ADC 3500.0f   // sale de reversa cuando ADC6 y ADC8 leen lejos
 #define OBJ_WALL_REVERSE_CLEAR_CNT 4         // ciclos consecutivos (40 ms) con ADC6/ADC8 >= clear
 // Avance buscando la pared: mismo PI de velocidad que OBJ_WALL_FWD (más cauteloso,
 // target más bajo) en vez de ángulo fijo sin ningún control -- se aceleraba sin límite
 // hasta encontrar la pared.
-#define OBJ_WALL_APPROACH_SPEED_TARGET 0.3f   // m/s, avance cauteloso buscando la pared
+#define OBJ_WALL_APPROACH_SPEED_TARGET 0.22f  // m/s, avance cauteloso buscando la pared
 #define OBJ_WALL_APPROACH_ANGLE_MAX    1.5f   // ángulo máximo de avance buscando la pared (°)
 #define OBJ_WALL_APPROACH_TIMEOUT  6000U     // ms máximos buscando la pared antes de rendirse
 // Avance bordeando la pared: PI de velocidad (mismo patrón que LOST_FWD/EDGE_FWD) en vez
 // de ángulo fijo + freno bang-bang por sobrevelocidad — regula la velocidad de crucero
 // con precisión en lugar de acelerar a fondo hasta cruzar el umbral y frenar de golpe.
-#define OBJ_WALL_SPEED_TARGET      0.50f     // m/s, avance cauteloso bordeando la pared
+#define OBJ_WALL_SPEED_TARGET      0.35f     // m/s, avance cauteloso bordeando la pared
 #define OBJ_WALL_VEL_KP            4.0f      // ganancia P acelerando
 #define OBJ_WALL_VEL_KP_BRAKE      22.0f     // ganancia P frenando (sobrevelocidad)
 #define OBJ_WALL_VEL_KI            1.0f      // ganancia I para sostener la velocidad de crucero
@@ -319,13 +319,13 @@ typedef enum {
 // (viniendo de avanzar), frena primero (mismo patrón que OBJ_PRE_REVERSE_HOLD) para no
 // entorpecer la reversa con inercia hacia adelante.
 #define OBJ_WALL_REVERSE_SETTLE_VEL 0.15f    // m/s por debajo del cual se considera "quieto"
-#define OBJ_WALL_PIVOT_POWER       8.0f      // potencia del pivot en WALL_TURN/WALL_FWD
+#define OBJ_WALL_PIVOT_POWER       5.0f      // potencia del pivot en WALL_TURN/WALL_FWD
 #define OBJ_WALL_LINE_IGNORE_MS    3000U     // ms al inicio de WALL_FWD en que se ignora la línea
 #define OBJ_WALL_CLEAR_COUNTS      100       // counts de encoder a avanzar tras perder la pared, antes de girar
 #define OBJ_WALL_ARC_RADIUS_M      0.38f     // radio nominal del semicírculo de esquive
 #define OBJ_WALL_ARC_MAX_DEG       180.0f    // barrido total: media circunferencia
-#define OBJ_WALL_ARC_STEER_KP      0.30f     // PWM de steering por grado de error de rumbo del arco
-#define OBJ_WALL_ARC_STEER_MAX     10.0f     // límite del corrector odométrico del semicírculo
+#define OBJ_WALL_ARC_STEER_KP      0.18f     // PWM de steering por grado de error de rumbo del arco
+#define OBJ_WALL_ARC_STEER_MAX     6.0f      // límite del corrector odométrico del semicírculo
 
 // Parámetros del arco evasivo (OBJ_ARC) — ajustables en runtime desde Qt
 // OBJ_ARC_DIFF_TARGET: diferencial de velocidad deseado entre ruedas [rps] (derecha - izquierda)
@@ -1512,10 +1512,10 @@ static float ObjWallComputeArcSteer(void)
         OBJ_WALL_PROP_STEER_MAX
     );
 
-    float target = clampf_local(arc_steer + wall_steer, -18.0f, 18.0f);
+    float target = clampf_local(arc_steer + wall_steer, -10.0f, 10.0f);
     float delta = target - obj_wall_arc_steer_f;
-    if (delta >  0.8f) delta =  0.8f;
-    if (delta < -0.8f) delta = -0.8f;
+    if (delta >  0.4f) delta =  0.4f;
+    if (delta < -0.4f) delta = -0.4f;
     obj_wall_arc_steer_f += delta;
 
     return obj_wall_arc_steer_f;
