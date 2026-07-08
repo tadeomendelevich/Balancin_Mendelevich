@@ -288,7 +288,7 @@ typedef enum {
 #define OBJ_HOLD_DURATION_MS       2000U     // ms de balance estatico en OBJ_HOLD antes de wall-following
 #define OBJ_WALL_ADC_IDX           6          // índice del sensor lateral (ADC7 = adcAvg[6])
 #define OBJ_WALL_THRESHOLD         3750.0f   // ADC < umbral → objeto visible; > umbral → perdido
-#define OBJ_WALL_REVERSE_THOLD     750.0f    // ADC7 < este valor → reversa por encoder
+#define OBJ_WALL_REVERSE_THOLD     750.0f    // ADC7 < este valor → arranca reversa
 #define OBJ_WALL_TOO_CLOSE_THOLD   2200.0f   // ADC7 entre REVERSE_THOLD y este valor → pivot derecha
 #define OBJ_WALL_ADC_LPF_ALPHA     0.18f     // filtro IIR de ADC7 para no cambiar de estado por ruido
 #define OBJ_WALL_ADC_HYST          160.0f    // histéresis de umbrales visible/cerca/reversa
@@ -296,13 +296,25 @@ typedef enum {
 #define OBJ_WALL_ADC_TARGET        2850.0f   // distancia lateral deseada: menor=cerca, mayor=lejos
 #define OBJ_WALL_PROP_KP           0.006f    // PWM de steering por cuenta ADC de error lateral
 #define OBJ_WALL_PROP_STEER_MAX    5.0f      // límite del corrector proporcional de distancia
-#define OBJ_WALL_REVERSE_ANGLE     2.2f      // grados de inclinación hacia atrás durante la reversa por pared
-#define OBJ_WALL_REVERSE_COUNTS    100       // pulsos de encoder derecho a retroceder al acercarse demasiado
+#define OBJ_WALL_REVERSE_ANGLE     6.0f      // grados de inclinación hacia atrás durante la reversa por pared. Con 2.2-3.0 no vencía la fricción estática desde parado: la soft-zone del PID (error<1.5° → autoridad al 15%) exige ángulos grandes para reversas reales — OBJ_RETROCESO necesita 8.5. Si sigue sin arrancar, subir de a 1.0 (el clamp global permite hasta 7.0 en estados de pared)
+#define OBJ_WALL_REVERSE_CLEAR_ADC 3600.0f   // sale de reversa cuando ADC6 y ADC8 leen lejos (>= este valor)
+#define OBJ_WALL_REVERSE_CLEAR_CNT 4         // ciclos consecutivos (40 ms) con ADC6/ADC8 >= clear
+#define OBJ_WALL_REVERSE_TIMEOUT_MS 4000U    // colchón: suelta el latch de reversa si en este tiempo ADC6/ADC8 nunca despejaron
+// Árbitro de acción del wall-following: UNA sola decisión vigente por vez, con
+// tiempo mínimo de compromiso. Sin esto, con el robot al borde de los umbrales
+// la máquina re-decidía cada ciclo (100 veces/seg) alternando avance/pivot/
+// reversa — cada acción se cancelaba antes de producir efecto y el robot
+// "no hacía nada".
+#define OBJ_WALL_ACT_AVANZA        0u
+#define OBJ_WALL_ACT_PIVOT_CERCA   1u
+#define OBJ_WALL_ACT_REVERSA       2u
+#define OBJ_WALL_ACTION_MIN_MS     450U      // compromiso mínimo con cada acción (subir si sigue indeciso, bajar si reacciona lento)
+#define OBJ_WALL_STATE_MIN_MS      450U      // mínimo en BORDEAR/GIRO_PARED antes de transicionar por pared vista/perdida
 // Avance buscando la pared: mismo PI de velocidad que OBJ_WALL_FWD (más cauteloso,
 // target más bajo) en vez de ángulo fijo sin ningún control -- se aceleraba sin límite
 // hasta encontrar la pared.
 #define OBJ_WALL_APPROACH_SPEED_TARGET 0.22f  // m/s, avance cauteloso buscando la pared
-#define OBJ_WALL_APPROACH_ANGLE_MAX    1.5f   // ángulo máximo de avance buscando la pared (°)
+#define OBJ_WALL_APPROACH_ANGLE_MAX    2.5f   // ángulo máximo de avance buscando la pared (°) — 1.5 casi no movía el robot (mismo caso que LOST_FWD_ANGLE_MAX 1.0→2.5 del 2026-07-04)
 #define OBJ_WALL_APPROACH_TIMEOUT  6000U     // ms máximos buscando la pared antes de rendirse
 // Avance bordeando la pared: PI de velocidad (mismo patrón que LOST_FWD/EDGE_FWD) en vez
 // de ángulo fijo + freno bang-bang por sobrevelocidad — regula la velocidad de crucero
@@ -318,7 +330,7 @@ typedef enum {
 // (viniendo de avanzar), frena primero (mismo patrón que OBJ_PRE_REVERSE_HOLD) para no
 // entorpecer la reversa con inercia hacia adelante.
 #define OBJ_WALL_REVERSE_SETTLE_VEL 0.15f    // m/s por debajo del cual se considera "quieto"
-#define OBJ_WALL_PIVOT_POWER       5.0f      // potencia del pivot en WALL_TURN/WALL_FWD
+#define OBJ_WALL_PIVOT_POWER       20.0f     // potencia del pivot en WALL_TURN/WALL_FWD. Historial de este robot: 5 y 8 insuficientes para rotar (changelog 2026-05-27), y los giros de LOST_ROTATE necesitaron subir 14→20→24 (2026-07-05). Si el pivot de pared sigue débil, probar 24 (valor validado en LROT_PIVOT)
 #define OBJ_WALL_LINE_IGNORE_MS    3000U     // ms al inicio de WALL_FWD en que se ignora la línea
 #define OBJ_WALL_CLEAR_COUNTS      100       // counts de encoder a avanzar tras perder la pared, antes de girar
 #define OBJ_WALL_ARC_RADIUS_M      0.38f     // radio nominal del semicírculo de esquive
@@ -582,7 +594,11 @@ static uint8_t  obj_wall_visible_cnt = 0;
 static uint8_t  obj_wall_too_close_cnt = 0;
 static uint8_t  obj_wall_reverse_cnt = 0;
 static uint8_t  obj_wall_reverse_active = 0;
-static int32_t  obj_wall_reverse_r0 = 0;
+static uint8_t  obj_wall_reverse_clear_cnt = 0;  // ciclos consecutivos con ADC6/ADC8 despejados
+static uint32_t obj_wall_reverse_start_ms = 0;   // timestamp de armado del latch (para el timeout de seguridad)
+static uint8_t  obj_wall_action = OBJ_WALL_ACT_AVANZA;   // acción vigente del árbitro (AVANZA/PIVOT_CERCA/REVERSA)
+static uint32_t obj_wall_action_since_ms = 0;            // desde cuándo rige la acción vigente
+static uint32_t obj_wall_turn_start_ms = 0;              // entrada a GIRO_PARED (mínimo en estado antes de volver a BORDEAR)
 static uint8_t  obj_wall_arc_active = 0;
 static float    obj_wall_arc_x0 = 0.0f;
 static float    obj_wall_arc_y0 = 0.0f;
@@ -1432,7 +1448,11 @@ static void ObjWallResetController(void)
     obj_wall_too_close_cnt = 0;
     obj_wall_reverse_cnt = 0;
     obj_wall_reverse_active = 0;
-    obj_wall_reverse_r0 = 0;
+    obj_wall_reverse_clear_cnt = 0;
+    obj_wall_reverse_start_ms = 0;
+    obj_wall_action = OBJ_WALL_ACT_AVANZA;
+    obj_wall_action_since_ms = 0;
+    obj_wall_turn_start_ms = 0;
     obj_wall_arc_active = 0;
     obj_wall_arc_steer_f = 0.0f;
 }
@@ -1458,24 +1478,69 @@ static void ObjWallUpdateAdc(float raw_adc)
 
 static uint8_t ObjWallUpdateReverseLatch(void)
 {
-    if (!obj_wall_reverse_active && obj_wall_reverse_f) {
-        __disable_irq();
-        obj_wall_reverse_r0 = encoder_right;
-        __enable_irq();
-        obj_wall_reverse_active = 1;
+    // El latch solo puede ARMARSE dentro de los 3 estados de wall-following.
+    // Antes corría en todo el modo línea: se armaba durante FOLLOWING / giro
+    // de esquive / pausa (el sensor lateral pasa cerca del objeto en el giro)
+    // y el robot entraba a BORDEAR_PARED con una reversa pendiente que nadie
+    // pidió en ese contexto.
+    uint8_t in_wall_state = (line_state == LINE_STATE_OBJ_BORDEAR_PARED ||
+                             line_state == LINE_STATE_OBJ_PARED_LIBRE  ||
+                             line_state == LINE_STATE_OBJ_GIRO_PARED);
+
+    if (!obj_wall_reverse_active && obj_wall_reverse_f && in_wall_state) {
+        obj_wall_reverse_active    = 1;
+        obj_wall_reverse_clear_cnt = 0;
+        obj_wall_reverse_start_ms  = HAL_GetTick();
     }
 
     if (obj_wall_reverse_active) {
-        __disable_irq();
-        int32_t reverse_dr = encoder_right - obj_wall_reverse_r0;
-        __enable_irq();
-        if (abs(reverse_dr) >= OBJ_WALL_REVERSE_COUNTS) {
+        // Salida normal: ADC6 y ADC8 (adcAvg[5]/adcAvg[7], largo alcance
+        // frontal) leen "lejos" durante CLEAR_CNT ciclos consecutivos.
+        // Colchón de seguridad por tiempo: si el robot no logra despejar
+        // (no arranca por fricción estática, hold, ángulo corto), sin
+        // timeout el latch quedaba armado para siempre y se quedaba quieto.
+        uint8_t clear_far = ((float)adcAvg[5] >= OBJ_WALL_REVERSE_CLEAR_ADC &&
+                             (float)adcAvg[7] >= OBJ_WALL_REVERSE_CLEAR_ADC);
+        if (clear_far) {
+            if (obj_wall_reverse_clear_cnt < OBJ_WALL_REVERSE_CLEAR_CNT) {
+                obj_wall_reverse_clear_cnt++;
+            }
+        } else {
+            obj_wall_reverse_clear_cnt = 0;
+        }
+        if (obj_wall_reverse_clear_cnt >= OBJ_WALL_REVERSE_CLEAR_CNT ||
+            (HAL_GetTick() - obj_wall_reverse_start_ms) >= OBJ_WALL_REVERSE_TIMEOUT_MS ||
+            !in_wall_state) {
             obj_wall_reverse_active = 0;
-            obj_wall_reverse_r0 = 0;
+            obj_wall_reverse_clear_cnt = 0;
         }
     }
 
     return obj_wall_reverse_active;
+}
+
+// Árbitro de acción del wall-following: elige UNA acción (avanzar / pivot por
+// cercanía / reversa) y se compromete con ella un mínimo de tiempo antes de
+// permitir cambiarla. La REVERSA es la excepción: entra y sale al ritmo del
+// latch (que ya tiene su propio compromiso — ADC6/ADC8 despejados o timeout),
+// porque demorar la entrada arriesga chocar el objeto, y demorar la salida
+// alarga la reversa más de lo pedido.
+static void ObjWallDecideAction(void)
+{
+    uint8_t desired;
+    if (obj_wall_reverse_active)   desired = OBJ_WALL_ACT_REVERSA;
+    else if (obj_wall_too_close_f) desired = OBJ_WALL_ACT_PIVOT_CERCA;
+    else                           desired = OBJ_WALL_ACT_AVANZA;
+
+    if (desired == obj_wall_action) return;
+
+    uint32_t now = HAL_GetTick();
+    if (desired == OBJ_WALL_ACT_REVERSA ||
+        obj_wall_action == OBJ_WALL_ACT_REVERSA ||
+        (now - obj_wall_action_since_ms) >= OBJ_WALL_ACTION_MIN_MS) {
+        obj_wall_action          = desired;
+        obj_wall_action_since_ms = now;
+    }
 }
 
 static float ObjWallComputeArcSteer(void)
@@ -1782,6 +1847,18 @@ static const char *LineStateStr(void)
         case LINE_STATE_OBJ_PARED_LIBRE:    return "LIBRE";
         case LINE_STATE_OBJ_GIRO_PARED:     return "GIRAP";
         default:                            return "UNK";
+    }
+}
+
+// Acción vigente del árbitro de wall-following (pantalla 6). Solo tiene
+// sentido durante los 3 estados de pared, donde el sub-estado por sí solo
+// no dice qué está haciendo el robot (avanza / pivot por cercanía / reversa).
+static const char *ObjWallActionStr(void)
+{
+    switch (obj_wall_action) {
+        case OBJ_WALL_ACT_REVERSA:     return "REV";
+        case OBJ_WALL_ACT_PIVOT_CERCA: return "PIV";
+        default:                       return "AVZ";
     }
 }
 
@@ -2096,7 +2173,21 @@ void updateDisplay(void) {
         // ───────────────────────────────────────────────────────────
         OLED_Header("OBJETO");
 
-        OLED_Puts7CenteredX(LineStateStr(), 0, 127, 12);
+        // En los estados de pared se agrega la acción del árbitro
+        // (AVZ/PIV/REV) al nombre del sub-estado: "PARED>REV".
+        {
+            uint8_t in_wall = (robot_state == ROBOT_STATE_LINE_FOLLOWING) &&
+                              (line_state == LINE_STATE_OBJ_BORDEAR_PARED ||
+                               line_state == LINE_STATE_OBJ_PARED_LIBRE  ||
+                               line_state == LINE_STATE_OBJ_GIRO_PARED);
+            if (in_wall) {
+                snprintf(lbuf, sizeof(lbuf), "%s>%s",
+                         LineStateStr(), ObjWallActionStr());
+                OLED_Puts7CenteredX(lbuf, 0, 127, 12);
+            } else {
+                OLED_Puts7CenteredX(LineStateStr(), 0, 127, 12);
+            }
+        }
         {
             uint32_t e = OLED_LineStateElapsedMs();
             snprintf(lbuf, sizeof(lbuf), "t:%lu.%01lus",
@@ -2389,6 +2480,7 @@ static void ControlStep10ms(void)
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
             ObjWallUpdateAdc((float)adcAvg[OBJ_WALL_ADC_IDX]);
             ObjWallUpdateReverseLatch();
+            ObjWallDecideAction();
         }
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
             // Detección de objetos: sensores de largo alcance ADC 5-8 (índices 4-7).
@@ -2958,7 +3050,7 @@ static void ControlStep10ms(void)
                 // corrección que la reversa pareja (ver switch más abajo). Si todavía hay
                 // velocidad residual de avance, frena primero (upright + freno de encoders)
                 // en vez de arrancar la reversa de golpe con inercia hacia adelante.
-                if (obj_wall_reverse_active) {
+                if (obj_wall_action == OBJ_WALL_ACT_REVERSA) {
                     obj_wall_vel_integral = 0.0f;
                     if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
                         base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
@@ -2994,7 +3086,7 @@ static void ControlStep10ms(void)
             } else if (line_state == LINE_STATE_OBJ_PARED_LIBRE) {
                 // Mismo esquema que OBJ_WALL_FWD (reversa si demasiado cerca, si no PI de
                 // velocidad avanzando) -- ver comentarios ahí arriba.
-                if (obj_wall_reverse_active) {
+                if (obj_wall_action == OBJ_WALL_ACT_REVERSA) {
                     obj_wall_vel_integral = 0.0f;
                     if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
                         base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
@@ -3028,7 +3120,7 @@ static void ControlStep10ms(void)
                 // Wall-following girando: upright puro, motores controlados por line_pivot_active.
                 // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás (reversa pareja),
                 // con la misma espera de estabilidad que en OBJ_WALL_FWD antes de arrancar.
-                if (obj_wall_reverse_active) {
+                if (obj_wall_action == OBJ_WALL_ACT_REVERSA) {
                     if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
                         base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
                         brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
@@ -3154,6 +3246,12 @@ static void ControlStep10ms(void)
         float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f
                         : (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) ? 6.0f
                         : (line_state == LINE_STATE_OBJ_RETROCESO)         ? 9.0f
+                        // Estados de pared: la reversa por latch usa -OBJ_WALL_REVERSE_ANGLE
+                        // (6.0°) — sin esta excepción, el límite general de 5.0 la recortaba
+                        // en silencio (mismo patrón que la excepción de OBJ_RETROCESO).
+                        : (line_state == LINE_STATE_OBJ_BORDEAR_PARED ||
+                           line_state == LINE_STATE_OBJ_PARED_LIBRE  ||
+                           line_state == LINE_STATE_OBJ_GIRO_PARED)        ? 7.0f
                         : 5.0f;
         base_setpoint_target = clampf_local(base_setpoint_target,
                                             -sp_limit - brake_setpoint_target,
@@ -3183,6 +3281,15 @@ static void ControlStep10ms(void)
             } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
                        line_state == LINE_STATE_OBJ_RETROCESO) {
                 // Rampa rápida para el empujón inicial de la reversa (vencer fricción estática)
+                sp_step_max = 0.6f;
+            } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
+                       obj_wall_action == OBJ_WALL_ACT_REVERSA &&
+                       (line_state == LINE_STATE_OBJ_BORDEAR_PARED ||
+                        line_state == LINE_STATE_OBJ_PARED_LIBRE  ||
+                        line_state == LINE_STATE_OBJ_GIRO_PARED)) {
+                // Reversa por latch en modo pared: mismo motivo que OBJ_RETROCESO —
+                // con la rampa general (0.15°/ciclo) llegar a -6° tardaba 400ms y el
+                // empujón inicial no vencía la fricción estática.
                 sp_step_max = 0.6f;
             } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
                 sp_step_max = 0.15f;
@@ -3414,7 +3521,16 @@ static void ControlStep10ms(void)
                      line_state == LINE_STATE_LOST_FWD ||
                      line_state == LINE_STATE_EDGE_FWD ||
                      line_state == LINE_STATE_OBJ_RETROCESO ||
-                     line_state == LINE_STATE_OBJ_BUSCAR_PARED))
+                     line_state == LINE_STATE_OBJ_BUSCAR_PARED ||
+                     // Estados de wall-following: mismo patrón de bug que RETROCESO/
+                     // BUSCAR_PARED — con la reversa por latch (que primero frena a
+                     // quietud total) el error de inclinación queda chico, el hold
+                     // entraba y silenciaba el PID justo cuando tenía que empujar
+                     // los -3° de reversa o el avance del PI → robot quieto para
+                     // siempre (los counts de encoder del latch nunca llegaban).
+                     line_state == LINE_STATE_OBJ_BORDEAR_PARED ||
+                     line_state == LINE_STATE_OBJ_PARED_LIBRE ||
+                     line_state == LINE_STATE_OBJ_GIRO_PARED))
                     balance_hold_active = 0;
                 else if ((robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) &&
                          fabsf(manual_setpoint_cmd) > 0.01f)
@@ -4617,8 +4733,11 @@ static void ControlStep10ms(void)
                         // mientras el robot oscilaba entre bordear/girar buscando la pared.
                         uint8_t line_ignore   = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
                         uint8_t wall_visible  = obj_wall_visible_f;
-                        uint8_t wall_reverse  = obj_wall_reverse_active;
-                        uint8_t too_close     = obj_wall_too_close_f;
+                        uint8_t wall_reverse  = (obj_wall_action == OBJ_WALL_ACT_REVERSA);
+                        uint8_t too_close     = (obj_wall_action == OBJ_WALL_ACT_PIVOT_CERCA);
+                        // Mínimo en estado antes de declarar "perdí la pared": evita
+                        // rebotar BORDEAR<->LIBRE varias veces por segundo.
+                        uint8_t state_dwell_ok = ((HAL_GetTick() - obj_wall_fwd_start_ms) >= OBJ_WALL_STATE_MIN_MS);
                         if (line_detected && !line_ignore) {
                             line_seen_since_entry = 1;
                             line_state          = LINE_STATE_FOLLOWING;
@@ -4653,7 +4772,7 @@ static void ControlStep10ms(void)
                                 -(pwm_sat + OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
                             motorLeftVelocity  = (int16_t)clampf_local(
                                 -(pwm_sat - OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
-                        } else if (!wall_visible) {
+                        } else if (!wall_visible && state_dwell_ok) {
                             // Perdió la pared: en vez de girar ya mismo, avanza un poco más
                             // (OBJ_WALL_CLEAR_COUNTS) para no quedar pivoteando pegado a la
                             // esquina/pared.
@@ -4689,8 +4808,8 @@ static void ControlStep10ms(void)
                         __enable_irq();
                         int32_t clear_counts = (abs(clear_dr) + abs(clear_dl)) / 2;
 
-                        uint8_t wall_reverse = obj_wall_reverse_active;
-                        uint8_t too_close    = obj_wall_too_close_f;
+                        uint8_t wall_reverse = (obj_wall_action == OBJ_WALL_ACT_REVERSA);
+                        uint8_t too_close    = (obj_wall_action == OBJ_WALL_ACT_PIVOT_CERCA);
                         // Misma ventana que BORDEAR_PARED, medida desde la entrada a TODA
                         // la secuencia (obj_wall_seq_start_ms) — ver fix 2026-07-05.
                         uint8_t line_ignore2 = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
@@ -4729,6 +4848,7 @@ static void ControlStep10ms(void)
                             line_state                 = LINE_STATE_OBJ_GIRO_PARED;
                             steering_adjustment        = 0.0f;
                             obj_wall_clear_initialized = 0;
+                            obj_wall_turn_start_ms     = HAL_GetTick();
                         } else {
                             steering_adjustment = ObjWallComputeArcSteer();
                             obj_rev_steer_f      = 0.0f;
@@ -4742,8 +4862,11 @@ static void ControlStep10ms(void)
                         // ADC7 < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
                         // TOO_CLOSE_THOLD → pivot derecha en cambio.
                         uint8_t wall_visible = obj_wall_visible_f;
-                        uint8_t wall_reverse = obj_wall_reverse_active;
-                        uint8_t too_close    = obj_wall_too_close_f;
+                        uint8_t wall_reverse = (obj_wall_action == OBJ_WALL_ACT_REVERSA);
+                        uint8_t too_close    = (obj_wall_action == OBJ_WALL_ACT_PIVOT_CERCA);
+                        // Mínimo en estado antes de volver a BORDEAR por "pared vista":
+                        // evita rebotar GIRO_PARED<->BORDEAR varias veces por segundo.
+                        uint8_t turn_dwell_ok = ((HAL_GetTick() - obj_wall_turn_start_ms) >= OBJ_WALL_STATE_MIN_MS);
                         // Misma ventana que BORDEAR_PARED/PARED_LIBRE, medida desde la
                         // entrada a toda la secuencia (obj_wall_seq_start_ms).
                         uint8_t line_ignore2 = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
@@ -4780,7 +4903,7 @@ static void ControlStep10ms(void)
                                 -(pwm_sat + OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
                             motorLeftVelocity  = (int16_t)clampf_local(
                                 -(pwm_sat - OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
-                        } else if (wall_visible) {
+                        } else if (wall_visible && turn_dwell_ok) {
                             line_state            = LINE_STATE_OBJ_BORDEAR_PARED;
                             line_pivot_active     = 0;
                             obj_wall_fwd_start_ms = HAL_GetTick();
