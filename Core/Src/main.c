@@ -288,8 +288,8 @@ typedef enum {
 #define OBJ_HOLD_DURATION_MS       2000U     // ms de balance estatico en OBJ_HOLD antes de wall-following
 #define OBJ_WALL_ADC_IDX           6          // índice del sensor lateral (ADC7 = adcAvg[6])
 #define OBJ_WALL_THRESHOLD         3750.0f   // ADC < umbral → objeto visible; > umbral → perdido
-#define OBJ_WALL_REVERSE_THOLD     600.0f    // ADC7 < este valor → demasiado cerca, reversa pareja
-#define OBJ_WALL_TOO_CLOSE_THOLD   2100.0f   // ADC7 entre REVERSE_THOLD y este valor → pivot derecha
+#define OBJ_WALL_REVERSE_THOLD     750.0f    // ADC7 < este valor → reversa por encoder
+#define OBJ_WALL_TOO_CLOSE_THOLD   2200.0f   // ADC7 entre REVERSE_THOLD y este valor → pivot derecha
 #define OBJ_WALL_ADC_LPF_ALPHA     0.18f     // filtro IIR de ADC7 para no cambiar de estado por ruido
 #define OBJ_WALL_ADC_HYST          160.0f    // histéresis de umbrales visible/cerca/reversa
 #define OBJ_WALL_ADC_DEBOUNCE_CNT  4         // ciclos consecutivos (40 ms) para aceptar un cruce
@@ -297,8 +297,7 @@ typedef enum {
 #define OBJ_WALL_PROP_KP           0.006f    // PWM de steering por cuenta ADC de error lateral
 #define OBJ_WALL_PROP_STEER_MAX    5.0f      // límite del corrector proporcional de distancia
 #define OBJ_WALL_REVERSE_ANGLE     2.2f      // grados de inclinación hacia atrás durante la reversa por pared
-#define OBJ_WALL_REVERSE_CLEAR_ADC 3500.0f   // sale de reversa cuando ADC6 y ADC8 leen lejos
-#define OBJ_WALL_REVERSE_CLEAR_CNT 4         // ciclos consecutivos (40 ms) con ADC6/ADC8 >= clear
+#define OBJ_WALL_REVERSE_COUNTS    100       // pulsos de encoder derecho a retroceder al acercarse demasiado
 // Avance buscando la pared: mismo PI de velocidad que OBJ_WALL_FWD (más cauteloso,
 // target más bajo) en vez de ángulo fijo sin ningún control -- se aceleraba sin límite
 // hasta encontrar la pared.
@@ -583,7 +582,7 @@ static uint8_t  obj_wall_visible_cnt = 0;
 static uint8_t  obj_wall_too_close_cnt = 0;
 static uint8_t  obj_wall_reverse_cnt = 0;
 static uint8_t  obj_wall_reverse_active = 0;
-static uint8_t  obj_wall_reverse_clear_cnt = 0;
+static int32_t  obj_wall_reverse_r0 = 0;
 static uint8_t  obj_wall_arc_active = 0;
 static float    obj_wall_arc_x0 = 0.0f;
 static float    obj_wall_arc_y0 = 0.0f;
@@ -1433,7 +1432,7 @@ static void ObjWallResetController(void)
     obj_wall_too_close_cnt = 0;
     obj_wall_reverse_cnt = 0;
     obj_wall_reverse_active = 0;
-    obj_wall_reverse_clear_cnt = 0;
+    obj_wall_reverse_r0 = 0;
     obj_wall_arc_active = 0;
     obj_wall_arc_steer_f = 0.0f;
 }
@@ -1459,22 +1458,20 @@ static void ObjWallUpdateAdc(float raw_adc)
 
 static uint8_t ObjWallUpdateReverseLatch(void)
 {
-    if (obj_wall_reverse_f) {
+    if (!obj_wall_reverse_active && obj_wall_reverse_f) {
+        __disable_irq();
+        obj_wall_reverse_r0 = encoder_right;
+        __enable_irq();
         obj_wall_reverse_active = 1;
-        obj_wall_reverse_clear_cnt = 0;
-    } else if (obj_wall_reverse_active) {
-        uint8_t clear_far = ((float)adcAvg[5] >= OBJ_WALL_REVERSE_CLEAR_ADC &&
-                             (float)adcAvg[7] >= OBJ_WALL_REVERSE_CLEAR_ADC);
-        if (clear_far) {
-            if (obj_wall_reverse_clear_cnt < OBJ_WALL_REVERSE_CLEAR_CNT) {
-                obj_wall_reverse_clear_cnt++;
-            }
-            if (obj_wall_reverse_clear_cnt >= OBJ_WALL_REVERSE_CLEAR_CNT) {
-                obj_wall_reverse_active = 0;
-                obj_wall_reverse_clear_cnt = 0;
-            }
-        } else {
-            obj_wall_reverse_clear_cnt = 0;
+    }
+
+    if (obj_wall_reverse_active) {
+        __disable_irq();
+        int32_t reverse_dr = encoder_right - obj_wall_reverse_r0;
+        __enable_irq();
+        if (abs(reverse_dr) >= OBJ_WALL_REVERSE_COUNTS) {
+            obj_wall_reverse_active = 0;
+            obj_wall_reverse_r0 = 0;
         }
     }
 
