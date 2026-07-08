@@ -313,6 +313,11 @@ _eESP01STATUS ESP01_Send(uint8_t *buf, uint16_t irRingBuf, uint16_t length, uint
 
 		esp01Flags.bit.TXCIPSEND = 1;
 		esp01Flags.bit.SENDINGDATA = 1;
+		// Colchón: si el SEND OK nunca llega (se perdió, ERROR no parseado),
+		// sin esto SENDINGDATA quedaba en 1 PARA SIEMPRE (el timeout existía
+		// pero nadie lo armaba) → ESP01_Send devolvía BUSY eternamente y el
+		// robot dejaba de transmitir del todo hasta el próximo reset.
+		esp01TimeoutSending = 100;  // 1s (decrementa en ESP01_Timeout10ms)
 
 		if(aDbgStr != NULL){
 			aDbgStr("+&DBGSENDING DATA ");
@@ -362,7 +367,13 @@ void ESP01_Timeout10ms(){
 	if(esp01TimeoutSending) {
 		esp01TimeoutSending--;
 		if(!esp01TimeoutSending && esp01Flags.bit.SENDINGDATA) {
+			// Limpieza COMPLETA del envío colgado: antes solo se bajaba
+			// SENDINGDATA y quedaban TXCIPSEND/WAITINGSYMBOL y bytes viejos
+			// en el buffer TX — el próximo CIPSEND salía pegado a esa basura.
 			esp01Flags.bit.SENDINGDATA = 0;
+			esp01Flags.bit.TXCIPSEND = 0;
+			esp01Flags.bit.WAITINGSYMBOL = 0;
+			esp01irTX = esp01iwTX;
 			if(aDbgStr) aDbgStr(">>> TIMEOUT: SENDINGDATA cleared forcedly\r\n");
 		}
 	}
@@ -552,8 +563,16 @@ static void ESP01ATDecode(){
 
 				case 3://ERROR
 					if(esp01Flags.bit.SENDINGDATA){
+						// Abortar SOLO el envío en curso. Antes también se ponía
+						// UDPTCPCONNECTED=0: un simple ERROR de CIPSEND (ESP ocupado)
+						// tiraba abajo el socket y forzaba reabrirlo en el chequeo de
+						// 5s — el ciclo "envía un rato / se corta / se reconecta".
+						// UDP no tiene conexión que se caiga: los cierres reales
+						// llegan como CLOSED / DISCONNECTED y se manejan ahí.
 						esp01Flags.bit.SENDINGDATA = 0;
-						esp01Flags.bit.UDPTCPCONNECTED = 0;
+						esp01Flags.bit.TXCIPSEND = 0;
+						esp01Flags.bit.WAITINGSYMBOL = 0;
+						esp01TimeoutSending = 0;
 						esp01irTX = esp01iwTX;
 					}
 					break;
@@ -582,6 +601,7 @@ static void ESP01ATDecode(){
 					break;
 				case 9://SEND OK
 					esp01Flags.bit.SENDINGDATA = 0;
+					esp01TimeoutSending = 0;
 					ESP01_NotifyStateChange(ESP01_SEND_OK);
 					break;
 				case 10://CONNECT
@@ -709,9 +729,12 @@ static void ESP01ATDecode(){
 		    if (esp01nBytes == 0) {
 		        // fin de payload:
 		        esp01HState = 0;
-		        esp01Flags.bit.WAITINGSYMBOL = 0;
-		        esp01Flags.bit.TXCIPSEND     = 0;
-		        esp01Flags.bit.SENDINGDATA   = 0;
+		        // NO tocar los flags de envío acá: recibir un paquete (+IPD) es
+		        // independiente de estar enviando. Antes se limpiaban WAITINGSYMBOL/
+		        // TXCIPSEND/SENDINGDATA — si un paquete de Qt llegaba en el medio de
+		        // un CIPSEND nuestro, abortaba el envío a mitad de camino y el
+		        // siguiente CIPSEND salía encimado → ERROR → reconexión del socket.
+		        // El envío colgado de verdad lo cubre esp01TimeoutSending (1s).
 
 		        // 4) imprimimos en debug los lastIPDlen bytes recibidos
 		        uint16_t start = (*esp01Handle.iwRX + esp01Handle.sizeBufferRX - lastIPDlen)
@@ -1044,10 +1067,18 @@ static void ESP01SENDData(){
 
 	if(esp01Flags.bit.WAITINGSYMBOL){
 		if(!esp01TimeoutTxSymbol){
+			// No llegó el '>' a tiempo: abortar SOLO este envío. Antes además
+			// se hacía esp01ATSate = ESP01ATAT — re-inicializaba TODA la máquina
+			// AT (AT/CWMODE/CWJAP/CIPSTART) con el WiFi perfectamente sano, un
+			// ciclo entero de reconexión por un prompt perdido. Si el socket
+			// está caído de verdad, CLOSED/DISCONNECTED o el chequeo periódico
+			// de DOConnection lo reconectan por su cuenta.
 			esp01irTX = esp01iwTX;
 			esp01Flags.bit.WAITINGSYMBOL = 0;
-			esp01ATSate = ESP01ATAT;
-			esp01TimeoutTask = 10;
+			esp01Flags.bit.TXCIPSEND = 0;
+			esp01Flags.bit.SENDINGDATA = 0;
+			esp01TimeoutSending = 0;
+			if(aDbgStr) aDbgStr(">>> TIMEOUT: '>' nunca llego, envio abortado\r\n");
 		}
 		return;
 	}
@@ -1063,7 +1094,7 @@ static void ESP01SENDData(){
 				if(esp01TXATBuf[esp01irTX] == '>'){
 					esp01Flags.bit.TXCIPSEND = 0;
 					esp01Flags.bit.WAITINGSYMBOL = 1;
-					esp01TimeoutTxSymbol = 5;
+					esp01TimeoutTxSymbol = 30;  // 300ms (50ms era muy justo: el '>' se pierde si el parser está a mitad de otro token y el timeout abortaba envíos sanos)
 					// Si encontramos el fin de comando, incrementamos y salimos
 					// para respetar el WAITINGSYMBOL
 					esp01irTX++;
