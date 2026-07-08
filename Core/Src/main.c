@@ -508,6 +508,7 @@ static uint8_t  key_click_count = 0;
 
 static float manual_setpoint_ramped = 0.0f;  // último ángulo de avance aplicado en MANUAL (telemetría)
 static float manual_vel_integral    = 0.0f;  // integral del PI de velocidad adelante/atrás en MANUAL
+static float manual_straight_steer_f = 0.0f; // corrección de rumbo recto (mismo algoritmo que REV_STRAIGHT en OBJ_REVERSE) cuando no hay giro comandado en MANUAL
 
 static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float line_enc_angle_corr     = 0.0f;  // corrección P de angulo por deficit de velocidad encoder
@@ -2466,6 +2467,24 @@ static void ControlStep10ms(void)
             // velocity_est ya actualizado desde encoders al inicio del ciclo
         }
 
+        // Comandos manuales durante LINE_FOLLOWING (WiFi/USB), SOLO si no ve la
+        // línea: reutiliza el mismo control que ROBOT_STATE_MANUAL_CONTROL (PI de
+        // velocidad + giro suave + corrección de rumbo recto) extendiendo las
+        // condiciones de esas dos ramas (más abajo, cálculo de setpoint y mezcla
+        // de motores) en vez de duplicar el algoritmo. En cuanto vuelve a ver la
+        // línea, se ignoran los comandos y el seguidor retoma el control normal
+        // (line_state ya queda forzado en LINE_STATE_FOLLOWING mientras el
+        // override está activo, así que retoma limpio). Se exige además que el
+        // comando haya llegado hace poco (<250ms): mientras se sigue la línea
+        // normalmente el decay de manual_setpoint_cmd/steering_cmd NO corre (vive
+        // en la rama MANUAL, que acá no se ejecuta) — sin este chequeo, un comando
+        // viejo (de hace rato, ya soltado) quedaría "congelado" y dispararía el
+        // override de golpe apenas se pierda la línea más tarde, sin que el
+        // usuario esté mandando nada en ese momento.
+        uint8_t manual_line_override =
+            (robot_state == ROBOT_STATE_LINE_FOLLOWING) && !line_detected &&
+            (HAL_GetTick() - manual_cmd_last_ms) < 250U &&
+            (fabsf(manual_setpoint_cmd) > 0.01f || fabsf(manual_steering_cmd) > 0.5f);
 
         // -------------------------------------------------------
         // CAMBIOS DE ESTADO
@@ -2562,13 +2581,14 @@ static void ControlStep10ms(void)
             odom_theta_deg = 0.0f;
 
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                manual_setpoint_cmd    = 0.0f;
-                manual_steering_cmd    = 0.0f;
-                manual_cmd_last_ms     = HAL_GetTick();
-                manual_setpoint_ramped = 0.0f;
-                manual_vel_integral    = 0.0f;
-                steering_adjustment    = 0.0f;
-                obj_rev_steer_f        = 0.0f;
+                manual_setpoint_cmd     = 0.0f;
+                manual_steering_cmd     = 0.0f;
+                manual_cmd_last_ms      = HAL_GetTick();
+                manual_setpoint_ramped  = 0.0f;
+                manual_vel_integral     = 0.0f;
+                manual_straight_steer_f = 0.0f;
+                steering_adjustment     = 0.0f;
+                obj_rev_steer_f         = 0.0f;
             }
         }
 
@@ -2580,7 +2600,7 @@ static void ControlStep10ms(void)
         float base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
         float brake_setpoint_target = 0.0f;
 
-        if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+        if (robot_state == ROBOT_STATE_LINE_FOLLOWING && !manual_line_override) {
             if (line_state == LINE_STATE_FOLLOWING && line_detected) {
                 // Regulación de velocidad por encoders:
                 // - vel < 0 (avance): reducir ángulo si va muy rápido → frena
@@ -2901,11 +2921,13 @@ static void ControlStep10ms(void)
             }
 
             line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
-        } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+        } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
             // Control manual normal (joystick/comandos WiFi-USB). El banco de pruebas
             // del giro de 90° que vivía acá (activado con el joystick en reposo) se
             // eliminó a pedido del usuario: MANUAL ahora es exclusivamente para mover
-            // el robot con comandos, sin ningún ciclo automático.
+            // el robot con comandos, sin ningún ciclo automático. También se entra
+            // acá con manual_line_override=1 (LINE_FOLLOWING sin ver la línea +
+            // comando activo) — mismo control, reutilizado tal cual.
             if (HAL_GetTick() - manual_cmd_last_ms > 60) {
                 manual_setpoint_cmd *= 0.96f;
                 manual_steering_cmd *= 0.90f;
@@ -2953,7 +2975,13 @@ static void ControlStep10ms(void)
 
             manual_setpoint_ramped = manual_angle_cmd; // telemetría/consistencia con el resto del archivo
             base_setpoint_target   = SETPOINT_ANGLE + setpoint_trim + manual_angle_cmd;
-            brake_setpoint_target  = ComputeBrakeSetpointTarget(robot_state);
+            // ComputeBrakeSetpointTarget devuelve 0 directo si el estado es
+            // LINE_FOLLOWING (ver la función) — acá "robot_state" sigue siendo
+            // LINE_FOLLOWING durante manual_line_override, así que hay que forzar
+            // MANUAL_CONTROL explícitamente para que SÍ aplique el freno traslacional.
+            brake_setpoint_target = ComputeBrakeSetpointTarget(
+                manual_line_override ? ROBOT_STATE_MANUAL_CONTROL : robot_state
+            );
         } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
             base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
         } else if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
@@ -2970,7 +2998,7 @@ static void ControlStep10ms(void)
         // sin esto, este clamp recortaba en silencio el nuevo tope a 5.0 sin que el
         // usuario se enterara (mismo patrón de bug ya visto antes con OBJ_REVERSE).
         float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f
-                        : (robot_state == ROBOT_STATE_MANUAL_CONTROL)      ? 6.0f
+                        : (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) ? 6.0f
                         : (line_state == LINE_STATE_OBJ_RETROCESO)         ? 9.0f
                         : 5.0f;
         base_setpoint_target = clampf_local(base_setpoint_target,
@@ -2996,7 +3024,7 @@ static void ControlStep10ms(void)
         {
             float sp_step_max;
 
-            if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+            if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
                 sp_step_max = 0.1f;
             } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
                        line_state == LINE_STATE_OBJ_RETROCESO) {
@@ -3017,7 +3045,7 @@ static void ControlStep10ms(void)
         }
 
         {
-            float brake_step_max = (robot_state == ROBOT_STATE_MANUAL_CONTROL)
+            float brake_step_max = (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override)
                                  ? BRAKE_TILT_STEP_MAN
                                  : BRAKE_TILT_STEP_BAL;
 
@@ -3107,6 +3135,7 @@ static void ControlStep10ms(void)
                 lost_fwd_vel_integral = 0.0f;
                 obj_wall_vel_integral = 0.0f;
                 manual_vel_integral   = 0.0f;
+                manual_straight_steer_f = 0.0f;
                 obj_rot_initialized = 0;
                 obj_rot_start_ms    = 0;
                 obj_rot_phase       = 0;
@@ -3232,7 +3261,8 @@ static void ControlStep10ms(void)
                      line_state == LINE_STATE_OBJ_RETROCESO ||
                      line_state == LINE_STATE_OBJ_BUSCAR_PARED))
                     balance_hold_active = 0;
-                else if (robot_state == ROBOT_STATE_MANUAL_CONTROL && fabsf(manual_setpoint_cmd) > 0.01f)
+                else if ((robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) &&
+                         fabsf(manual_setpoint_cmd) > 0.01f)
                     balance_hold_active = 0;
                 else if (!balance_hold_active) {
                     if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
@@ -3269,18 +3299,18 @@ static void ControlStep10ms(void)
             if (pwm_sat < -50.0f) { pwm_sat = -50.0f; sat_flag = 1; }
 
             if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
-                line_state == LINE_STATE_FOLLOWING) {
+                line_state == LINE_STATE_FOLLOWING && !manual_line_override) {
                 if (pwm_sat >  40.0f) pwm_sat =  40.0f;
                 if (pwm_sat < -40.0f) pwm_sat = -40.0f;
             }
 
-            if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+            if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
                 if (pwm_sat >  55.0f) pwm_sat =  55.0f;
                 if (pwm_sat < -55.0f) pwm_sat = -55.0f;
             }
 
             float pwm_limit;
-            if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+            if (robot_state == ROBOT_STATE_LINE_FOLLOWING && !manual_line_override) {
                 pwm_limit = 40.0f;
             } else {
                 pwm_limit = 100.0f;
@@ -3337,7 +3367,7 @@ static void ControlStep10ms(void)
                 if (integral < -8.0f) integral = -8.0f;
             }
 
-            if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+            if (robot_state == ROBOT_STATE_LINE_FOLLOWING && !manual_line_override) {
                 uint8_t line_pivot_active = 0;
 
                 switch (line_state) {
@@ -4655,7 +4685,7 @@ static void ControlStep10ms(void)
                     motorLeftVelocity  = -(int16_t)lroundf(mR);
                 }
 
-            } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+            } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
                 line_integral       = 0.0f;
                 line_obj_rev_vel_integral = 0.0f;
                 line_error_prev     = 0.0f;
@@ -4664,18 +4694,41 @@ static void ControlStep10ms(void)
                 // Control manual normal (comandos por WiFi/USB). El banco de pruebas
                 // del giro de 90° que se activaba con el joystick/comandos en reposo
                 // se eliminó a pedido del usuario: MANUAL ahora solo mueve el robot en
-                // respuesta a comandos, sin ningún ciclo automático de rotación.
-                {
-                    // Rampa mucho más lenta que antes (1.5→0.25 por ciclo, ~150°/s→25°/s):
-                    // el giro pegaba un salto brusco casi instantáneo al mantener izquierda/
-                    // derecha; ahora tarda ~2.4s en llegar al steering máximo (±60) y, al
-                    // soltar, decae igual de suave (mismo mecanismo, manual_steering_cmd ya
-                    // decae hacia 0 solo si no llegan más comandos).
-                    const float STEER_RATE = 0.25f;
+                // respuesta a comandos, sin ningún ciclo automático de rotación. También
+                // se entra acá con manual_line_override=1 (LINE_FOLLOWING sin ver la
+                // línea + comando activo) — mismo control, reutilizado tal cual; el
+                // `line_state = LINE_STATE_FOLLOWING` de arriba mantiene la máquina de
+                // estados del seguidor limpia mientras dura el override.
+                uint8_t manual_turning = fabsf(manual_steering_cmd) > 0.5f;
+
+                if (manual_turning) {
+                    // Giro: rampa suave hacia manual_steering_cmd. Bajado a 1/4 de la
+                    // rampa anterior (0.25→0.0625/ciclo) porque, aun con la magnitud del
+                    // comando también reducida a 1/4 (±60→±15 en MOVE_LEFT/RIGHT,
+                    // UNER.c), el giro seguía sintiéndose demasiado fuerte — "siempre
+                    // movimientos suaves".
+                    const float STEER_RATE = 0.0625f;
                     float steer_delta = manual_steering_cmd - steering_adjustment;
                     if (steer_delta >  STEER_RATE) steer_delta =  STEER_RATE;
                     if (steer_delta < -STEER_RATE) steer_delta = -STEER_RATE;
                     steering_adjustment += steer_delta;
+                    manual_straight_steer_f = steering_adjustment; // sincronizado para la transición a "sin giro"
+                } else {
+                    // Sin giro comandado: corrección de rumbo recto para que
+                    // adelante/atrás no se curve por asimetría mecánica entre ruedas —
+                    // mismo algoritmo P sobre diferencia de velocidad de ruedas ya
+                    // usado y calibrado en la reversa recta de OBJ_REVERSE/wall-following
+                    // (ver REV_STRAIGHT_KP/MAX/SLEW), reutilizado tal cual.
+                    float rate_diff = speed_right_rps_s - speed_left_rps_s;
+                    float corr_target = clampf_local(
+                        REV_STRAIGHT_KP * rate_diff,
+                        -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
+                    );
+                    float corr_delta = corr_target - manual_straight_steer_f;
+                    if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
+                    if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
+                    manual_straight_steer_f += corr_delta;
+                    steering_adjustment = manual_straight_steer_f;
                 }
 
                 static float prev_steering_cmd = 0.0f;

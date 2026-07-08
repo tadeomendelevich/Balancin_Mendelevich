@@ -673,7 +673,11 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MOVE_FORWARD:
-            if (p_robot_state != NULL && *p_robot_state == 4) {
+            if (p_robot_state != NULL && (*p_robot_state == 4 || *p_robot_state == 3)) {
+                // ==4: MANUAL_CONTROL siempre. ==3: LINE_FOLLOWING también acepta estos
+                // comandos, pero main.c los ignora si en ese momento SÍ ve la línea
+                // (manual_line_override exige !line_detected) — acá no se puede saber
+                // eso, así que se deja pasar siempre y el firmware filtra.
                 if (p_manual_sp_cmd) *p_manual_sp_cmd = 1.0f; // m/s deseados hacia adelante (ver MANUAL_SPEED_MAX en main.c)
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
                 last_manual_cmd = MOVE_FORWARD;
@@ -685,7 +689,11 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MOVE_BACKWARD:
-            if (p_robot_state != NULL && *p_robot_state == 4) {
+            if (p_robot_state != NULL && (*p_robot_state == 4 || *p_robot_state == 3)) {
+                // ==4: MANUAL_CONTROL siempre. ==3: LINE_FOLLOWING también acepta estos
+                // comandos, pero main.c los ignora si en ese momento SÍ ve la línea
+                // (manual_line_override exige !line_detected) — acá no se puede saber
+                // eso, así que se deja pasar siempre y el firmware filtra.
                 if (p_manual_sp_cmd) *p_manual_sp_cmd = -1.0f; // m/s deseados hacia atrás
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
                 last_manual_cmd = MOVE_BACKWARD;
@@ -697,9 +705,13 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MOVE_LEFT:
-            if (p_robot_state != NULL && *p_robot_state == 4) {
+            if (p_robot_state != NULL && (*p_robot_state == 4 || *p_robot_state == 3)) {
+                // ==4: MANUAL_CONTROL siempre. ==3: LINE_FOLLOWING también acepta estos
+                // comandos, pero main.c los ignora si en ese momento SÍ ve la línea
+                // (manual_line_override exige !line_detected) — acá no se puede saber
+                // eso, así que se deja pasar siempre y el firmware filtra.
                 if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
-                if (p_manual_st_cmd) *p_manual_st_cmd = -60.0f; // steering value for left
+                if (p_manual_st_cmd) *p_manual_st_cmd = -15.0f; // steering value for left (1/4 de 60, a pedido: giro demasiado fuerte)
                 last_manual_cmd = MOVE_LEFT;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
             }
@@ -709,9 +721,13 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MOVE_RIGHT:
-            if (p_robot_state != NULL && *p_robot_state == 4) {
+            if (p_robot_state != NULL && (*p_robot_state == 4 || *p_robot_state == 3)) {
+                // ==4: MANUAL_CONTROL siempre. ==3: LINE_FOLLOWING también acepta estos
+                // comandos, pero main.c los ignora si en ese momento SÍ ve la línea
+                // (manual_line_override exige !line_detected) — acá no se puede saber
+                // eso, así que se deja pasar siempre y el firmware filtra.
                 if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
-                if (p_manual_st_cmd) *p_manual_st_cmd = 60.0f; // steering value for right
+                if (p_manual_st_cmd) *p_manual_st_cmd = 15.0f; // steering value for right (1/4 de 60, a pedido: giro demasiado fuerte)
                 last_manual_cmd = MOVE_RIGHT;
                 if (p_manual_tmo) *p_manual_tmo = HAL_GetTick();
             }
@@ -721,7 +737,11 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MOVE_STOP:
-            if (p_robot_state != NULL && *p_robot_state == 4) {
+            if (p_robot_state != NULL && (*p_robot_state == 4 || *p_robot_state == 3)) {
+                // ==4: MANUAL_CONTROL siempre. ==3: LINE_FOLLOWING también acepta estos
+                // comandos, pero main.c los ignora si en ese momento SÍ ve la línea
+                // (manual_line_override exige !line_detected) — acá no se puede saber
+                // eso, así que se deja pasar siempre y el firmware filtra.
                 if (p_manual_sp_cmd) *p_manual_sp_cmd = 0.0f;
                 if (p_manual_st_cmd) *p_manual_st_cmd = 0.0f;
                 last_manual_cmd = MOVE_STOP;
