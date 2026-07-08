@@ -290,6 +290,12 @@ typedef enum {
 #define OBJ_WALL_THRESHOLD         3750.0f   // ADC < umbral → objeto visible; > umbral → perdido
 #define OBJ_WALL_REVERSE_THOLD     600.0f    // ADC7 < este valor → demasiado cerca, reversa pareja
 #define OBJ_WALL_TOO_CLOSE_THOLD   2100.0f   // ADC7 entre REVERSE_THOLD y este valor → pivot derecha
+#define OBJ_WALL_ADC_LPF_ALPHA     0.18f     // filtro IIR de ADC7 para no cambiar de estado por ruido
+#define OBJ_WALL_ADC_HYST          160.0f    // histéresis de umbrales visible/cerca/reversa
+#define OBJ_WALL_ADC_DEBOUNCE_CNT  4         // ciclos consecutivos (40 ms) para aceptar un cruce
+#define OBJ_WALL_ADC_TARGET        2850.0f   // distancia lateral deseada: menor=cerca, mayor=lejos
+#define OBJ_WALL_PROP_KP           0.010f    // PWM de steering por cuenta ADC de error lateral
+#define OBJ_WALL_PROP_STEER_MAX    9.0f      // límite del corrector proporcional de distancia
 #define OBJ_WALL_REVERSE_ANGLE     3.0f      // grados de inclinación hacia atrás durante la reversa por pared
 // Avance buscando la pared: mismo PI de velocidad que OBJ_WALL_FWD (más cauteloso,
 // target más bajo) en vez de ángulo fijo sin ningún control -- se aceleraba sin límite
@@ -300,7 +306,7 @@ typedef enum {
 // Avance bordeando la pared: PI de velocidad (mismo patrón que LOST_FWD/EDGE_FWD) en vez
 // de ángulo fijo + freno bang-bang por sobrevelocidad — regula la velocidad de crucero
 // con precisión en lugar de acelerar a fondo hasta cruzar el umbral y frenar de golpe.
-#define OBJ_WALL_SPEED_TARGET      1.0f      // m/s, avance cauteloso bordeando la pared
+#define OBJ_WALL_SPEED_TARGET      0.50f     // m/s, avance cauteloso bordeando la pared
 #define OBJ_WALL_VEL_KP            4.0f      // ganancia P acelerando
 #define OBJ_WALL_VEL_KP_BRAKE      22.0f     // ganancia P frenando (sobrevelocidad)
 #define OBJ_WALL_VEL_KI            1.0f      // ganancia I para sostener la velocidad de crucero
@@ -314,6 +320,10 @@ typedef enum {
 #define OBJ_WALL_PIVOT_POWER       8.0f      // potencia del pivot en WALL_TURN/WALL_FWD
 #define OBJ_WALL_LINE_IGNORE_MS    3000U     // ms al inicio de WALL_FWD en que se ignora la línea
 #define OBJ_WALL_CLEAR_COUNTS      100       // counts de encoder a avanzar tras perder la pared, antes de girar
+#define OBJ_WALL_ARC_RADIUS_M      0.38f     // radio nominal del semicírculo de esquive
+#define OBJ_WALL_ARC_MAX_DEG       180.0f    // barrido total: media circunferencia
+#define OBJ_WALL_ARC_STEER_KP      0.30f     // PWM de steering por grado de error de rumbo del arco
+#define OBJ_WALL_ARC_STEER_MAX     10.0f     // límite del corrector odométrico del semicírculo
 
 // Parámetros del arco evasivo (OBJ_ARC) — ajustables en runtime desde Qt
 // OBJ_ARC_DIFF_TARGET: diferencial de velocidad deseado entre ruedas [rps] (derecha - izquierda)
@@ -562,6 +572,19 @@ static uint32_t obj_wall_seq_start_ms = 0;         // timestamp de entrada a TOD
                                                     // esos 3 estados -- ver fix 2026-07-05 "ignora la línea todo el tiempo"
 static int32_t  obj_wall_clear_r0 = 0;
 static int32_t  obj_wall_clear_l0 = 0;
+static float    obj_wall_adc_f = 4095.0f;
+static uint8_t  obj_wall_adc_valid = 0;
+static uint8_t  obj_wall_visible_f = 0;
+static uint8_t  obj_wall_too_close_f = 0;
+static uint8_t  obj_wall_reverse_f = 0;
+static uint8_t  obj_wall_visible_cnt = 0;
+static uint8_t  obj_wall_too_close_cnt = 0;
+static uint8_t  obj_wall_reverse_cnt = 0;
+static uint8_t  obj_wall_arc_active = 0;
+static float    obj_wall_arc_x0 = 0.0f;
+static float    obj_wall_arc_y0 = 0.0f;
+static float    obj_wall_arc_theta0 = 0.0f;
+static float    obj_wall_arc_steer_f = 0.0f;
 
 volatile uint8_t tick2ms_count = 0;
 static uint8_t encoder_sampler_initialized = 0;
@@ -1367,6 +1390,105 @@ static float apply_deadbandf(float value, float deadband)
     if (value > deadband) return value - deadband;
     if (value < -deadband) return value + deadband;
     return 0.0f;
+}
+
+static float wrap_deg_local(float angle)
+{
+    while (angle >  180.0f) angle -= 360.0f;
+    while (angle < -180.0f) angle += 360.0f;
+    return angle;
+}
+
+static uint8_t hysteresis_low_debounce(float value, float threshold, float hyst,
+                                       uint8_t *state, uint8_t *counter)
+{
+    uint8_t desired = *state
+                    ? (value < (threshold + hyst))
+                    : (value < (threshold - hyst));
+
+    if (desired != *state) {
+        if (*counter < OBJ_WALL_ADC_DEBOUNCE_CNT) (*counter)++;
+        if (*counter >= OBJ_WALL_ADC_DEBOUNCE_CNT) {
+            *state = desired;
+            *counter = 0;
+        }
+    } else {
+        *counter = 0;
+    }
+
+    return *state;
+}
+
+static void ObjWallResetController(void)
+{
+    obj_wall_adc_valid = 0;
+    obj_wall_visible_f = 0;
+    obj_wall_too_close_f = 0;
+    obj_wall_reverse_f = 0;
+    obj_wall_visible_cnt = 0;
+    obj_wall_too_close_cnt = 0;
+    obj_wall_reverse_cnt = 0;
+    obj_wall_arc_active = 0;
+    obj_wall_arc_steer_f = 0.0f;
+}
+
+static void ObjWallUpdateAdc(float raw_adc)
+{
+    if (!obj_wall_adc_valid) {
+        obj_wall_adc_f = raw_adc;
+        obj_wall_adc_valid = 1;
+    } else {
+        obj_wall_adc_f += OBJ_WALL_ADC_LPF_ALPHA * (raw_adc - obj_wall_adc_f);
+    }
+
+    hysteresis_low_debounce(obj_wall_adc_f, OBJ_WALL_THRESHOLD,       OBJ_WALL_ADC_HYST,
+                            &obj_wall_visible_f,   &obj_wall_visible_cnt);
+    hysteresis_low_debounce(obj_wall_adc_f, OBJ_WALL_TOO_CLOSE_THOLD, OBJ_WALL_ADC_HYST,
+                            &obj_wall_too_close_f, &obj_wall_too_close_cnt);
+    hysteresis_low_debounce(obj_wall_adc_f, OBJ_WALL_REVERSE_THOLD,   OBJ_WALL_ADC_HYST,
+                            &obj_wall_reverse_f,   &obj_wall_reverse_cnt);
+
+    if (obj_wall_reverse_f) obj_wall_too_close_f = 0;
+}
+
+static float ObjWallComputeArcSteer(void)
+{
+    if (!obj_wall_arc_active) {
+        obj_wall_arc_x0 = odom_x_m;
+        obj_wall_arc_y0 = odom_y_m;
+        obj_wall_arc_theta0 = odom_theta_deg;
+        obj_wall_arc_active = 1;
+        obj_wall_arc_steer_f = 0.0f;
+    }
+
+    float dx = odom_x_m - obj_wall_arc_x0;
+    float dy = odom_y_m - obj_wall_arc_y0;
+    float arc_progress_m = sqrtf(dx * dx + dy * dy);
+    float arc_len_m = (float)M_PI * OBJ_WALL_ARC_RADIUS_M;
+    float arc_frac = (arc_len_m > 0.001f) ? clampf_local(arc_progress_m / arc_len_m, 0.0f, 1.0f) : 1.0f;
+
+    float desired_theta = wrap_deg_local(obj_wall_arc_theta0 + OBJ_WALL_ARC_MAX_DEG * arc_frac);
+    float heading_err = wrap_deg_local(desired_theta - odom_theta_deg);
+    float arc_steer = clampf_local(
+        -ODOM_THETA_SIGN * OBJ_WALL_ARC_STEER_KP * heading_err,
+        -OBJ_WALL_ARC_STEER_MAX,
+        OBJ_WALL_ARC_STEER_MAX
+    );
+
+    float wall_err = OBJ_WALL_ADC_TARGET - obj_wall_adc_f;
+    float wall_steer = clampf_local(
+        OBJ_WALL_PROP_KP * wall_err,
+        -OBJ_WALL_PROP_STEER_MAX,
+        OBJ_WALL_PROP_STEER_MAX
+    );
+
+    float target = clampf_local(arc_steer + wall_steer, -18.0f, 18.0f);
+    float delta = target - obj_wall_arc_steer_f;
+    if (delta >  0.8f) delta =  0.8f;
+    if (delta < -0.8f) delta = -0.8f;
+    obj_wall_arc_steer_f += delta;
+
+    return obj_wall_arc_steer_f;
 }
 
 
@@ -2238,6 +2360,9 @@ static void ControlStep10ms(void)
         uint8_t line_detected = 0;
         float w_sum = 0.0f;
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+            ObjWallUpdateAdc((float)adcAvg[OBJ_WALL_ADC_IDX]);
+        }
+        if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
             // Detección de objetos: sensores de largo alcance ADC 5-8 (índices 4-7).
             // Si cualquier sensor baja del umbral durante OBJ_DETECT_DEBOUNCE_CNT ciclos
             // consecutivos (10 ciclos = 100 ms), arranca la secuencia de evasión.
@@ -2266,6 +2391,7 @@ static void ControlStep10ms(void)
                     obj_rot_phase       = 0;
                     obj_rot_heading     = 0.0f;
                     obj_rot_phase1_ms   = 0;
+                    ObjWallResetController();
                 }
             }
 
@@ -2804,7 +2930,7 @@ static void ControlStep10ms(void)
                 // corrección que la reversa pareja (ver switch más abajo). Si todavía hay
                 // velocidad residual de avance, frena primero (upright + freno de encoders)
                 // en vez de arrancar la reversa de golpe con inercia hacia adelante.
-                if ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_REVERSE_THOLD) {
+                if (obj_wall_reverse_f) {
                     obj_wall_vel_integral = 0.0f;
                     if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
                         base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
@@ -2840,7 +2966,7 @@ static void ControlStep10ms(void)
             } else if (line_state == LINE_STATE_OBJ_PARED_LIBRE) {
                 // Mismo esquema que OBJ_WALL_FWD (reversa si demasiado cerca, si no PI de
                 // velocidad avanzando) -- ver comentarios ahí arriba.
-                if ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_REVERSE_THOLD) {
+                if (obj_wall_reverse_f) {
                     obj_wall_vel_integral = 0.0f;
                     if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
                         base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
@@ -2874,7 +3000,7 @@ static void ControlStep10ms(void)
                 // Wall-following girando: upright puro, motores controlados por line_pivot_active.
                 // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás (reversa pareja),
                 // con la misma espera de estabilidad que en OBJ_WALL_FWD antes de arrancar.
-                if ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_REVERSE_THOLD) {
+                if (obj_wall_reverse_f) {
                     if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
                         base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
                         brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
@@ -3150,6 +3276,7 @@ static void ControlStep10ms(void)
                 obj_wall_lost_ms           = 0;
                 obj_wall_seq_start_ms      = 0;
                 obj_wall_clear_initialized = 0;
+                ObjWallResetController();
                 lrot_brake_start_ms        = 0;
                 lrot_settle_start_ms       = 0;
                 edge_wait_start_ms         = 0;
@@ -4406,6 +4533,8 @@ static void ControlStep10ms(void)
                             obj_wall_fwd_start_ms      = HAL_GetTick();
                             obj_wall_seq_start_ms      = HAL_GetTick();
                             obj_wall_vel_integral      = 0.0f;
+                            obj_wall_arc_active        = 0;
+                            obj_wall_arc_steer_f       = 0.0f;
                         }
                         break;
                     }
@@ -4419,7 +4548,7 @@ static void ControlStep10ms(void)
                     {
                         // Avanza despacio (PI de velocidad) hasta que ADC7 detecta la pared.
                         // Timeout OBJ_WALL_APPROACH_TIMEOUT → vuelve a FOLLOWING si no encuentra pared.
-                        uint8_t wall_found = ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD);
+                        uint8_t wall_found = obj_wall_visible_f;
                         if (f_fallen) {
                             line_state                 = LINE_STATE_FOLLOWING;
                             obj_wall_approach_start_ms = 0;
@@ -4430,6 +4559,8 @@ static void ControlStep10ms(void)
                             obj_wall_fwd_start_ms      = HAL_GetTick();
                             obj_wall_seq_start_ms      = HAL_GetTick();
                             obj_wall_vel_integral      = 0.0f;
+                            obj_wall_arc_active        = 0;
+                            obj_wall_arc_steer_f       = 0.0f;
                         } else if ((HAL_GetTick() - obj_wall_approach_start_ms) >= OBJ_WALL_APPROACH_TIMEOUT) {
                             line_state                 = LINE_STATE_OBJ_BORDEAR_PARED;
                             obj_wall_approach_start_ms = 0;
@@ -4457,10 +4588,9 @@ static void ControlStep10ms(void)
                         // este estado desde GIRO_PARED, dejando la línea ignorada indefinidamente
                         // mientras el robot oscilaba entre bordear/girar buscando la pared.
                         uint8_t line_ignore   = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
-                        float wall_adc        = (float)adcAvg[OBJ_WALL_ADC_IDX];
-                        uint8_t wall_visible  = (wall_adc < OBJ_WALL_THRESHOLD);
-                        uint8_t wall_reverse  = (wall_adc < OBJ_WALL_REVERSE_THOLD);
-                        uint8_t too_close     = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
+                        uint8_t wall_visible  = obj_wall_visible_f;
+                        uint8_t wall_reverse  = obj_wall_reverse_f;
+                        uint8_t too_close     = obj_wall_too_close_f;
                         if (line_detected && !line_ignore) {
                             line_seen_since_entry = 1;
                             line_state          = LINE_STATE_FOLLOWING;
@@ -4472,6 +4602,7 @@ static void ControlStep10ms(void)
                             steering_adjustment = 0.0f;
                             obj_wall_fwd_start_ms = 0;
                             obj_wall_seq_start_ms = 0;
+                            ObjWallResetController();
                             obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
                         } else if (wall_reverse) {
                             // Demasiado cerca: reversa pareja (mismo P que LINE_STATE_OBJ_RETROCESO,
@@ -4505,7 +4636,7 @@ static void ControlStep10ms(void)
                             obj_wall_lost_ms           = HAL_GetTick();  // arranca la ventana de 2s de ignorar línea en WALL_CLEAR/WALL_TURN
                         } else {
                             // Avanza hacia adelante con ángulo fijo; yaw-lock se aplica al calcular motores.
-                            steering_adjustment = 0.0f;
+                            steering_adjustment = ObjWallComputeArcSteer();
                             obj_rev_steer_f      = 0.0f;
                         }
                         break;
@@ -4530,9 +4661,8 @@ static void ControlStep10ms(void)
                         __enable_irq();
                         int32_t clear_counts = (abs(clear_dr) + abs(clear_dl)) / 2;
 
-                        float wall_adc       = (float)adcAvg[OBJ_WALL_ADC_IDX];
-                        uint8_t wall_reverse = (wall_adc < OBJ_WALL_REVERSE_THOLD);
-                        uint8_t too_close    = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
+                        uint8_t wall_reverse = obj_wall_reverse_f;
+                        uint8_t too_close    = obj_wall_too_close_f;
                         // Misma ventana que BORDEAR_PARED, medida desde la entrada a TODA
                         // la secuencia (obj_wall_seq_start_ms) — ver fix 2026-07-05.
                         uint8_t line_ignore2 = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
@@ -4548,6 +4678,7 @@ static void ControlStep10ms(void)
                             steering_adjustment = 0.0f;
                             obj_wall_clear_initialized = 0;
                             obj_wall_seq_start_ms = 0;
+                            ObjWallResetController();
                             obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
                         } else if (wall_reverse) {
                             float rate_diff = speed_right_rps_s - speed_left_rps_s;
@@ -4571,7 +4702,7 @@ static void ControlStep10ms(void)
                             steering_adjustment        = 0.0f;
                             obj_wall_clear_initialized = 0;
                         } else {
-                            steering_adjustment = 0.0f;
+                            steering_adjustment = ObjWallComputeArcSteer();
                             obj_rev_steer_f      = 0.0f;
                         }
                         break;
@@ -4582,10 +4713,9 @@ static void ControlStep10ms(void)
                         // Pivot izquierda hasta re-ver el objeto en ADC7 o detectar línea.
                         // ADC7 < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
                         // TOO_CLOSE_THOLD → pivot derecha en cambio.
-                        float wall_adc       = (float)adcAvg[OBJ_WALL_ADC_IDX];
-                        uint8_t wall_visible = (wall_adc < OBJ_WALL_THRESHOLD);
-                        uint8_t wall_reverse = (wall_adc < OBJ_WALL_REVERSE_THOLD);
-                        uint8_t too_close    = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
+                        uint8_t wall_visible = obj_wall_visible_f;
+                        uint8_t wall_reverse = obj_wall_reverse_f;
+                        uint8_t too_close    = obj_wall_too_close_f;
                         // Misma ventana que BORDEAR_PARED/PARED_LIBRE, medida desde la
                         // entrada a toda la secuencia (obj_wall_seq_start_ms).
                         uint8_t line_ignore2 = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
@@ -4600,6 +4730,7 @@ static void ControlStep10ms(void)
                             steering_adjustment = 0.0f;
                             line_pivot_active   = 0;
                             obj_wall_seq_start_ms = 0;
+                            ObjWallResetController();
                             obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
                         } else if (wall_reverse) {
                             // Demasiado cerca: reversa pareja (mismo P que LINE_STATE_OBJ_RETROCESO,
