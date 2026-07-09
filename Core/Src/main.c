@@ -614,9 +614,27 @@ volatile int32_t encoder_left  = 0;
 // ODOM_THETA_SIGN: si al girar a la DERECHA θ se hace más POSITIVO, invertir a -1.0f
 // (la convención deseada es la matemática estándar: antihorario = positivo).
 #define ODOM_THETA_SIGN  (+1.0f)
+// Mejoras de precisión (2026-07-09):
+// - Gating de pivot: 1 count de encoder = ~6.3mm; girando en el lugar los ticks de
+//   cada rueda caen en ciclos de 10ms DISTINTOS con el rumbo cambiando rápido, y esos
+//   pasos de ±1 count integrados a rumbos diferentes no se cancelan → la posición
+//   "camina" al rotar. Si el robot claramente está pivoteando (|gz| alto) y el avance
+//   neto del ciclo es ≤1 count, se descarta la traslación de ese ciclo.
+// - Bias residual de gyro Z aprendido en línea (solo para odometría): el bias fijo
+//   de fábrica deriva con la temperatura; con el robot quieto (encoders sin ticks)
+//   se estima el residuo con una EMA lenta y se resta al integrar θ.
+// - Integración de 2º orden (rumbo de mitad de paso) para menos sesgo en curvas.
+#define ODOM_PIVOT_GZ_DPS      40.0f   // |gz| por encima de esto = "está pivoteando"
+#define ODOM_PIVOT_MAX_COUNTS  1       // avance neto (|dR+dL|) tolerado como ruido durante pivot
+#define ODOM_GZ_STILL_LSB      150.0f  // |gz| crudo por debajo de esto puede ser bias (~1.5 dps)
+#define ODOM_GZ_BIAS_ALPHA     0.005f  // EMA del bias (tau ~2s a 100Hz, solo quieto)
+#define ODOM_GZ_BIAS_MAX_LSB   200.0f  // clamp de seguridad del bias aprendido (±2 dps)
+#define ODOM_STILL_MIN_CYCLES  50      // ciclos quieto (500ms) antes de empezar a aprender
 static float odom_x_m       = 0.0f;
 static float odom_y_m       = 0.0f;
 static float odom_theta_deg = 0.0f;
+static float    odom_gz_bias_f   = 0.0f;  // bias residual de gz aprendido (LSB), solo odometría
+static uint16_t odom_still_cnt   = 0;     // ciclos consecutivos con el robot quieto
 // Pose del último punto donde se vio la línea (para el retorno por odometría en
 // LOST_FWD). Se actualiza cada ciclo con línea detectada en FOLLOWING.
 static float   line_loss_x_m       = 0.0f;
@@ -2202,13 +2220,40 @@ static void ControlStep10ms(void)
 		// (velocity_est_f negativo = adelante, ver vel_enc arriba).
 		// Durante caídas no se integra: las ruedas pueden girar sin traccionar.
 		if (!f_fallen) {
+			// Bias residual de gz aprendido con el robot quieto (ver defines ODOM_GZ_*):
+			// encoders sin ticks + gz chico durante 500ms → EMA lenta del residuo.
+			if (delta_right == 0 && delta_left == 0 &&
+			    fabsf((float)gz - odom_gz_bias_f) < ODOM_GZ_STILL_LSB) {
+				if (odom_still_cnt < 65535) odom_still_cnt++;
+				if (odom_still_cnt >= ODOM_STILL_MIN_CYCLES) {
+					odom_gz_bias_f += ODOM_GZ_BIAS_ALPHA * ((float)gz - odom_gz_bias_f);
+					odom_gz_bias_f = clampf_local(odom_gz_bias_f,
+					                              -ODOM_GZ_BIAS_MAX_LSB, ODOM_GZ_BIAS_MAX_LSB);
+				}
+			} else {
+				odom_still_cnt = 0;
+			}
+			float gz_odom_dps = ((float)gz - odom_gz_bias_f) / 100.0f;
+
 			float odom_d = ((float)(delta_right + delta_left) * 0.5f / ENC_CPR) * ENC_VEL_SCALE;
-			odom_theta_deg += ODOM_THETA_SIGN * ((float)gz / 100.0f) * DT_CTRL_FIXED;
+
+			// Gating de pivot: rotando en el lugar, el avance neto de ±1 count por
+			// ciclo es ruido de cuantización/timing, no traslación real — integrarlo
+			// con el rumbo cambiando hace "caminar" la posición (ver defines arriba).
+			if (fabsf(gz_odom_dps) > ODOM_PIVOT_GZ_DPS &&
+			    abs(delta_right + delta_left) <= ODOM_PIVOT_MAX_COUNTS) {
+				odom_d = 0.0f;
+			}
+
+			// Integración de 2º orden: la traslación usa el rumbo de MITAD de paso
+			// (θ + Δθ/2), no el rumbo final — menos sesgo sistemático en arcos.
+			float odom_dth = ODOM_THETA_SIGN * gz_odom_dps * DT_CTRL_FIXED;
+			float odom_th_mid_rad = (odom_theta_deg + 0.5f * odom_dth) * (M_PI / 180.0f);
+			odom_theta_deg += odom_dth;
 			if      (odom_theta_deg >  180.0f) odom_theta_deg -= 360.0f;
 			else if (odom_theta_deg < -180.0f) odom_theta_deg += 360.0f;
-			float odom_th_rad = odom_theta_deg * (M_PI / 180.0f);
-			odom_x_m += odom_d * cosf(odom_th_rad);
-			odom_y_m += odom_d * sinf(odom_th_rad);
+			odom_x_m += odom_d * cosf(odom_th_mid_rad);
+			odom_y_m += odom_d * sinf(odom_th_mid_rad);
 		}
 
 		// Steering PID de lazo cerrado: disponible mientras speed_r/l están en scope.
@@ -4936,6 +4981,11 @@ static void ControlStep10ms(void)
             odata.line_detected = line_detected_disp;
             odata.robot_state   = robot_state;
             odata.line_state    = (uint8_t)line_state;
+            odata.adc5          = adcAvg[4];  // sensores de objeto: menos = más cerca,
+            odata.adc6          = adcAvg[5];  // ~4095 = nada adelante — para graficar
+            odata.adc7          = adcAvg[6];  // la barrera/cuerpo frente al robot en Qt
+            odata.adc8          = adcAvg[7];
+            odata.roll_deg      = filtered_roll_deg;  // balanceo → Vista 3D de Qt
 
             UNER_SendWifiOdomData(&odata);
         }

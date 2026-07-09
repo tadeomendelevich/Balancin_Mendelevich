@@ -196,6 +196,11 @@ typedef struct __attribute__((packed)) {
     uint8_t  line_detected;    // 1 si en este ciclo se vio la línea
     uint8_t  robot_state;      // eRobotState
     uint8_t  line_state;       // eLineState (solo válido si robot_state==LINE_FOLLOWING)
+    uint16_t adc5;             // sensores de objeto (adcAvg[4..7]): menos = más cerca,
+    uint16_t adc6;             // ~4095 = nada adelante. Para graficar en Qt una barrera/
+    uint16_t adc7;             // cuerpo frente al robot cuando está viendo algo.
+    uint16_t adc8;
+    float    roll_deg;         // ángulo de balanceo (filtered_roll_deg) — alimenta la Vista 3D de Qt sin depender de ACTIVATE_WIFI_LOG
 } WifiOdomData_t;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr);
