@@ -119,12 +119,22 @@ typedef enum {
 #define SETPOINT_ANGLE 	0.0f
 
 #define SOFT_ZONE_ANGLE_DEG   1.50f   // error a partir del cual el PID va al 100%
-#define SOFT_ZONE_MIN_SCALE   0.15f   // escala mínima cuando el error es ~0
-// Zona de hold con histéresis: silencia PID en el punto dulce de equilibrio
-#define BALANCE_HOLD_ENTER_ANGLE_DEG  0.70f  // entra en hold si |error| <= este valor
-#define BALANCE_HOLD_EXIT_ANGLE_DEG   0.90f  // sale de hold si |error| >= este valor
-#define BALANCE_HOLD_ENTER_GYRO_DPS   4.0f   // entra en hold si |gyro| <= este valor
-#define BALANCE_HOLD_EXIT_GYRO_DPS    10.0f  // sale de hold si |gyro| >= este valor
+// 2026-07-10: 0.15 -> 0.35. Con 0.15, cerca del equilibrio el PID quedaba al
+// 15% de autoridad y casi todo comando caia debajo de MOTOR_CMD_NEUTRAL (+-2):
+// sin par hasta que el error ya era grande -> bamboleo lento de lado a lado.
+#define SOFT_ZONE_MIN_SCALE   0.35f   // escala mínima cuando el error es ~0
+// Zona de hold con histéresis: silencia P/I en el punto dulce de equilibrio.
+// 2026-07-10: zona achicada (0.70/0.90 -> 0.25/0.45, gyro 4/10 -> 2/6) y el D
+// ya NO se apaga dentro del hold (ver bloque del PID). Con la zona vieja el
+// robot quedaba a la deriva casi 1 grado entero con motores muertos: un pendulo
+// invertido SIEMPRE se cae en lazo abierto, asi que el hold ancho garantizaba
+// un ciclo limite (caer -> atajar -> cruzar con impulso -> caer del otro lado)
+// = el "se bambolea sin quedarse quieto". El anti-chatter real en parado lo da
+// MOTOR_CMD_NEUTRAL, no este hold.
+#define BALANCE_HOLD_ENTER_ANGLE_DEG  0.25f  // entra en hold si |error| <= este valor
+#define BALANCE_HOLD_EXIT_ANGLE_DEG   0.45f  // sale de hold si |error| >= este valor
+#define BALANCE_HOLD_ENTER_GYRO_DPS   2.0f   // entra en hold si |gyro| <= este valor
+#define BALANCE_HOLD_EXIT_GYRO_DPS    6.0f   // sale de hold si |gyro| >= este valor
 
 // Complementary Filter / PID timing
 #define ALPHA 0.98f
@@ -149,6 +159,15 @@ typedef enum {
 
 #define MOTOR_RIGHT_DEADBAND  	8   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
 #define MOTOR_LEFT_DEADBAND   	8   // ídem motor izquierdo — ajustar si el izq. no arranca a PWM bajo
+// 2026-07-10 (fix bamboleo, parte 2): los 8 de arriba compensan la friccion
+// ESTATICA (arrancar la rueda parada). Con la rueda YA girando la friccion es
+// cinetica (mucho menor) y sumar 8 igual convierte cada cruce por la zona
+// neutra en una patada de ~11 PWM — un rele que, sobre una planta inestable,
+// sostiene un ciclo limite (el bamboleo). Con ticks de encoder en los ultimos
+// WHEEL_MOVING_WINDOW_MS se usa el offset cinetico; sin ticks (parada de
+// verdad), el estatico completo para vencer el arranque.
+#define MOTOR_DEADBAND_KINETIC  	4   // offset cuando la rueda ya esta girando
+#define WHEEL_MOVING_WINDOW_MS  	80  // rueda "en movimiento" si tickeo hace menos de esto
 // Zona neutra de comando: |comando| <= este valor => motor directamente en 0,
 // SIN saltar a ±DEADBAND. Sin esto, cualquier chatter de ±1 PWM del PID cerca
 // del equilibrio se convierte en golpes de ±9 PWM a 100 Hz (la compensación de
@@ -420,21 +439,30 @@ static uint8_t esp01RxBuf[ESP01RXBUFAT];
 static uint16_t esp01IwRx = 0;
 static uint16_t esp01IrRx = 0;		/* Índice de lectura para el buffer UDP entrante */
 
-//const char *wifiSSID     = "FCAL";
-//const char *wifiPassword = "fcalconcordia.06-2019";
-//const char *wifiIp = "172.23.205.98";
+// ── Perfiles de red WiFi ─────────────────────────────────────────────────
+// Para cambiar de red: tocar SOLO el número de WIFI_PROFILE_ACTIVE.
+// Para agregar una red nueva: sumar una fila a la tabla (y opcionalmente a
+// CLAUDE.md). SSID/password/IP quedan sincronizados automáticamente, ya no
+// hace falta descomentar/comentar bloques en más de un lugar.
+typedef struct {
+    const char *ssid;
+    const char *password;
+    const char *ip;
+    const char *label;
+} WifiProfile_t;
 
-const char *wifiSSID     = "MEGACABLE FIBRA-2.4G-ckd0";
-const char *wifiPassword = "djg19dlk";
-const char *wifiIp 		 = "192.168.100.5";
+static const WifiProfile_t wifiProfiles[] = {
+    /* 0 */ { "FCAL",                      "fcalconcordia.06-2019", "172.23.205.98", "FCAL / Universidad" },
+    /* 1 */ { "MEGACABLE FIBRA-2.4G-ckd0", "djg19dlk",              "192.168.100.5", "Casa" },
+    /* 2 */ { "Delco_Mendelevich",         "toyotakia",             "192.168.1.23",  "Delco Mendelevich" },
+    /* 3 */ { "Wifi Habitaciones",         "toyotakia",             "192.168.1.48",  "Wifi Habitaciones" },
+};
 
-//const char *wifiSSID     = "Delco_Mendelevich";
-//const char *wifiPassword = "toyotakia";
-//const char *wifiIp = "192.168.1.55";
+#define WIFI_PROFILE_ACTIVE  2   /* <<< NUMERO DE RED ELEGIDA >>> */
 
-//const char *wifiSSID     = "Wifi Habitaciones";
-//const char *wifiPassword = "toyotakia";
-//const char *wifiIp = "192.168.1.48";
+const char *wifiSSID;
+const char *wifiPassword;
+const char *wifiIp;
 
 int16_t motorRightVelocity = 0;
 int16_t motorLeftVelocity  = 0;
@@ -535,6 +563,16 @@ static float line_obj_rev_vel_integral = 0.0f;  // integral del PI de velocidad 
 static float line_steer_fb_int      = 0.0f;  // integral del inner steering PI (idea 2)
 static float speed_right_rps_s      = 0.0f;  // velocidad rueda derecha, accesible fuera del bloque encoder
 static float speed_left_rps_s       = 0.0f;  // velocidad rueda izquierda, accesible fuera del bloque encoder
+static uint32_t wheel_r_last_tick_ms = 0;    // último tick de encoder derecho (deadband cinético/estático)
+static uint32_t wheel_l_last_tick_ms = 0;    // ídem izquierdo
+// Velocidad LENTA (tau ~0.5s) SOLO para el freno traslacional: meciéndose en el
+// lugar la velocidad alterna de signo a ~1Hz y este filtro la promedia a ~0
+// (no dispara el freno); una deriva real sostenida sí pasa (con ~0.5-1s de
+// retardo, aceptable para frenar un empujón). Con el filtro rápido de antes
+// (VEL_LPF_BETA=0.35) el freno inclinaba el setpoint alternando de signo con
+// retardo y BOMBEABA el bamboleo en vez de frenarlo.
+#define VEL_SLOW_BETA  0.02f
+static float velocity_est_slow_f    = 0.0f;
 static float line_error_disp        = 0.0f;  // último error de línea, para mostrar en pantalla
 static uint8_t line_detected_disp   = 0;      // línea detectada en el ciclo actual, para telemetría WiFi
 static float pwm_sat_prev = 0.0f;
@@ -1414,7 +1452,10 @@ static float ComputeBrakeSetpointTarget(uint8_t state)
         return 0.0f;
     }
 
-    float vel_for_brake = apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND);
+    // 2026-07-10: velocidad LENTA (tau ~0.5s) en lugar de velocity_est_f — el
+    // vaivén en el lugar promedia a ~0 y ya no dispara el freno (que bombeaba
+    // la oscilación); la deriva real sostenida sigue pasando. Ver VEL_SLOW_BETA.
+    float vel_for_brake = apply_deadbandf(velocity_est_slow_f, BRAKE_VEL_DEADBAND);
     vel_for_brake = clampf_local(vel_for_brake, -BRAKE_VEL_MAX, BRAKE_VEL_MAX);
     float brake_tilt_max = (state == ROBOT_STATE_MANUAL_CONTROL)
                          ? BRAKE_TILT_MAX_MANUAL
@@ -1759,15 +1800,17 @@ void updateDisplay(void) {
         snprintf(lbuf, sizeof(lbuf), "TR:%s", nbuf);
         OLED_Str5(2, 57, lbuf);
 
-        // ── Derecha: error, velocidad, yaw, motores ──
+        // ── Derecha: ganancias PID + velocidad + motores ──
         {
             const uint16_t rx = 67;
-            FormatSignedFixed(nbuf, sizeof(nbuf), dynamic_setpoint_f - filtered_roll_deg, 2);
-            snprintf(lbuf, sizeof(lbuf), "ER:%s", nbuf);  OLED_Str5(rx, 13, lbuf);
+            FormatSignedFixed(nbuf, sizeof(nbuf), KP_value, 3);
+            snprintf(lbuf, sizeof(lbuf), "KP:%s", nbuf + 1);  OLED_Str5(rx, 12, lbuf);
+            FormatSignedFixed(nbuf, sizeof(nbuf), KI_value, 3);
+            snprintf(lbuf, sizeof(lbuf), "KI:%s", nbuf + 1);  OLED_Str5(rx, 21, lbuf);
+            FormatSignedFixed(nbuf, sizeof(nbuf), KD_value, 3);
+            snprintf(lbuf, sizeof(lbuf), "KD:%s", nbuf + 1);  OLED_Str5(rx, 30, lbuf);
             FormatSignedFixed(nbuf, sizeof(nbuf), velocity_est_f, 2);
-            snprintf(lbuf, sizeof(lbuf), "VE:%s", nbuf);  OLED_Str5(rx, 28, lbuf);
-            FormatSignedFixed(nbuf, sizeof(nbuf), (float)gz / 100.0f, 0);
-            snprintf(lbuf, sizeof(lbuf), "GZ:%s", nbuf);  OLED_Str5(rx, 43, lbuf);
+            snprintf(lbuf, sizeof(lbuf), "VE:%s", nbuf);      OLED_Str5(rx, 39, lbuf);
 
             if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
                 uint8_t cmd = UNER_GetLastManualCmd();
@@ -2211,8 +2254,11 @@ static void ControlStep10ms(void)
 		vel_enc = clampf_local(vel_enc, -20.0f, 20.0f);
 		velocity_est    = vel_enc;
 		velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+		velocity_est_slow_f += VEL_SLOW_BETA * (velocity_est - velocity_est_slow_f);
 		speed_right_rps_s = speed_right_rps;
 		speed_left_rps_s  = speed_left_rps;
+		if (delta_right != 0) wheel_r_last_tick_ms = HAL_GetTick();
+		if (delta_left  != 0) wheel_l_last_tick_ms = HAL_GetTick();
 
 		// ── ODOMETRÍA DE POSE ────────────────────────────────────────────
 		// Distancia por encoders + rumbo por gyro Z, integrados cada ciclo.
@@ -2595,6 +2641,7 @@ static void ControlStep10ms(void)
             steering_adjustment = 0.0f;
             velocity_est        = 0.0f;
             velocity_est_f      = 0.0f;
+            velocity_est_slow_f = 0.0f;
             vel_from_accel      = 0.0f;
             line_vel_integral   = 0.0f;
             line_obj_rev_vel_integral = 0.0f;
@@ -2662,6 +2709,7 @@ static void ControlStep10ms(void)
             steering_adjustment = 0.0f;
             velocity_est        = 0.0f;
             velocity_est_f      = 0.0f;
+            velocity_est_slow_f = 0.0f;
             vel_from_accel      = 0.0f;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
@@ -3222,6 +3270,7 @@ static void ControlStep10ms(void)
                 balance_hold_active = 0;
                 velocity_est        = 0.0f;
                 velocity_est_f      = 0.0f;
+                velocity_est_slow_f = 0.0f;
                 vel_from_accel      = 0.0f;
                 line_integral       = 0.0f;
                 line_obj_rev_vel_integral = 0.0f;
@@ -3281,6 +3330,7 @@ static void ControlStep10ms(void)
                 balance_hold_active       = 0;
                 velocity_est              = 0.0f;
                 velocity_est_f            = 0.0f;
+                velocity_est_slow_f       = 0.0f;
                 vel_from_accel            = 0.0f;
                 line_integral             = 0.0f;
                 line_obj_rev_vel_integral = 0.0f;
@@ -3305,6 +3355,7 @@ static void ControlStep10ms(void)
                 integral           = 0.0f;
 				velocity_est       = 0.0f;
 				velocity_est_f     = 0.0f;
+				velocity_est_slow_f = 0.0f;
 				vel_from_accel     = 0.0f;
                 dynamic_setpoint   = SETPOINT_ANGLE + setpoint_trim;
                 dynamic_setpoint_f = SETPOINT_ANGLE + setpoint_trim;
@@ -3390,15 +3441,26 @@ static void ControlStep10ms(void)
                         balance_hold_active = 0;
                 }
 
-                if (balance_hold_active) {
-                    balance_pi_scale = 0.0f;
-                    balance_d_scale  = 0.0f;
-                    integral *= 0.98f;
-                } else {
+                {
                     float x = abs_error / SOFT_ZONE_ANGLE_DEG;
                     if (x > 1.0f) x = 1.0f;
-                    balance_pi_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;
-                    balance_d_scale  = balance_pi_scale;
+                    float soft_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;
+
+                    if (balance_hold_active) {
+                        // Hold: silencia P/I (sin chatter por offset residual de
+                        // angulo) pero deja el D VIVO — parado de verdad D~0 igual
+                        // (gyro en cero), y apenas el robot empieza a caerse el D
+                        // frena la caida ANTES de que el error cruce el umbral de
+                        // salida del hold. Con D tambien apagado (version previa,
+                        // hasta 2026-07-10) el hold era "motores muertos hasta que
+                        // la caida ya tomo impulso" -> bamboleo permanente.
+                        balance_pi_scale = 0.0f;
+                        balance_d_scale  = soft_scale;
+                        integral *= 0.98f;
+                    } else {
+                        balance_pi_scale = soft_scale;
+                        balance_d_scale  = soft_scale;
+                    }
                 }
 
                 p_term *= balance_pi_scale;
@@ -5064,17 +5126,28 @@ static void ControlStep10ms(void)
     } else if ((robot_state != ROBOT_STATE_IDLE) && !f_fallen) {
         // Zona neutra: comandos chicos van a 0 en vez de saltar a ±DEADBAND
         // (ver MOTOR_CMD_NEUTRAL — anti-temblor cerca del equilibrio).
+        // Deadband adaptativo (2026-07-10): offset estático completo solo con la
+        // rueda realmente parada (sin ticks de encoder hace WHEEL_MOVING_WINDOW_MS);
+        // girando, offset cinético menor — mata las patadas de ±11 PWM en cada
+        // cruce por la zona neutra que sostenían el bamboleo (relé sobre planta
+        // inestable). Ver comentario en los defines MOTOR_DEADBAND_KINETIC.
+        uint32_t now_db = HAL_GetTick();
+        int16_t dbR = (now_db - wheel_r_last_tick_ms < WHEEL_MOVING_WINDOW_MS)
+                    ? MOTOR_DEADBAND_KINETIC : MOTOR_RIGHT_DEADBAND;
+        int16_t dbL = (now_db - wheel_l_last_tick_ms < WHEEL_MOVING_WINDOW_MS)
+                    ? MOTOR_DEADBAND_KINETIC : MOTOR_LEFT_DEADBAND;
+
         int16_t mR_comp = motorRightVelocity;
         if (mR_comp >= -MOTOR_CMD_NEUTRAL && mR_comp <= MOTOR_CMD_NEUTRAL) mR_comp = 0;
-        if      (mR_comp > 0)  mR_comp = (int16_t)( mR_comp + MOTOR_RIGHT_DEADBAND);
-        else if (mR_comp < 0)  mR_comp = (int16_t)( mR_comp - MOTOR_RIGHT_DEADBAND);
+        if      (mR_comp > 0)  mR_comp = (int16_t)( mR_comp + dbR);
+        else if (mR_comp < 0)  mR_comp = (int16_t)( mR_comp - dbR);
         if (mR_comp >  100) mR_comp =  100;
         if (mR_comp < -100) mR_comp = -100;
 
         int16_t mL_comp = -motorLeftVelocity;
         if (mL_comp >= -MOTOR_CMD_NEUTRAL && mL_comp <= MOTOR_CMD_NEUTRAL) mL_comp = 0;
-        if      (mL_comp > 0)  mL_comp = (int16_t)( mL_comp + MOTOR_LEFT_DEADBAND);
-        else if (mL_comp < 0)  mL_comp = (int16_t)( mL_comp - MOTOR_LEFT_DEADBAND);
+        if      (mL_comp > 0)  mL_comp = (int16_t)( mL_comp + dbL);
+        else if (mL_comp < 0)  mL_comp = (int16_t)( mL_comp - dbL);
         if (mL_comp >  100) mL_comp =  100;
         if (mL_comp < -100) mL_comp = -100;
 
@@ -5194,6 +5267,10 @@ int main(void)
   HAL_NVIC_SetPriority(TIM2_IRQn,         3, 0);  // muestreo de encoders, debajo de DMA/I2C y MPU
   HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);              // PA8 ya no interrumpe
   HAL_NVIC_SetPriority(TIM5_IRQn,         6, 0);  // libre / no usado por encoders
+
+  wifiSSID     = wifiProfiles[WIFI_PROFILE_ACTIVE].ssid;
+  wifiPassword = wifiProfiles[WIFI_PROFILE_ACTIVE].password;
+  wifiIp       = wifiProfiles[WIFI_PROFILE_ACTIVE].ip;
 
   CDC_Attach_Rx(USBRxData);
   nBytesTx = 0;

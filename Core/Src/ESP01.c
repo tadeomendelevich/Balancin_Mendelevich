@@ -15,10 +15,6 @@
 
 extern void USB_Debug(const char *fmt, ...);
 
-#define SERVER_IP    		"192.168.100.5"	// Wifi Depto
-//#define SERVER_IP    		"172.23.205.98"	// Wifi Facultad
-#define SERVER_PORT  		30010
-#define LOCAL_PORT   		30000
 #define ALIVE_INTERVAL_FAST_MS 	5000
 #define ALIVE_INTERVAL_SLOW_MS 	10000
 #define ALIVE_FAST_COUNT 		20
@@ -1038,7 +1034,10 @@ static void ESP01DOConnection(){
 		} else if (tryingTCP) {
 			tryingTCP = 0;
 			ESP01_USB_DbgStr(">>> TCP CONNECT falló, cambiando a UDP...\r\n");
-			ESP01_StartUDP(SERVER_IP, SERVER_PORT, LOCAL_PORT);
+			// Reintenta con el MISMO destino que ya se había pedido (esp01RemoteIP
+			// quedó seteado por la llamada real hecha desde main.c, vía wifiProfiles[]/
+			// WIFI_PROFILE_ACTIVE) — ya no hay una IP propia hardcodeada acá.
+			ESP01_StartUDP(esp01RemoteIP, atoi(esp01RemotePORT), atoi(esp01LocalPORT));
 		} else {
 			esp01ATSate = ESP01ATCIPSTART;  // reintenta sólo el START
 			esp01TimeoutTask = 1000;        // y dale otro segundo
