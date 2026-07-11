@@ -201,6 +201,8 @@ typedef struct __attribute__((packed)) {
     uint16_t adc7;             // cuerpo frente al robot cuando está viendo algo.
     uint16_t adc8;
     float    roll_deg;         // ángulo de balanceo (filtered_roll_deg) — alimenta la Vista 3D de Qt sin depender de ACTIVATE_WIFI_LOG
+    float    lat_deg;          // inclinación LATERAL (banking alrededor del eje de avance), por
+                               // acelerómetro con EMA — tercer eje de la Vista 3D de Qt (2026-07-10)
 } WifiOdomData_t;
 
 void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr);
