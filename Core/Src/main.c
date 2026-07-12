@@ -338,7 +338,7 @@ typedef enum {
 // el robot realmente estaba quieto. Ahora, igual que LOST_SETTLE: sale por tiempo mínimo
 // Y velocidad/inclinación estabilizadas, con un timeout de seguridad más largo (no un
 // corte normal) por si nunca llega a asentarse del todo.
-#define OBJ_PRE_REVERSE_HOLD_MS    5000U      // tiempo mínimo de balance estático antes de retroceder
+#define OBJ_PRE_REVERSE_HOLD_MS    2000U      // tiempo mínimo de balance estático antes de retroceder (2026-07-11: 5000→2000)
 #define OBJ_PRE_REVERSE_TIMEOUT    6000U      // colchón de seguridad si nunca se asienta
 #define OBJ_PRE_REVERSE_VEL_THR    0.10f      // m/s por debajo del cual se considera "quieto"
 #define OBJ_PRE_REVERSE_TILT_THR   3.0f       // grados de error respecto al setpoint para considerar "quieto"
@@ -404,6 +404,11 @@ typedef enum {
 #define OBJ_WALL_STUCK_WIN_MS      2500U     // ventana de detección de atorado (5000 era mucho tiempo empujando la pared)
 #define OBJ_WALL_STUCK_COUNTS      20        // menos que esto de movimiento en la ventana (~13 cm) = atorado
 #define OBJ_WALL_REV_ESCAPE_COUNTS 60        // counts de la reversa de destrabe (~38 cm)
+// 2026-07-11: si en BORDEAR_PARED/PARED_LIBRE/GIRO_PARED la pared (ADC7) no
+// vuelve a verse en ningún momento durante este tiempo continuo, se aborta
+// toda la secuencia a reposo (ROBOT_STATE_IDLE) en vez de seguir buscándola
+// a ciegas y arriesgar un choque.
+#define OBJ_WALL_MISSING_TIMEOUT_MS 5000U
 // 2026-07-10: verificación del giro de esquive por ADC7. El giro de 90° por
 // encoders/gyro puede quedar corto (la pared no entra en la vista lateral);
 // buena detención = ADC7 < OBJ_ROT_ADC_GOOD al terminar. Si no bajó de ahí,
@@ -720,6 +725,7 @@ static int32_t  obj_wall_rev_goal     = OBJ_WALL_REV_COUNTS; // objetivo de la r
 static int32_t  obj_wall_stuck_r0     = 0;   // snapshot de la ventana de atorado
 static int32_t  obj_wall_stuck_l0     = 0;
 static uint32_t obj_wall_stuck_ms     = 0;   // 0 = ventana sin arrancar
+static uint32_t obj_wall_missing_since_ms = 0; // 0 = pared visible / timer sin arrancar (ver OBJ_WALL_MISSING_TIMEOUT_MS)
 static float    lost_fwd_vel_integral = 0.0f;     // integral del PI de velocidad en LOST_FWD/EDGE_FWD
 static float    obj_wall_vel_integral = 0.0f;     // integral del PI de velocidad en OBJ_WALL_FWD
 static uint32_t obj_brake_start_ms   = 0;         // inicio de OBJ_BRAKE (file-scope para reset en caída)
@@ -2496,9 +2502,28 @@ static void ControlStep10ms(void)
 				    (HAL_GetTick() - obj_wall_rev_latch_ms) > rev_tout)
 					obj_wall_rev_latch = 0;
 			}
+
+			// ── Timeout de pared perdida (2026-07-11) ──
+			// Si en toda la secuencia de pared no se vuelve a ver el objeto
+			// (ADC7 < OBJ_WALL_THRESHOLD) durante OBJ_WALL_MISSING_TIMEOUT_MS
+			// continuos, se abandona la búsqueda: reposo (IDLE) en vez de
+			// seguir avanzando/pivoteando a ciegas y arriesgar un choque.
+			if ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD) {
+				obj_wall_missing_since_ms = 0;
+			} else {
+				if (obj_wall_missing_since_ms == 0) {
+					obj_wall_missing_since_ms = HAL_GetTick();
+				} else if (HAL_GetTick() - obj_wall_missing_since_ms >= OBJ_WALL_MISSING_TIMEOUT_MS) {
+					robot_state               = ROBOT_STATE_IDLE;
+					obj_wall_missing_since_ms = 0;
+					obj_wall_rev_latch        = 0;
+					obj_wall_stuck_ms         = 0;
+				}
+			}
 		} else {
-			obj_wall_rev_latch = 0;
-			obj_wall_stuck_ms  = 0;
+			obj_wall_rev_latch        = 0;
+			obj_wall_stuck_ms         = 0;
+			obj_wall_missing_since_ms = 0;
 		}
 
 		// ── ODOMETRÍA DE POSE ────────────────────────────────────────────
