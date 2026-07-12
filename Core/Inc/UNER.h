@@ -143,24 +143,6 @@ typedef enum{
 
 typedef struct __attribute__((packed)) {
     uint32_t t_ms;
-    uint32_t dt_us;
-    float accel_roll;
-    float gyro_y;
-    float roll_filt;
-    float error;
-    float p_term;
-    float i_term;
-    float d_term;
-    float output;
-    float pwm_cmd;
-    float pwm_sat;
-    uint8_t sat_flag;
-    int16_t mR;
-    int16_t mL;
-} LogData_t;
-
-typedef struct __attribute__((packed)) {
-    uint32_t t_ms;
     float roll_filt;
     float output;
     float p_term;
@@ -229,7 +211,6 @@ void UNER_SendAllSensors(void);
 
 uint8_t UNER_ShouldSendAllSensors(void);
 
-void UNER_SendSerial(_sTx *tx);
 
 /**
  * Registra el buffer de valores ADC para que UNER pueda leerlos.
@@ -265,7 +246,6 @@ void UNER_RegisterSetpointTrim(float *trimPtr);
 
 void UNER_RegisterRobotState(uint8_t *robotStatePtr);
 
-void UNER_SendLogData(LogData_t *data);
 
 void UNER_SendWifiLogData(WifiLogData_t *data);
 

@@ -42,3 +42,4 @@
 "./USB_DEVICE/App/usbd_cdc_if.o"
 "./USB_DEVICE/App/usbd_desc.o"
 "./USB_DEVICE/Target/usbd_conf.o"
+"./Core/Src/i2c_manager.o"

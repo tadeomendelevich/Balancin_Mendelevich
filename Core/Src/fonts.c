@@ -173,7 +173,10 @@ const uint8_t Font5x7[] = {
 FontDef_t Font_5x7 = {
     5,    // ancho de carácter
     7,    // alto de carácter
-    Font5x7
+    // Sin data: esta fuente usa 1 byte/columna (no uint16_t/fila como las demás)
+    // y el dibujado en ssd1306.c accede al array Font5x7 directamente.
+    // No usar con SSD1306_Puts/DrawChar genéricos.
+    NULL
 };
 
 

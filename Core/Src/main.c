@@ -1075,6 +1075,7 @@ void USB_Debug(const char *fmt, ...) {
     while (*fmt) {
         if (*fmt == '%') {
             fmt++;
+            if (*fmt == '\0') break; // '%' al final: no leer más allá del string
             switch (*fmt) {
                 case 's': { // cadena
                     char *s = va_arg(ap, char*);
@@ -2508,7 +2509,11 @@ static void ControlStep10ms(void)
 			// (ADC7 < OBJ_WALL_THRESHOLD) durante OBJ_WALL_MISSING_TIMEOUT_MS
 			// continuos, se abandona la búsqueda: reposo (IDLE) en vez de
 			// seguir avanzando/pivoteando a ciegas y arriesgar un choque.
-			if ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD) {
+			// Durante la reversa de pared el timer no corre: retroceder aleja
+			// la pared de la vista de ADC7 a propósito (la de escape dura
+			// hasta 6s y dispararía el timeout en plena maniobra válida).
+			if (obj_wall_rev_latch ||
+			    (float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD) {
 				obj_wall_missing_since_ms = 0;
 			} else {
 				if (obj_wall_missing_since_ms == 0) {

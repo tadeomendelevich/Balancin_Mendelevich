@@ -571,7 +571,8 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
         case CHANGE_DISPLAY:
             if (p_change_display != NULL) {
-                *p_change_display = (*p_change_display + 1) % 6;
+                // 8 pantallas, igual que el botón físico (main.c): 6=OBJ, 7=ODOM
+                *p_change_display = (*p_change_display + 1) % 8;
                 putHeaderOnTx(dataTx, CHANGE_DISPLAY, 2);
                 putByteOnTx(dataTx, ACK);
                 putByteOnTx(dataTx, dataTx->chk);
@@ -790,13 +791,15 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         {
             // Payload: 4 bytes = float en little-endian (grados; + = derecha, - = izquierda)
             if (p_robot_state != NULL && *p_robot_state == 4 && p_rot_target_deg && p_rot_trigger) {
-                union { uint8_t b[4]; float f; } conv;
-                conv.b[0] = unerRx->buff[(unerRx->indexR + 2) & unerRx->mask];
-                conv.b[1] = unerRx->buff[(unerRx->indexR + 3) & unerRx->mask];
-                conv.b[2] = unerRx->buff[(unerRx->indexR + 4) & unerRx->mask];
-                conv.b[3] = unerRx->buff[(unerRx->indexR + 5) & unerRx->mask];
-                if (conv.f != 0.0f) {
-                    *p_rot_target_deg = conv.f;
+                // Leído con getByteFromRx como el resto de los comandos — la
+                // versión anterior indexaba desde indexR (que acá apunta al
+                // checksum) y caía fuera del frame: leía basura.
+                myWord.ui8[0] = getByteFromRx(dataRx, 1, 0);
+                myWord.ui8[1] = getByteFromRx(dataRx, 1, 0);
+                myWord.ui8[2] = getByteFromRx(dataRx, 1, 0);
+                myWord.ui8[3] = getByteFromRx(dataRx, 1, 0);
+                if (myWord.f32 != 0.0f) {
+                    *p_rot_target_deg = myWord.f32;
                     *p_rot_trigger    = 1;
                 }
             }
@@ -867,7 +870,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			putByteOnTx(dataTx, myWord.ui8[2] );
 			putByteOnTx(dataTx, myWord.ui8[3] );
 
-			putByteOnTx(dataTx, unerTx->chk);
+			putByteOnTx(dataTx, dataTx->chk);
         	break;
         case GET_ODOMETRY:
             if (p_odom_x && p_odom_y && p_odom_theta) {
@@ -1023,23 +1026,6 @@ uint8_t UNER_ShouldSendAllSensors(void) {
     return sendAllSensorsFlag;
 }
 
-void UNER_SendSerial(_sTx *tx)
-{
-    uint16_t len = (tx->indexW + tx->mask + 1 - tx->indexR) & tx->mask;
-    if (!len) return;
-
-    uint8_t tmp[TXBUFSIZE];
-    for (uint16_t i = 0; i < len; i++) {
-        tmp[i] = tx->buff[(tx->indexR + i) & tx->mask];
-    }
-    // ---> envío asíncrono y no bloqueante <---
-    if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED) {
-        usb_enqueue_tx(tmp, len);
-    }
-    tx->indexR = tx->indexW;
-}
-
-
 void UNER_RegisterADCBuffer(uint16_t *buf, uint8_t len) {
     p_adcBuf   = buf;
     adcBufLen  = len;
@@ -1159,25 +1145,6 @@ void UNER_SendWifiOdomData(WifiOdomData_t *data) {
     uint8_t payloadLen = sizeof(WifiOdomData_t);
 
     putHeaderOnTx(unerTx, CMD_WIFI_ODOM_DATA, payloadLen + 1);
-
-    uint8_t *p = (uint8_t*)data;
-    for (uint8_t i = 0; i < payloadLen; i++) {
-        putByteOnTx(unerTx, p[i]);
-    }
-
-    putByteOnTx(unerTx, unerTx->chk);
-
-    UNER_SendData();
-}
-
-void UNER_SendLogData(LogData_t *data) {
-    if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending()) {
-        return;
-    }
-
-    uint8_t payloadLen = sizeof(LogData_t);
-
-    putHeaderOnTx(unerTx, CMD_LOG_DATA, payloadLen);
 
     uint8_t *p = (uint8_t*)data;
     for (uint8_t i = 0; i < payloadLen; i++) {

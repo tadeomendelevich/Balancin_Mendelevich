@@ -7,6 +7,7 @@
 C_SRCS += \
 ../Core/Src/ESP01.c \
 ../Core/Src/MPU6050.c \
+../Core/Src/i2c_manager.c \
 ../Core/Src/UNER.c \
 ../Core/Src/fonts.c \
 ../Core/Src/main.c \
@@ -20,6 +21,7 @@ C_SRCS += \
 OBJS += \
 ./Core/Src/ESP01.o \
 ./Core/Src/MPU6050.o \
+./Core/Src/i2c_manager.o \
 ./Core/Src/UNER.o \
 ./Core/Src/fonts.o \
 ./Core/Src/main.o \
@@ -33,6 +35,7 @@ OBJS += \
 C_DEPS += \
 ./Core/Src/ESP01.d \
 ./Core/Src/MPU6050.d \
+./Core/Src/i2c_manager.d \
 ./Core/Src/UNER.d \
 ./Core/Src/fonts.d \
 ./Core/Src/main.d \
