@@ -285,12 +285,18 @@ typedef enum {
 #define LINE_REV_BOOST_DOWN     0.10f  // bajada max por ciclo de control
 #define LINE_REV_VEL_START      0.05f  // m/s de reversa desde donde empieza a actuar
 #define LINE_REV_VEL_FULL       0.35f  // m/s de reversa para aplicar boost maximo
-#define LINE_OBJ_REV_SPEED_MAX  0.30f  // m/s objetivo maximo durante reversa por obstaculo
-#define LINE_OBJ_REV_SPEED_MIN  0.10f  // m/s minimo para que la reversa no se quede sin empuje
-#define LINE_OBJ_REV_TILT_MAX   8.5f   // inclinacion maxima hacia atras durante reversa por obstaculo
-#define LINE_OBJ_REV_VEL_KP    28.0f   // ganancia P dedicada al PI de velocidad en reversa
-#define LINE_OBJ_REV_STEER_GAIN 0.70f  // escala del PID de linea cuando corrige marcha atras
-#define LINE_OBJ_REV_STEER_MAX  16.0f  // limite de steering durante reversa siguiendo linea
+#define LINE_OBJ_REV_TILT_MAX   8.5f   // tope de inclinacion hacia atras en reversa (limite negativo del setpoint)
+// 2026-07-13: la reversa por obstáculo dejó de ser un PI de velocidad cerrado.
+// Ese lazo no tenía equilibrio posible: el target (≤0.30 m/s) quedaba DEBAJO del
+// piso de medición (deadband 0.35 sobre la velocidad cuantizada de encoders) —
+// medido 0 → empuje máximo + windup; al cruzar el deadband el error saltaba
+// negativo de golpe (KP=28 → 3° por escalón del LPF) → freno activo → quieto →
+// empuje máximo otra vez. Ese bang-bang era el "tambaleo sin poder ir atrás".
+// Ahora: inclinación feedforward fija escalada por la aproximación (la fricción
+// la cubre el anti-stall) y freno proporcional suave solo con sobrevelocidad
+// REAL (por encima del deadband, es decir > ~0.35 m/s medibles de verdad).
+#define OBJ_REV_PUSH_ANGLE      3.5f   // grados de inclinación hacia atrás (feedforward)
+#define OBJ_REV_BRAKE_KP        6.0f   // grados por m/s de sobrevelocidad real (freno suave)
 // Corrección de rumbo sin línea: P simple sobre diferencia de velocidad de ruedas,
 // en PWM absoluto (mismas unidades que steering_adjustment/pwm_sat). REV_STRAIGHT_MAX
 // es chico a propósito: nunca puede acercarse a pwm_sat, así que ninguna rueda se
@@ -306,13 +312,18 @@ typedef enum {
 // instantánea, que a la velocidad de reversa está cuantizada en saltos de
 // 3.57 rps (1 count/ciclo) y es casi puro ruido. Mismo signo/convención que
 // REV_STRAIGHT_KP: si empeora el desvío en vez de corregirlo, probar +1.0.
-// 2026-07-10 bis: KC bajado de -1.0 a -0.4 y corrección SOLO en movimiento
-// (REV_STRAIGHT_MIN_VEL): con el freno activo el robot pasa parte de la
-// reversa casi quieto, y el P de rumbo a 1 PWM/count pivoteaba izquierda/
-// derecha alrededor del rumbo inicial sin avanzar (reportado). Parado no hay
-// rumbo que mantener: el target va a 0 suave (por el mismo slew).
+// 2026-07-10 bis: KC bajado de -1.0 a -0.4 y corrección SOLO en movimiento:
+// con el freno activo el robot pasa parte de la reversa casi quieto, y el P de
+// rumbo a 1 PWM/count pivoteaba izquierda/derecha alrededor del rumbo inicial
+// sin avanzar (reportado). Parado no hay rumbo que mantener: el target va a 0
+// suave (por el mismo slew).
+// 2026-07-13: el gate de "en movimiento" pasó de velocity_est_f > 0.12 a
+// actividad de encoders (algún tick en los últimos ACT_MS). A velocidad de
+// reversa el LPF de la velocidad cuantizada suele leer menos que 0.12 aunque
+// el robot esté retrocediendo — la corrección quedaba apagada casi toda la
+// reversa y el robot salía torcido (reportado).
 #define REV_STRAIGHT_KC   -0.4f   // PWM por count de diferencia acumulada L/R
-#define REV_STRAIGHT_MIN_VEL 0.12f // m/s: por debajo no se corrige rumbo (quieto)
+#define REV_STRAIGHT_ACT_MS 250U  // ms sin ticks de encoder para considerar "quieto" (sin corrección)
 // 2026-07-10: aproximación desacelerada al setpoint de distancia de la reversa.
 // El corte es por ADC (A6 y A8 ≥ CLEAR) pero se llegaba a velocidad plena y la
 // inercia lo pasaba de largo → el hold del STOP tenía que devolverlo →
@@ -562,7 +573,7 @@ static const WifiProfile_t wifiProfiles[] = {
     /* 3 */ { "Wifi Habitaciones",         "toyotakia",             "192.168.1.48",  "Wifi Habitaciones" },
 };
 
-#define WIFI_PROFILE_ACTIVE  2   /* <<< NUMERO DE RED ELEGIDA >>> */
+#define WIFI_PROFILE_ACTIVE  1        /* <<< NUMERO DE RED ELEGIDA >>> */
 
 const char *wifiSSID;
 const char *wifiPassword;
@@ -669,7 +680,6 @@ static float line_angle_ramped      = 0.0f;  // rampa de avance en line follower
 static float line_enc_angle_corr     = 0.0f;  // corrección P de angulo por deficit de velocidad encoder
 static float line_reverse_boost     = 0.0f;  // extra de angulo si encoders muestran reversa
 static float line_vel_integral      = 0.0f;  // integral del PI de velocidad (idea 1)
-static float line_obj_rev_vel_integral = 0.0f;  // integral del PI de velocidad en reversa por obstaculo
 static float line_steer_fb_int      = 0.0f;  // integral del inner steering PI (idea 2)
 static float speed_right_rps_s      = 0.0f;  // velocidad rueda derecha, accesible fuera del bloque encoder
 static float speed_left_rps_s       = 0.0f;  // velocidad rueda izquierda, accesible fuera del bloque encoder
@@ -716,6 +726,8 @@ static int32_t  obj_rev_r0           = 0;
 static int32_t  obj_rev_l0           = 0;
 static uint8_t  obj_rev_clear_cnt    = 0;         // debounce del corte por ADC6/ADC8 de la reversa inicial
 static float    obj_rev_steer_f      = 0.0f;      // corrección de rumbo rampeada, PWM absoluto (sin línea), durante OBJ_REVERSE
+static int32_t  obj_rev_last_counts  = 0;         // último rev_counts visto (gate de actividad del rumbo)
+static uint32_t obj_rev_last_move_ms = 0;         // tick del último cambio de counts en la reversa
 // Latch de reversa de pared por counts (ver OBJ_WALL_REV_COUNTS)
 static uint8_t  obj_wall_rev_latch    = 0;
 static int32_t  obj_wall_rev_latch_r0 = 0;
@@ -1774,6 +1786,12 @@ static uint16_t OLED_Str5W(const char *s)
     return w;
 }
 
+static void OLED_Str5Centered(uint16_t y, const char *s)
+{
+    uint16_t w = OLED_Str5W(s);
+    OLED_Str5((uint16_t)((w < SCREEN_W) ? (SCREEN_W - w) / 2 : 0), y, s);
+}
+
 static void OLED_Puts7CenteredX(const char *s, uint16_t x0, uint16_t x1, uint16_t y)
 {
     uint16_t len = 0;
@@ -1801,9 +1819,9 @@ static void OLED_WifiIcon7(uint16_t x, uint16_t y)   // 7x6 px
     }
 }
 
-// Header común a todas las pantallas: título a la izquierda; a la derecha
-// "F!" si está caído, modo actual, icono WiFi y punto de actividad que
-// parpadea mientras el display se sigue refrescando (loop vivo).
+// Header común a todas las pantallas: título a la izquierda; "F!" centrado
+// si está caído; a la derecha modo actual, icono WiFi y spinner de actividad
+// que gira mientras el display se sigue refrescando (loop vivo).
 static void OLED_Header(const char *title)
 {
     OLED_Str5(1, 1, title);
@@ -1832,9 +1850,10 @@ static void OLED_Header(const char *title)
     x -= (uint16_t)(OLED_Str5W(mode_str) + 3);
     OLED_Str5(x, 1, mode_str);
 
+    // Indicador de caída centrado en el header (antes seguía la pila de la
+    // derecha y se mezclaba con el modo/icono WiFi).
     if (f_fallen) {
-        x -= 14;
-        OLED_Str5(x, 1, "F!");
+        OLED_Str5Centered(1, "F!");
     }
 
     SSD1306_DrawLine(0, 9, SCREEN_W - 1, 9, SSD1306_COLOR_WHITE);
@@ -1928,20 +1947,34 @@ void updateDisplay(void) {
             OLED_Puts7CenteredX("CONECTADO", 0, SCREEN_W - 1, 14);
 
             // SSID truncado a 21 chars (128px / 6px por char en 5x7);
-            // copia manual para no disparar -Wformat-truncation.
+            // copia manual para no disparar -Wformat-truncation. Todas las
+            // líneas centradas (pedido 2026-07-13).
             char ssid_buf[22];
             uint8_t si = 0;
             for (; wifiSSID[si] != '\0' && si < sizeof(ssid_buf) - 1; si++)
                 ssid_buf[si] = wifiSSID[si];
             ssid_buf[si] = '\0';
-            OLED_Str5(2, 30, "RED:");
-            OLED_Str5(2, 38, ssid_buf);
+            OLED_Str5Centered(30, "RED:");
+            OLED_Str5Centered(38, ssid_buf);
 
             const char *lip = ESP01_GetLocalIP();   // IP propia (NULL si aún no está)
-            OLED_Str5(2, 48, "IP:");
-            OLED_Str5(22, 48, (lip != NULL) ? lip : "...");
-            OLED_Str5(2, 56, "PC:");                // IP destino (Qt), del perfil activo
-            OLED_Str5(22, 56, wifiIp);
+            char ip_buf[24];
+            uint8_t bi = 0;
+            const char *pfx = "IP: ";
+            for (; *pfx; pfx++) ip_buf[bi++] = *pfx;
+            for (const char *p = (lip != NULL) ? lip : "...";
+                 *p != '\0' && bi < sizeof(ip_buf) - 1; p++)
+                ip_buf[bi++] = *p;
+            ip_buf[bi] = '\0';
+            OLED_Str5Centered(48, ip_buf);
+
+            bi = 0;                                 // IP destino (Qt), del perfil activo
+            pfx = "PC: ";
+            for (; *pfx; pfx++) ip_buf[bi++] = *pfx;
+            for (const char *p = wifiIp; *p != '\0' && bi < sizeof(ip_buf) - 1; p++)
+                ip_buf[bi++] = *p;
+            ip_buf[bi] = '\0';
+            OLED_Str5Centered(56, ip_buf);
 
             SSD1306_RequestUpdate();
             return;
@@ -2694,7 +2727,6 @@ static void ControlStep10ms(void)
                     obj_cnt              = 0;
                     steering_adjustment = 0.0f;
                     line_integral       = 0.0f;
-                    line_obj_rev_vel_integral = 0.0f;
                     line_error_prev     = 0.0f;
                     line_error_f_d      = 0.0f;
                     obj_rev_initialized = 0;
@@ -2870,66 +2902,30 @@ static void ControlStep10ms(void)
             }
 
             if (line_state == LINE_STATE_OBJ_RETROCESO) {
-                float reverse_speed_target = clampf_local(
-                    LINE_SPEED_TARGET * 0.25f,
-                    LINE_OBJ_REV_SPEED_MIN,
-                    LINE_OBJ_REV_SPEED_MAX
-                );
-                if (line_detected) {
-                    float reverse_track_scale = fmaxf(0.35f, speed_factor);
-                    reverse_speed_target = fmaxf(LINE_OBJ_REV_SPEED_MIN,
-                                                 reverse_speed_target * reverse_track_scale);
-                }
-
                 // Aproximación desacelerada al setpoint de distancia (2026-07-10):
                 // el factor cae linealmente de 1 (lejos del corte) al piso
                 // APPROACH_MIN (llegando a CLEAR), gobernado por el MENOR de
-                // A6/A8 — el mismo sensor que decide el corte. Reduce velocidad
-                // objetivo Y tope de inclinación: llega "en puntas de pie" y el
-                // hold del STOP arranca casi sin inercia que corregir.
+                // A6/A8 — el mismo sensor que decide el corte. Llega "en puntas
+                // de pie" y el hold del STOP arranca casi sin inercia que corregir.
                 float rev_front_min = fminf((float)adcAvg[5], (float)adcAvg[7]);
                 float rev_approach  = clampf_local(
                     (OBJ_REV_CLEAR_ADC - rev_front_min) / OBJ_REV_APPROACH_BAND,
                     OBJ_REV_APPROACH_MIN, 1.0f);
-                reverse_speed_target *= rev_approach;
 
-                // Deadband en la medida (2026-07-10): antes usaba velocity_est_f
-                // cruda — el piso de cuantización (un tick suelto lee 0.11 tras
-                // el LPF) contra un target achicado por la aproximación (~0.07)
-                // daba "sobrevelocidad" FALSA → el freno activo inclinaba hacia
-                // adelante con el robot casi quieto: "le cuesta ir hacia atrás
-                // y a veces avanza". Con el deadband, el freno activo solo entra
-                // con velocidad real (> ~0.35), y de paso el empuje no se
-                // descuenta por ruido: retrocede con más ganas.
-                float reverse_vel = apply_deadbandf(fmaxf(0.0f, velocity_est_f),
-                                                    BRAKE_VEL_DEADBAND);
-                float reverse_vel_error = reverse_speed_target - reverse_vel;
-                if (reverse_vel_error > 0.0f) {
-                    line_obj_rev_vel_integral += reverse_vel_error * DT_CTRL_FIXED;
-                    line_obj_rev_vel_integral = clampf_local(
-                        line_obj_rev_vel_integral, 0.0f, LINE_VEL_I_MAX);
-                } else {
-                    line_obj_rev_vel_integral *= 0.80f;
-                }
-
-                // Tope de inclinación también escalado por la aproximación (con
-                // piso 0.4 para que el empuje inicial venza la fricción estática).
-                // Piso NEGATIVO (2026-07-10): con sobrevelocidad (vel_error < 0)
-                // el comando puede pasar a inclinación de FRENADO (hacia adelante,
-                // hasta OBJ_REV_ACTIVE_BRAKE_MAX) — antes el clamp en 0 solo
-                // permitía soltar el empuje y la inercia lo pasaba de largo.
-                float reverse_angle_mag = clampf_local(
-                    LINE_OBJ_REV_VEL_KP * reverse_vel_error +
-                    LINE_VEL_KI * line_obj_rev_vel_integral,
-                    -OBJ_REV_ACTIVE_BRAKE_MAX,
-                    LINE_OBJ_REV_TILT_MAX * fmaxf(rev_approach, 0.4f)
+                // Empuje feedforward + freno solo con sobrevelocidad real
+                // (2026-07-13, ver nota en OBJ_REV_PUSH_ANGLE: el PI cerrado
+                // anterior no tenía equilibrio posible y bang-bangueaba).
+                float rev_overspeed = apply_deadbandf(fmaxf(0.0f, velocity_est_f),
+                                                      BRAKE_VEL_DEADBAND);
+                float reverse_angle_mag = fmaxf(
+                    OBJ_REV_PUSH_ANGLE * rev_approach -
+                    OBJ_REV_BRAKE_KP * rev_overspeed,
+                    -OBJ_REV_ACTIVE_BRAKE_MAX
                 );
                 line_obj_reverse_angle_cmd = -reverse_angle_mag;
                 // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto en reversa.
                 line_obj_reverse_angle_cmd -= AntiStall_Tick(7,
                     reverse_angle_mag > 0.0f, ANTISTALL_MAX_REV);
-            } else {
-                line_obj_rev_vel_integral *= 0.80f;
             }
 
         } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
@@ -2975,7 +2971,6 @@ static void ControlStep10ms(void)
             velocity_est_slow_f = 0.0f;
             vel_from_accel      = 0.0f;
             line_vel_integral   = 0.0f;
-            line_obj_rev_vel_integral = 0.0f;
             line_enc_angle_corr = 0.0f;
             line_reverse_boost  = 0.0f;
             balance_hold_active = 0;
@@ -3654,7 +3649,6 @@ static void ControlStep10ms(void)
                 velocity_est_slow_f = 0.0f;
                 vel_from_accel      = 0.0f;
                 line_integral       = 0.0f;
-                line_obj_rev_vel_integral = 0.0f;
                 line_error_prev     = 0.0f;
                 line_error_f_d      = 0.0f;
                 steering_adjustment = 0.0f;
@@ -3714,7 +3708,6 @@ static void ControlStep10ms(void)
                 velocity_est_slow_f       = 0.0f;
                 vel_from_accel            = 0.0f;
                 line_integral             = 0.0f;
-                line_obj_rev_vel_integral = 0.0f;
                 line_error_prev           = 0.0f;
                 line_error_f_d            = 0.0f;
                 steering_adjustment       = 0.0f;
@@ -4731,6 +4724,8 @@ static void ControlStep10ms(void)
                             __enable_irq();
                             obj_rev_initialized  = 1;
                             obj_rev_clear_cnt    = 0;
+                            obj_rev_last_counts  = 0;
+                            obj_rev_last_move_ms = HAL_GetTick();
                         }
 
                         __disable_irq();
@@ -4760,7 +4755,6 @@ static void ControlStep10ms(void)
                             obj_brake_start_ms  = 0;
                             obj_rev_band_enter_ms = 0;
                             steering_adjustment = 0.0f;
-                            line_obj_rev_vel_integral = 0.0f;
                             line_integral       = 0.0f;
                             line_error_prev     = 0.0f;
                             line_error_f_d      = 0.0f;
@@ -4779,9 +4773,14 @@ static void ControlStep10ms(void)
                             // Solo mientras retrocede de verdad: parado (freno
                             // activo, llegada al corte) el target va a 0 por el
                             // slew — si no, el P de rumbo pivotea izq/der con el
-                            // robot quieto (ver nota en REV_STRAIGHT_MIN_VEL).
+                            // robot quieto. El gate es por actividad de encoders,
+                            // no por velocity_est_f (ver nota en REV_STRAIGHT_ACT_MS).
+                            if (rev_counts != obj_rev_last_counts) {
+                                obj_rev_last_counts  = rev_counts;
+                                obj_rev_last_move_ms = HAL_GetTick();
+                            }
                             float corr_target = 0.0f;
-                            if (fabsf(velocity_est_f) > REV_STRAIGHT_MIN_VEL) {
+                            if ((HAL_GetTick() - obj_rev_last_move_ms) < REV_STRAIGHT_ACT_MS) {
                                 corr_target = clampf_local(
                                     REV_STRAIGHT_KC * (float)(rev_dr - rev_dl),
                                     -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
@@ -5007,7 +5006,6 @@ static void ControlStep10ms(void)
                                     line_integral         = 0.0f;
                                     line_error_prev       = 0.0f;
                                     line_error_f_d        = 0.0f;
-                                    line_obj_rev_vel_integral = 0.0f;
                                     steering_adjustment   = 0.0f;
                                     obj_wall_clear_initialized = 0;
                                     obj_wall_seq_start_ms = 0;
@@ -5110,7 +5108,6 @@ static void ControlStep10ms(void)
                             line_seen_since_entry = 1;
                             line_state          = LINE_STATE_FOLLOWING;
                             line_integral       = 0.0f;
-                            line_obj_rev_vel_integral = 0.0f;
                             line_error_prev     = 0.0f;
                             line_error_f_d      = 0.0f;
                             line_lost_ms        = HAL_GetTick();
@@ -5186,7 +5183,6 @@ static void ControlStep10ms(void)
                             line_seen_since_entry = 1;
                             line_state          = LINE_STATE_FOLLOWING;
                             line_integral       = 0.0f;
-                            line_obj_rev_vel_integral = 0.0f;
                             line_error_prev     = 0.0f;
                             line_error_f_d      = 0.0f;
                             line_lost_ms        = HAL_GetTick();
@@ -5238,7 +5234,6 @@ static void ControlStep10ms(void)
                             line_seen_since_entry = 1;
                             line_state          = LINE_STATE_FOLLOWING;
                             line_integral       = 0.0f;
-                            line_obj_rev_vel_integral = 0.0f;
                             line_error_prev     = 0.0f;
                             line_error_f_d      = 0.0f;
                             line_lost_ms        = HAL_GetTick();
@@ -5332,7 +5327,6 @@ static void ControlStep10ms(void)
 
             } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
                 line_integral       = 0.0f;
-                line_obj_rev_vel_integral = 0.0f;
                 line_error_prev     = 0.0f;
                 line_state          = LINE_STATE_FOLLOWING;
 
@@ -5395,7 +5389,6 @@ static void ControlStep10ms(void)
 
             } else if (robot_state != ROBOT_STATE_MOTOR_TEST) {
                 line_integral       = 0.0f;
-                line_obj_rev_vel_integral = 0.0f;
                 line_error_prev     = 0.0f;
                 steering_adjustment = 0.0f;
                 line_state          = LINE_STATE_FOLLOWING;
