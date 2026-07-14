@@ -61,7 +61,8 @@ typedef enum {
     LINE_STATE_EDGE_SETTLE,    // Post-90°: pausa de estabilización antes de avanzar
     LINE_STATE_EDGE_FWD,       // Post-90°: avanza con velocidad controlada hasta encontrar la línea
     LINE_STATE_GIVEN_UP,       // Ni el giro de 180 ni el de 90 encontraron la línea: reposo total hasta reponerla a mano
-    LINE_STATE_PERP_ROTATE,    // Los 4 ADC en negro sin manipulación: cruce perpendicular, gira 90° instantáneo y retoma FOLLOWING
+    LINE_STATE_PERP_ROTATE,    // Los 4 ADC en negro sin manipulación: cruce perpendicular, gira 90° (sentido del último esquive)
+    LINE_STATE_PERP_SETTLE,    // Post-giro perpendicular: STOP neto de 2s sobre la línea (freno + hold de posición) antes de retomar FOLLOWING sin envión
     LINE_STATE_OBJ_ESPERA_REVERSA, // (fuera de la cadena activa desde 2026-07-14: sin ancla, el robot derivaba hacia atrás y perdía la pared)
     LINE_STATE_OBJ_RETROCESO,    // (fuera de la cadena activa desde 2026-07-14: la reversa la hace el hold del STOP)
     LINE_STATE_OBJ_FRENO_REVERSA,      // Fase STOP: entra DIRECTO al detectar objeto — frena la inercia y lleva/sostiene la distancia (A6/A8 en banda) hasta estabilizarse → giro
@@ -401,6 +402,12 @@ typedef enum {
 #define OBJ_PAUSA_POS_KP           0.06f     // grados por count de deriva (≈1° cada 10 cm)
 #define OBJ_PAUSA_POS_MAX          1.5f      // tope de la corrección de posición (°)
 #define OBJ_PAUSA_POS_DB_COUNTS    3.0f      // banda muerta (≈2 cm): adentro no corrige, deja asentar
+// 2026-07-14: STOP neto post-giro perpendicular ("frene sobre la línea y luego
+// siga sin envión"): al reencontrar la línea después del esquive, el robot
+// llegaba con velocidad y retomaba FOLLOWING lanzado, desestabilizándose.
+// Después del giro de PERP_ROTATE se queda PERP_SETTLE_MS quieto sobre la
+// línea (freno + mismo hold de posición que PAUSA_GIRO) y recién ahí sigue.
+#define PERP_SETTLE_MS             2000U     // duración del STOP post-giro perpendicular
 // 2026-07-13: esquive alternado. `obj_esquive_dir` = +1 → giro 90° a la DERECHA
 // y pared seguida con el lateral izquierdo ADC7 (adcAvg[6]) — el comportamiento
 // de siempre. -1 → todo espejado: giro a la IZQUIERDA y pared con el lateral
@@ -765,6 +772,9 @@ static uint32_t obj_rev_band_enter_ms = 0;        // entrada a la banda 3600..39
 static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
 static int32_t  obj_pausa_r0         = 0;         // ancla de posición del hold post-giro (PAUSA_GIRO)
 static int32_t  obj_pausa_l0         = 0;
+static uint32_t perp_settle_start_ms = 0;         // inicio del STOP post-giro perpendicular (PERP_SETTLE)
+static int32_t  perp_settle_r0       = 0;         // ancla de posición del PERP_SETTLE
+static int32_t  perp_settle_l0       = 0;
 static float    obj_arc_steer_int    = 0.0f;      // integral del PI de diferencial en OBJ_ARC
 static uint32_t obj_wall_approach_start_ms = 0;    // timestamp de entrada a WALL_APPROACH
 static uint32_t obj_wall_fwd_start_ms = 0;         // timestamp de entrada a WALL_FWD (init de PI/estado, no se usa para ignorar línea)
@@ -1904,6 +1914,7 @@ static const char *LineStateStr(void)
         case LINE_STATE_EDGE_FWD:           return "EVUELV";
         case LINE_STATE_GIVEN_UP:           return "PARADO";
         case LINE_STATE_PERP_ROTATE:        return "PGIRO";
+        case LINE_STATE_PERP_SETTLE:        return "PSTOP";
         case LINE_STATE_OBJ_ESPERA_REVERSA: return "ESPER";
         case LINE_STATE_OBJ_RETROCESO:      return "RETRO";
         case LINE_STATE_OBJ_FRENO_REVERSA:  return "STOP";
@@ -3334,6 +3345,27 @@ static void ControlStep10ms(void)
                 brake_setpoint_target = 0.0f;
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
+            } else if (line_state == LINE_STATE_PERP_SETTLE) {
+                // STOP neto post-giro perpendicular: upright + freno de encoders +
+                // hold de posición (mismo patrón y constantes que PAUSA_GIRO).
+                // Gate con perp_settle_start_ms != 0: el ancla se estampa en el
+                // case del estado (corre después) — el primer ciclo no corrige.
+                float psettle_corr = 0.0f;
+                if (perp_settle_start_ms != 0) {
+                    __disable_irq();
+                    int32_t sdr = encoder_right - perp_settle_r0;
+                    int32_t sdl = encoder_left  - perp_settle_l0;
+                    __enable_irq();
+                    float psettle_drift = (float)(sdr + sdl) * 0.5f;
+                    if (fabsf(psettle_drift) > OBJ_PAUSA_POS_DB_COUNTS) {
+                        psettle_corr = clampf_local(-OBJ_PAUSA_POS_KP * psettle_drift,
+                                                    -OBJ_PAUSA_POS_MAX, OBJ_PAUSA_POS_MAX);
+                    }
+                }
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim + psettle_corr;
+                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                line_enc_angle_corr   = 0.0f;
+                line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_PAUSA_GIRO) {
                 // Hold post-rotación: upright con freno traslacional, yaw-lock en switch.
                 // 2026-07-14: + hold de POSICIÓN por encoders (ver OBJ_PAUSA_POS_*):
@@ -4608,7 +4640,12 @@ static void ControlStep10ms(void)
                             int enc_done      = (prot_counts >= PROT_ENC_TARGET);
                             int overshoot     = (prot_abs_hdg > PROT_ABS_TARGET * 1.2f);
                             if ((enc_done && p1e >= PROT_BRAKE_DURATION) || p1e >= PROT_P1_MAX || overshoot) {
-                                line_state          = LINE_STATE_FOLLOWING;
+                                // 2026-07-14: antes retomaba FOLLOWING directo — llegando
+                                // del esquive con velocidad, arrancaba lanzado y se
+                                // desestabilizaba. Ahora pasa por un STOP neto de 2s
+                                // sobre la línea (PERP_SETTLE) antes de seguir.
+                                line_state          = LINE_STATE_PERP_SETTLE;
+                                perp_settle_start_ms = 0;
                                 line_seen_since_entry = 1;
                                 line_integral       = 0.0f;
                                 line_error_prev     = 0.0f;
@@ -4619,7 +4656,7 @@ static void ControlStep10ms(void)
                                 steering_adjustment = 0.0f;
                                 // Sin este reset, si los sensores siguen en negro después del
                                 // giro (no habia linea real), el timer ya vencido re-dispara
-                                // otro PERP_ROTATE en el ciclo siguiente -> giro en círculos.
+                                // otro PERP_ROTATE apenas vuelva a FOLLOWING -> giro en círculos.
                                 all_black_start_ms  = 0;
                             } else if (!enc_done) {
                                 float remaining = PROT_ENC_TARGET - prot_counts;
@@ -4634,6 +4671,34 @@ static void ControlStep10ms(void)
                                 motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
                             }
+                        }
+                        break;
+                    }
+
+                    case LINE_STATE_PERP_SETTLE:
+                    {
+                        // STOP neto post-giro perpendicular (2026-07-14): 2s quieto
+                        // sobre la línea antes de retomar FOLLOWING — sin esto, el
+                        // robot llegaba del esquive con velocidad y arrancaba a
+                        // seguir la línea lanzado ("envión que lo desestabiliza").
+                        // Setpoint (freno + hold de posición) en la sección de
+                        // setpoints; acá solo el timer, el ancla y la salida.
+                        steering_adjustment = 0.0f;
+                        if (perp_settle_start_ms == 0) {
+                            perp_settle_start_ms = HAL_GetTick();
+                            __disable_irq();
+                            perp_settle_r0 = encoder_right;
+                            perp_settle_l0 = encoder_left;
+                            __enable_irq();
+                        }
+                        if ((HAL_GetTick() - perp_settle_start_ms) >= PERP_SETTLE_MS) {
+                            line_state           = LINE_STATE_FOLLOWING;
+                            perp_settle_start_ms = 0;
+                            line_integral        = 0.0f;
+                            line_error_prev      = 0.0f;
+                            line_error_f_d       = 0.0f;
+                            line_lost_ms         = HAL_GetTick();
+                            all_black_start_ms   = 0;
                         }
                         break;
                     }
@@ -5421,6 +5486,7 @@ static void ControlStep10ms(void)
                     if (steering_adjustment == 0.0f &&
                         (line_state == LINE_STATE_LOST     ||
                          line_state == LINE_STATE_SEARCHING ||
+                         line_state == LINE_STATE_PERP_SETTLE ||
                          line_state == LINE_STATE_OBJ_ESPERA_REVERSA ||
                          line_state == LINE_STATE_OBJ_PAUSA_GIRO ||
                          line_state == LINE_STATE_OBJ_BUSCAR_PARED ||
