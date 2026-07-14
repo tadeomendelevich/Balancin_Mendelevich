@@ -62,16 +62,16 @@ typedef enum {
     LINE_STATE_EDGE_FWD,       // Post-90°: avanza con velocidad controlada hasta encontrar la línea
     LINE_STATE_GIVEN_UP,       // Ni el giro de 180 ni el de 90 encontraron la línea: reposo total hasta reponerla a mano
     LINE_STATE_PERP_ROTATE,    // Los 4 ADC en negro sin manipulación: cruce perpendicular, gira 90° instantáneo y retoma FOLLOWING
-    LINE_STATE_OBJ_ESPERA_REVERSA, // Objeto detectado: balance estático 2s → luego OBJ_GIRO_ESQUIVE
-    LINE_STATE_OBJ_RETROCESO,    // (deshabilitado) reversa breve antes del giro
-    LINE_STATE_OBJ_FRENO_REVERSA,      // (deshabilitado) frena hasta velocidad ≈ 0 antes de girar
-    LINE_STATE_OBJ_GIRO_ESQUIVE,     // Objeto detectado: girando 90° derecha por encoders
+    LINE_STATE_OBJ_ESPERA_REVERSA, // (fuera de la cadena activa desde 2026-07-14: sin ancla, el robot derivaba hacia atrás y perdía la pared)
+    LINE_STATE_OBJ_RETROCESO,    // (fuera de la cadena activa desde 2026-07-14: la reversa la hace el hold del STOP)
+    LINE_STATE_OBJ_FRENO_REVERSA,      // Fase STOP: entra DIRECTO al detectar objeto — frena la inercia y lleva/sostiene la distancia (A6/A8 en banda) hasta estabilizarse → giro
+    LINE_STATE_OBJ_GIRO_ESQUIVE,     // Objeto detectado: girando 90° por encoders (sentido según obj_esquive_dir)
     LINE_STATE_OBJ_PAUSA_GIRO,          // Post-rotación: balance estático espera 2s
     LINE_STATE_OBJ_ARC,           // (no usado) reservado
-    LINE_STATE_OBJ_BUSCAR_PARED, // Avanza despacio (2°) hasta encontrar la pared en ADC7
-    LINE_STATE_OBJ_BORDEAR_PARED,      // Wall-following: avanza mientras ADC7 en rango 500-3750
+    LINE_STATE_OBJ_BUSCAR_PARED, // Avanza despacio (2°) hasta encontrar la pared en el lateral activo (ADC7/ADC5)
+    LINE_STATE_OBJ_BORDEAR_PARED,      // Wall-following: avanza mientras el lateral activo ve la pared
     LINE_STATE_OBJ_PARED_LIBRE,    // Perdió la pared en WALL_FWD: avanza un poco más antes de girar (no chocar la esquina)
-    LINE_STATE_OBJ_GIRO_PARED,     // Wall-following: pivot izquierda hasta re-ver objeto en ADC7
+    LINE_STATE_OBJ_GIRO_PARED,     // Wall-following: pivot hacia la pared hasta re-verla en el lateral activo
 } eLineState;
 
 /* USER CODE END PTD */
@@ -349,7 +349,7 @@ typedef enum {
 // el robot realmente estaba quieto. Ahora, igual que LOST_SETTLE: sale por tiempo mínimo
 // Y velocidad/inclinación estabilizadas, con un timeout de seguridad más largo (no un
 // corte normal) por si nunca llega a asentarse del todo.
-#define OBJ_PRE_REVERSE_HOLD_MS    2000U      // tiempo mínimo de balance estático antes de retroceder (2026-07-11: 5000→2000)
+#define OBJ_PRE_REVERSE_HOLD_MS    1000U      // tiempo mínimo de balance estático antes de retroceder (2026-07-11: 5000→2000; 2026-07-14: →1000)
 #define OBJ_PRE_REVERSE_TIMEOUT    6000U      // colchón de seguridad si nunca se asienta
 #define OBJ_PRE_REVERSE_VEL_THR    0.10f      // m/s por debajo del cual se considera "quieto"
 #define OBJ_PRE_REVERSE_TILT_THR   3.0f       // grados de error respecto al setpoint para considerar "quieto"
@@ -394,7 +394,21 @@ typedef enum {
 // Giro 90° por encoders: medir distancia entre centros de rueda y ajustar aquí
 #define OBJ_ROTATE_TRACK_WIDTH     0.220f    // metros entre centros de ruedas (medido: 220 mm)
 #define OBJ_HOLD_DURATION_MS       2000U     // ms de balance estatico en OBJ_HOLD antes de wall-following
-#define OBJ_WALL_ADC_IDX           6          // índice del sensor lateral (ADC7 = adcAvg[6])
+// 2026-07-14: hold de POSICIÓN en la pausa post-giro ("que mantenga posición un
+// poco mejor"). El freno por velocidad (ComputeBrakeSetpointTarget) usa la
+// velocidad LENTA y solo frena — no devuelve la deriva ya recorrida. P suave
+// sobre los counts netos de encoder desde la entrada a la pausa (1 count ≈ 6.3mm).
+#define OBJ_PAUSA_POS_KP           0.06f     // grados por count de deriva (≈1° cada 10 cm)
+#define OBJ_PAUSA_POS_MAX          1.5f      // tope de la corrección de posición (°)
+#define OBJ_PAUSA_POS_DB_COUNTS    3.0f      // banda muerta (≈2 cm): adentro no corrige, deja asentar
+// 2026-07-13: esquive alternado. `obj_esquive_dir` = +1 → giro 90° a la DERECHA
+// y pared seguida con el lateral izquierdo ADC7 (adcAvg[6]) — el comportamiento
+// de siempre. -1 → todo espejado: giro a la IZQUIERDA y pared con el lateral
+// derecho ADC5 (adcAvg[4]). Se alterna en cada detección de objeto (la primera
+// va a la derecha) y se rearma en derecha al entrar al modo línea. Mismos
+// mecanismos, umbrales y constantes en ambos sentidos: solo cambian el signo de
+// los pivots y el sensor lateral.
+#define OBJ_WALL_ADC_IDX           ((obj_esquive_dir > 0) ? 6 : 4)   // ADC7 o ADC5 según sentido
 #define OBJ_WALL_THRESHOLD         3600.0f   // ADC < umbral → objeto visible; > umbral → perdido (3750 dejaba que se alejara demasiado antes de girar a buscarlo)
 #define OBJ_WALL_REVERSE_THOLD     600.0f    // ADC7 < este valor → demasiado cerca, reversa pareja
 #define OBJ_WALL_TOO_CLOSE_THOLD   2100.0f   // ADC7 entre REVERSE_THOLD y este valor → pivot derecha
@@ -438,19 +452,23 @@ typedef enum {
 // Avance bordeando la pared: PI de velocidad (mismo patrón que LOST_FWD/EDGE_FWD) en vez
 // de ángulo fijo + freno bang-bang por sobrevelocidad — regula la velocidad de crucero
 // con precisión en lugar de acelerar a fondo hasta cruzar el umbral y frenar de golpe.
-#define OBJ_WALL_SPEED_TARGET      1.0f      // m/s, avance cauteloso bordeando la pared
+// 2026-07-14: perfil de avance bajado al del retorno por odometría (LOST_FWD,
+// validado): con target 1.0 m/s y tope 3.5° el robot aceleraba fuerte bordeando
+// (desde parado el deadband de velocidad hace leer el error completo → tilt
+// clavado en el tope) y llegaba a la línea tan rápido que siempre se pasaba.
+#define OBJ_WALL_SPEED_TARGET      0.85f     // m/s, avance moderado bordeando la pared (1.0 se pasaba de la línea; 0.45 demasiado lento)
 #define OBJ_WALL_VEL_KP            4.0f      // ganancia P acelerando
 #define OBJ_WALL_VEL_KP_BRAKE      22.0f     // ganancia P frenando (sobrevelocidad)
 #define OBJ_WALL_VEL_KI            1.0f      // ganancia I para sostener la velocidad de crucero
 #define OBJ_WALL_VEL_I_MAX         1.0f      // anti-windup del integral de velocidad
-#define OBJ_WALL_FWD_ANGLE         3.5f      // ángulo máximo de avance en WALL_FWD (°)
+#define OBJ_WALL_FWD_ANGLE         3.3f      // ángulo máximo de avance en WALL_FWD (°; era 3.5 — acelerón; 2.5 le pareció poco al usuario)
 #define OBJ_WALL_BRAKE_ANGLE       4.0f      // freno activo máximo por sobrevelocidad en WALL_FWD (°)
 // Antes de arrancar la reversa por pared, si el robot todavía tiene velocidad residual
 // (viniendo de avanzar), frena primero (mismo patrón que OBJ_PRE_REVERSE_HOLD) para no
 // entorpecer la reversa con inercia hacia adelante.
 #define OBJ_WALL_REVERSE_SETTLE_VEL 0.15f    // m/s por debajo del cual se considera "quieto"
 #define OBJ_WALL_PIVOT_POWER       8.0f      // potencia del pivot en WALL_TURN/WALL_FWD
-#define OBJ_WALL_LINE_IGNORE_MS    3000U     // ms al inicio de WALL_FWD en que se ignora la línea
+#define OBJ_WALL_LINE_IGNORE_MS    5000U     // ms desde la entrada al wall-following en que se ignora la línea (2026-07-14: 3s→5s, veía la línea al arrancar pared>avanza/gira y abortaba la esquiva)
 #define OBJ_WALL_CLEAR_COUNTS      100       // counts de encoder a avanzar tras perder la pared, antes de girar
 
 // Parámetros del arco evasivo (OBJ_ARC) — ajustables en runtime desde Qt
@@ -720,7 +738,6 @@ static uint32_t obj_rot_phase1_ms    = 0;    // inicio de fase 1
 static float    obj_rot_p2_c0        = 0.0f; // counts al entrar al ajuste fino por ADC7
 static uint32_t obj_rot_p2_ms        = 0;    // inicio del ajuste fino
 static uint8_t  obj_rot_adc_good_cnt = 0;    // ciclos seguidos con ADC7 < OBJ_ROT_ADC_GOOD
-static uint8_t  obj_rot_p2_seen      = 0;    // 1 = ADC7 vio la pared al menos un ciclo en el ajuste fino
 static uint8_t  obj_rev_initialized  = 0;         // flag sesión actual de OBJ_REVERSE
 static int32_t  obj_rev_r0           = 0;
 static int32_t  obj_rev_l0           = 0;
@@ -728,6 +745,8 @@ static uint8_t  obj_rev_clear_cnt    = 0;         // debounce del corte por ADC6
 static float    obj_rev_steer_f      = 0.0f;      // corrección de rumbo rampeada, PWM absoluto (sin línea), durante OBJ_REVERSE
 static int32_t  obj_rev_last_counts  = 0;         // último rev_counts visto (gate de actividad del rumbo)
 static uint32_t obj_rev_last_move_ms = 0;         // tick del último cambio de counts en la reversa
+static int8_t   obj_esquive_dir      = 1;         // sentido del esquive ACTUAL: +1 derecha (ADC7), -1 izquierda (ADC5)
+static int8_t   obj_esquive_next_dir = 1;         // sentido de la PRÓXIMA detección (se alterna en cada objeto)
 // Latch de reversa de pared por counts (ver OBJ_WALL_REV_COUNTS)
 static uint8_t  obj_wall_rev_latch    = 0;
 static int32_t  obj_wall_rev_latch_r0 = 0;
@@ -744,6 +763,8 @@ static uint32_t obj_brake_start_ms   = 0;         // inicio de OBJ_BRAKE (file-s
 static uint32_t obj_pre_rotate_ms    = 0;         // inicio del wait post-freno antes de OBJ_ROTATE
 static uint32_t obj_rev_band_enter_ms = 0;        // entrada a la banda 3600..3900 de A6/A8 en STOP (0 = fuera de banda)
 static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
+static int32_t  obj_pausa_r0         = 0;         // ancla de posición del hold post-giro (PAUSA_GIRO)
+static int32_t  obj_pausa_l0         = 0;
 static float    obj_arc_steer_int    = 0.0f;      // integral del PI de diferencial en OBJ_ARC
 static uint32_t obj_wall_approach_start_ms = 0;    // timestamp de entrada a WALL_APPROACH
 static uint32_t obj_wall_fwd_start_ms = 0;         // timestamp de entrada a WALL_FWD (init de PI/estado, no se usa para ignorar línea)
@@ -1517,7 +1538,13 @@ static void ADC1_Recover(uint8_t clear_buffers)
     __HAL_DMA_CLEAR_FLAG(hadc1.DMA_Handle,
                          DMA_FLAG_TCIF0_4 | DMA_FLAG_HTIF0_4 |
                          DMA_FLAG_TEIF0_4 | DMA_FLAG_DMEIF0_4 | DMA_FLAG_FEIF0_4);
-    __HAL_DMA_ENABLE(hadc1.DMA_Handle);
+    // OJO: acá NO se rehabilita el stream a mano (__HAL_DMA_ENABLE). Hacerlo
+    // dejaba el EN=1 con el NDTR viejo un instante antes de HAL_ADC_Start_DMA:
+    // si el stream no llegaba a apagarse, la reconfiguración del HAL se ignora
+    // en silencio y la DMA sigue a mitad del buffer → TODOS los canales quedan
+    // rotados un lugar (un canal de línea pasa a leer el ~4095 de un canal de
+    // objeto) hasta la próxima recuperación. HAL_ADC_Start_DMA ya rearma y
+    // habilita el stream correctamente desde cero.
 
     if (clear_buffers) {
         memset(adcBuf, 0, sizeof(adcBuf));
@@ -2132,7 +2159,9 @@ void updateDisplay(void) {
         snprintf(lbuf, sizeof(lbuf), "E:%s", nbuf);   OLED_Str5(74, 33, lbuf);
         FormatSignedFixed(nbuf, sizeof(nbuf), velocity_est_f, 2);
         snprintf(lbuf, sizeof(lbuf), "V:%s", nbuf);   OLED_Str5(74, 42, lbuf);
-        snprintf(lbuf, sizeof(lbuf), "A7:%u", (unsigned)adcAvg[6]);
+        snprintf(lbuf, sizeof(lbuf), "A%c:%u",
+                 (obj_esquive_dir > 0) ? '7' : '5',
+                 (unsigned)adcAvg[OBJ_WALL_ADC_IDX]);
         OLED_Str5(74, 51, lbuf);
 
     } else if (f_change_display == 2) {
@@ -2293,14 +2322,17 @@ void updateDisplay(void) {
             OLED_Str5(0, 35, lbuf);
             OLED_HBar(44, 34, 83, 9, adcAvg[5], ticks6, 2);
         }
-        // A7 (lateral pared): ticks en reversa / muy-cerca / pared visible
+        // Lateral de pared activo (A7 esquivando a derecha, A5 a izquierda):
+        // ticks en reversa / muy-cerca / pared visible
         {
             static const float ticks7[3] = { OBJ_WALL_REVERSE_THOLD,
                                              OBJ_WALL_TOO_CLOSE_THOLD,
                                              OBJ_WALL_THRESHOLD };
-            snprintf(lbuf, sizeof(lbuf), "A7:%4u", (unsigned)adcAvg[6]);
+            snprintf(lbuf, sizeof(lbuf), "A%c:%4u",
+                     (obj_esquive_dir > 0) ? '7' : '5',
+                     (unsigned)adcAvg[OBJ_WALL_ADC_IDX]);
             OLED_Str5(0, 46, lbuf);
-            OLED_HBar(44, 45, 83, 9, adcAvg[6], ticks7, 3);
+            OLED_HBar(44, 45, 83, 9, adcAvg[OBJ_WALL_ADC_IDX], ticks7, 3);
         }
 
         // A8: el corte de la reversa exige A6 Y A8 ≥ 3600 — si la reversa se
@@ -2313,7 +2345,9 @@ void updateDisplay(void) {
     } else if (f_change_display == 7) {
         // ───────────────────────────────────────────────────────────
         // PANTALLA 7 — ODOMETRIA: mapa de pose + números
-        // Mapa: X odométrico hacia arriba, Y hacia la derecha, origen al
+        // Mapa: X odométrico hacia arriba, Y hacia la IZQUIERDA (θ positivo
+        // antihorario, convención estándar — espejar Y aquí haría que la
+        // flecha gire al revés de la realidad), origen al
         // centro. Autoescala para que la pose (y el punto de pérdida de
         // línea, si existe) siempre entren en el recuadro.
         // ───────────────────────────────────────────────────────────
@@ -2338,16 +2372,16 @@ void updateDisplay(void) {
 
             // punto de pérdida de línea (cuadradito hueco)
             if (line_loss_pose_valid) {
-                int16_t lx = cx + (int16_t)(line_loss_y_m * k);
+                int16_t lx = cx - (int16_t)(line_loss_y_m * k);
                 int16_t ly = cy - (int16_t)(line_loss_x_m * k);
                 SSD1306_DrawRectangle(lx - 1, ly - 1, 3, 3, SSD1306_COLOR_WHITE);
             }
 
             // pose actual: punto lleno + rayo de rumbo (θ=0 → +X → arriba)
-            int16_t px = cx + (int16_t)(odom_y_m * k);
+            int16_t px = cx - (int16_t)(odom_y_m * k);
             int16_t py = cy - (int16_t)(odom_x_m * k);
             float th = odom_theta_deg * ((float)M_PI / 180.0f);
-            int16_t hx = px + (int16_t)(sinf(th) * 7.0f);
+            int16_t hx = px - (int16_t)(sinf(th) * 7.0f);
             int16_t hy = py - (int16_t)(cosf(th) * 7.0f);
             if (hx < bx + 1)      hx = bx + 1;
             if (hx > bx + bw - 2) hx = bx + bw - 2;
@@ -2484,7 +2518,7 @@ static void ControlStep10ms(void)
 		if (delta_left  != 0) wheel_l_last_tick_ms = HAL_GetTick();
 
 		// ── Latch de reversa de pared por counts (2026-07-10) ──
-		// Se dispara con ADC7 < THOLD y queda activo hasta retroceder
+		// Se dispara con el lateral activo (ADC7/ADC5) < THOLD y queda activo hasta retroceder
 		// OBJ_WALL_REV_COUNTS (o timeout). Lo consumen las ramas de setpoint
 		// y de motores de los 3 estados de pared — reemplaza al chequeo
 		// instantáneo de ADC que cortaba la reversa apenas se despegaba.
@@ -2539,11 +2573,11 @@ static void ControlStep10ms(void)
 
 			// ── Timeout de pared perdida (2026-07-11) ──
 			// Si en toda la secuencia de pared no se vuelve a ver el objeto
-			// (ADC7 < OBJ_WALL_THRESHOLD) durante OBJ_WALL_MISSING_TIMEOUT_MS
+			// (lateral activo < OBJ_WALL_THRESHOLD) durante OBJ_WALL_MISSING_TIMEOUT_MS
 			// continuos, se abandona la búsqueda: reposo (IDLE) en vez de
 			// seguir avanzando/pivoteando a ciegas y arriesgar un choque.
 			// Durante la reversa de pared el timer no corre: retroceder aleja
-			// la pared de la vista de ADC7 a propósito (la de escape dura
+			// la pared de la vista del lateral a propósito (la de escape dura
 			// hasta 6s y dispararía el timeout en plena maniobra válida).
 			if (obj_wall_rev_latch ||
 			    (float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD) {
@@ -2722,9 +2756,21 @@ static void ControlStep10ms(void)
                 if (obj_cnt >= OBJ_DETECT_DEBOUNCE_CNT &&
                     line_state == LINE_STATE_FOLLOWING &&
                     HAL_GetTick() >= obj_detect_ignore_until_ms) {
-                    line_state           = LINE_STATE_OBJ_ESPERA_REVERSA;
-                    obj_pre_rev_start_ms = HAL_GetTick();
+                    // 2026-07-14: directo a la fase STOP, sin pasar por ESPERA_REVERSA.
+                    // El balance libre de ESPERA no tiene ancla de posición: llegando
+                    // con inercia el robot se iba un poco para atrás y perdía la pared
+                    // (reportado). El hold de distancia del STOP frena la inercia
+                    // (hold_damp) y sostiene/lleva la distancia a la banda 3500..3900
+                    // de A6/A8 desde el primer ciclo — no queda ningún período libre.
+                    line_state           = LINE_STATE_OBJ_FRENO_REVERSA;
+                    obj_brake_start_ms   = 0;
+                    obj_pre_rotate_ms    = 0;
+                    obj_rev_band_enter_ms = 0;
                     obj_cnt              = 0;
+                    // Sentido alternado (2026-07-13): esta esquiva usa el sentido
+                    // programado y deja armado el opuesto para el próximo objeto.
+                    obj_esquive_dir      = obj_esquive_next_dir;
+                    obj_esquive_next_dir = (int8_t)-obj_esquive_next_dir;
                     steering_adjustment = 0.0f;
                     line_integral       = 0.0f;
                     line_error_prev     = 0.0f;
@@ -2979,6 +3025,8 @@ static void ControlStep10ms(void)
             speed_left_rps_s    = 0.0f;
             line_state          = LINE_STATE_FOLLOWING;
             line_seen_since_entry = 0;
+            obj_esquive_dir     = 1;   // esquive alternado: arranca por derecha
+            obj_esquive_next_dir = 1;
             line_was_centered_on_lost = 1;
             last_detected_edge_only   = 0;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
@@ -3164,6 +3212,14 @@ static void ControlStep10ms(void)
                         (OBJ_REV_HOLD_ANGLE_MAX - OBJ_REV_HOLD_ANGLE_MIN) * hold_mag;
                     base_setpoint_target = SETPOINT_ANGLE + setpoint_trim +
                         ((hold_err > 0.0f) ? -hold_angle : hold_angle) + hold_damp;
+                    // Anti-stall (ver AntiStall_Tick): desde 2026-07-14 el STOP es la
+                    // entrada al detectar objeto y este hold cubre TODA la reversa
+                    // hasta la banda (antes eso lo hacía el feedforward de 3.5° de
+                    // OBJ_RETROCESO). Si la fricción puede con ANGLE_MAX (1.6°), sin
+                    // esto quedaría clavado cerca del objeto hasta el timeout de 10s
+                    // y giraría demasiado cerca. Empuja en el sentido de la corrección.
+                    base_setpoint_target += ((hold_err > 0.0f) ? -1.0f : 1.0f) *
+                        AntiStall_Tick(9, 1, ANTISTALL_MAX_REV);
                     brake_setpoint_target = 0.0f;
                 } else {
                     // Dentro de la zona fina: solo el damping (el freno general
@@ -3279,8 +3335,25 @@ static void ControlStep10ms(void)
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_PAUSA_GIRO) {
-                // Hold post-rotación: upright con freno traslacional, yaw-lock en switch
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                // Hold post-rotación: upright con freno traslacional, yaw-lock en switch.
+                // 2026-07-14: + hold de POSICIÓN por encoders (ver OBJ_PAUSA_POS_*):
+                // counts netos positivos = avance (ver signo de vel_enc) → inclina
+                // hacia atrás para volver al punto donde terminó el giro, y viceversa.
+                // Gate con obj_hold_start_ms != 0: el ancla se estampa en el case del
+                // estado (que corre después en el ciclo) — el primer ciclo no corrige.
+                float pausa_corr = 0.0f;
+                if (obj_hold_start_ms != 0) {
+                    __disable_irq();
+                    int32_t pdr = encoder_right - obj_pausa_r0;
+                    int32_t pdl = encoder_left  - obj_pausa_l0;
+                    __enable_irq();
+                    float pausa_drift = (float)(pdr + pdl) * 0.5f;
+                    if (fabsf(pausa_drift) > OBJ_PAUSA_POS_DB_COUNTS) {
+                        pausa_corr = clampf_local(-OBJ_PAUSA_POS_KP * pausa_drift,
+                                                  -OBJ_PAUSA_POS_MAX, OBJ_PAUSA_POS_MAX);
+                    }
+                }
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim + pausa_corr;
                 brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
@@ -4467,11 +4540,16 @@ static void ControlStep10ms(void)
                         // el robot): gira 90° fijo y vuelve directo a FOLLOWING, sin pasar
                         // por ningún estado de avance — se asume que quedó sobre la línea.
                         // Sin información de hacia qué lado está la línea (los 4 sensores
-                        // vieron lo mismo), dirección fija: siempre a la derecha, igual que
-                        // la convención por defecto de OBJ_ROTATE/LOST_ROTATE. Mismo esquema
-                        // de freno fijo corto que LOST_ROTATE/EDGE_ROTATE (2026-07-01):
-                        // no sale anticipadamente ante ninguna condición, siempre completa
-                        // el giro por encoder y luego un freno fijo breve.
+                        // vieron lo mismo), la dirección sigue a `obj_esquive_dir`
+                        // (2026-07-14): reencontrando la línea después de bordear el
+                        // obstáculo, girar hacia el MISMO lado del esquive aleja del
+                        // objeto — girar al contrario lo devolvía directo al obstáculo.
+                        // Sin esquive previo obj_esquive_dir vale +1 (se rearma al entrar
+                        // al modo línea), así que el caso normal conserva la convención
+                        // histórica de girar a la derecha. Mismo esquema de freno fijo
+                        // corto que LOST_ROTATE/EDGE_ROTATE (2026-07-01): no sale
+                        // anticipadamente ante ninguna condición, siempre completa el
+                        // giro por encoder y luego un freno fijo breve.
                         const float  PROT_ENC_TARGET  = 440.0f; // calibración base de 90°
                         const float  PROT_PIVOT       = 14.0f;
                         const float  PROT_BRAKE       = 16.0f;
@@ -4481,7 +4559,7 @@ static void ControlStep10ms(void)
                         const uint32_t PROT_P1_MAX    = 800U;
                         const uint32_t PROT_BRAKE_DURATION = 400U;
                         const float  PROT_ENC_FRAC    = 0.60f;
-                        const float  PROT_DIR         = 1.0f;   // siempre a la derecha
+                        const float  PROT_DIR         = (float)obj_esquive_dir; // sentido del último esquive (+1 derecha por defecto)
 
                         if (!obj_rot_initialized) {
                             __disable_irq();
@@ -4806,7 +4884,50 @@ static void ControlStep10ms(void)
                         const float    BRAKE_VEL_THR  = 0.05f;
                         const uint32_t BRAKE_TIMEOUT  = 1500U;
                         const uint32_t PRE_ROTATE_MS  = 3000U;
-                        if (obj_brake_start_ms == 0) obj_brake_start_ms = HAL_GetTick();
+                        if (obj_brake_start_ms == 0) {
+                            obj_brake_start_ms = HAL_GetTick();
+                            // Rumbo recto (2026-07-14): desde que el STOP es la entrada
+                            // al detectar objeto, su hold hace también la reversa hasta
+                            // la banda de A6/A8 — y salía chueca (reportado) porque no
+                            // tenía ninguna corrección de rumbo. Se porta el mismo P
+                            // sobre diferencia ACUMULADA de counts que tenía
+                            // OBJ_RETROCESO (ver REV_STRAIGHT_*): ancla el rumbo de
+                            // entrada y lo mantiene durante toda la fase, en ambos
+                            // sentidos de corrección del hold.
+                            __disable_irq();
+                            obj_rev_r0 = encoder_right;
+                            obj_rev_l0 = encoder_left;
+                            __enable_irq();
+                            obj_rev_steer_f      = 0.0f;
+                            obj_rev_last_counts  = 0;
+                            obj_rev_last_move_ms = HAL_GetTick();
+                        }
+
+                        {
+                            __disable_irq();
+                            int32_t rev_dr = encoder_right - obj_rev_r0;
+                            int32_t rev_dl = encoder_left  - obj_rev_l0;
+                            __enable_irq();
+                            int32_t rev_counts = (abs(rev_dr) + abs(rev_dl)) / 2;
+                            if (rev_counts != obj_rev_last_counts) {
+                                obj_rev_last_counts  = rev_counts;
+                                obj_rev_last_move_ms = HAL_GetTick();
+                            }
+                            // Solo corrige mientras hay movimiento real (gate por
+                            // actividad de encoders, igual que en OBJ_RETROCESO);
+                            // quieto, el target decae a 0 por el slew (anti-pivoteo).
+                            float corr_target = 0.0f;
+                            if ((HAL_GetTick() - obj_rev_last_move_ms) < REV_STRAIGHT_ACT_MS) {
+                                corr_target = clampf_local(
+                                    REV_STRAIGHT_KC * (float)(rev_dr - rev_dl),
+                                    -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX);
+                            }
+                            float corr_delta = corr_target - obj_rev_steer_f;
+                            if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
+                            if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
+                            obj_rev_steer_f += corr_delta;
+                            steering_adjustment = obj_rev_steer_f;
+                        }
 
                         // Fase 1: frenar hasta quieto o timeout (cruda: la deadbandeada con
                         // umbral 0.05 equivalía a ~0.40 m/s reales)
@@ -4849,10 +4970,11 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_OBJ_GIRO_ESQUIVE:
                     {
-                        // Giro 90° derecha para esquivar objeto: MISMA lógica y constantes
+                        // Giro 90° para esquivar objeto: MISMA lógica y constantes
                         // que el banco de pruebas de 90° en MANUAL, ya validado (pivot fijo
                         // con slowdown por encoder, freno arrancando al 85% del recorrido,
-                        // continuidad del freno al terminar). Dirección fija: derecha.
+                        // continuidad del freno al terminar). Sentido según obj_esquive_dir
+                        // (2026-07-13): +1 derecha (histórico), -1 izquierda (espejado).
                         const float  LINE_ROT_ENC_TARGET   = 372.0f;  // recortado más: 460→394→372 (seguía quedando grande)
                         const float  LINE_ROT_PIVOT        = 24.0f;
                         const float  LINE_ROT_BRAKE         = 10.0f;
@@ -4878,6 +5000,10 @@ static void ControlStep10ms(void)
                         float obj_gz_dps = (float)gz / 100.0f;
                         obj_rot_heading += obj_gz_dps * DT_CTRL_FIXED;
 
+                        // Espeja pivot y freno según el sentido del esquive; el heading
+                        // se compara siempre en valor absoluto, no necesita signo.
+                        float rot_dir = (float)obj_esquive_dir;
+
                         __disable_irq();
                         int32_t dr = encoder_right - obj_rot_r0;
                         int32_t dl = encoder_left  - obj_rot_l0;
@@ -4901,7 +5027,7 @@ static void ControlStep10ms(void)
                                 float slowdown  = (remaining < LINE_ROT_SLOWDOWN_DEG)
                                                 ? (remaining / LINE_ROT_SLOWDOWN_DEG)
                                                 : 1.0f;
-                                float pivot = LINE_ROT_PIVOT * fmaxf(slowdown, 0.0f);
+                                float pivot = LINE_ROT_PIVOT * fmaxf(slowdown, 0.0f) * rot_dir;
                                 line_pivot_active = 1;
                                 motorRightVelocity = (int16_t)clampf_local(
                                     -(pwm_sat + pivot), -60.0f, 60.0f);
@@ -4919,8 +5045,8 @@ static void ControlStep10ms(void)
                             int overshoot     = (abs_heading > LINE_ROT_ABS_TARGET * 1.2f);
                             if ((enc_done && p1_elapsed >= LINE_ROT_BRAKE_DURATION) ||
                                 p1_elapsed >= LINE_ROT_P1_MAX || overshoot) {
-                                // Verificación por ADC7 (2026-07-10): buena detención =
-                                // la pared quedó a la vista lateral (ADC7 < 3200). Si no
+                                // Verificación por el lateral activo (2026-07-10): buena
+                                // detención = la pared quedó a la vista (< 3200). Si no
                                 // bajó de ahí, el giro quedó corto → fase 2 de ajuste fino
                                 // (sigue pivotando despacio hasta verla). El overshoot NO
                                 // entra al ajuste: girar más solo lo empeoraría.
@@ -4936,20 +5062,19 @@ static void ControlStep10ms(void)
                                     obj_rot_p2_c0        = rot_counts;
                                     obj_rot_p2_ms        = HAL_GetTick();
                                     obj_rot_adc_good_cnt = 0;
-                                    obj_rot_p2_seen      = 0;
                                 }
                                 // Seguir aplicando el mismo freno diferencial un ciclo más al
                                 // terminar (ver fix en banco MANUAL) — soltarlo de golpe a 0
                                 // daba un empujón justo en la transición.
                                 line_pivot_active = 1;
                                 motorRightVelocity = (int16_t)clampf_local(
-                                    -(pwm_sat - LINE_ROT_BRAKE), -60.0f, 60.0f);
+                                    -(pwm_sat - LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(
-                                    -(pwm_sat + LINE_ROT_BRAKE), -60.0f, 60.0f);
+                                    -(pwm_sat + LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
                             } else if (!enc_near_done) {
                                 float remaining = LINE_ROT_ENC_TARGET - rot_counts;
                                 float ramp = fminf(remaining / (LINE_ROT_ENC_TARGET * 0.15f), 1.0f);
-                                float pivot = LINE_ROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
+                                float pivot = LINE_ROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f) * rot_dir;
                                 line_pivot_active = 1;
                                 motorRightVelocity = (int16_t)clampf_local(
                                     -(pwm_sat + pivot), -60.0f, 60.0f);
@@ -4958,22 +5083,23 @@ static void ControlStep10ms(void)
                             } else {
                                 line_pivot_active = 1;
                                 motorRightVelocity = (int16_t)clampf_local(
-                                    -(pwm_sat - LINE_ROT_BRAKE), -60.0f, 60.0f);
+                                    -(pwm_sat - LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(
-                                    -(pwm_sat + LINE_ROT_BRAKE), -60.0f, 60.0f);
+                                    -(pwm_sat + LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
                             }
                         } else if (obj_rot_phase == 2) {
-                            // Ajuste fino por ADC7 (2026-07-10): los 90° por encoders
+                            // Ajuste fino por el lateral activo (ADC7 girando a derecha,
+                            // ADC5 a izquierda; 2026-07-10): los 90° por encoders
                             // terminaron pero la pared no quedó a la vista lateral
-                            // (ADC7 ≥ 3200) — le falta un poco más. Pivot suave a la
-                            // derecha hasta que ADC7 baje de OBJ_ROT_ADC_GOOD durante
-                            // GOOD_CYC ciclos seguidos, con tope de counts extra y
-                            // timeout (por si la pared quedó fuera de alcance).
+                            // (≥ 3200) — le falta un poco más. Pivot suave en el mismo
+                            // sentido del giro hasta que el lateral baje de
+                            // OBJ_ROT_ADC_GOOD durante GOOD_CYC ciclos seguidos, con
+                            // tope de counts extra y timeout (por si la pared quedó
+                            // fuera de alcance).
                             uint8_t rot_adc_good =
                                 ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_ROT_ADC_GOOD);
                             if (rot_adc_good) {
                                 if (obj_rot_adc_good_cnt < 255) obj_rot_adc_good_cnt++;
-                                obj_rot_p2_seen = 1;
                             } else {
                                 obj_rot_adc_good_cnt = 0;
                             }
@@ -4986,39 +5112,26 @@ static void ControlStep10ms(void)
                                 obj_rot_phase       = 0;
                                 obj_rot_heading     = 0.0f;
                                 obj_rot_start_ms    = 0;
-                                if (obj_rot_adc_good_cnt >= OBJ_ROT_ADC_GOOD_CYC ||
-                                    obj_rot_p2_seen) {
-                                    // Pared confirmada (o al menos vislumbrada): seguir
-                                    // la secuencia normal de bordeo.
-                                    line_state = LINE_STATE_OBJ_PAUSA_GIRO;
-                                } else {
-                                    // La pared NO apareció en ningún momento del ajuste
-                                    // fino (2026-07-10): detección fantasma o el objeto
-                                    // quedó fuera de alcance — bordear no tiene sentido.
-                                    // Abortar la esquiva y volver a buscar la línea por
-                                    // odometría (mismo retorno al punto de pérdida que
-                                    // usa el post-180°). Ignorar detección de objetos
-                                    // 5s, como el resto de las salidas de pared.
-                                    line_state            = LINE_STATE_LOST_FWD;
-                                    line_lost_ms          = HAL_GetTick();
-                                    lost_fwd_vel_integral = 0.0f;
-                                    lost_ret_ov_active    = 0;
-                                    line_integral         = 0.0f;
-                                    line_error_prev       = 0.0f;
-                                    line_error_f_d        = 0.0f;
-                                    steering_adjustment   = 0.0f;
-                                    obj_wall_clear_initialized = 0;
-                                    obj_wall_seq_start_ms = 0;
-                                    obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
-                                }
+                                // 2026-07-14: SIEMPRE sigue a PAUSA_GIRO, aunque el lateral
+                                // no haya visto la pared. El aborto a LOST_FWD que había acá
+                                // (2026-07-10, "detección fantasma") volvía a la línea al
+                                // instante — reportado en el esquive a IZQUIERDA: "si ve la
+                                // línea durante el giro se sale del modo esquive" y el robot
+                                // regresaba directo al obstáculo. Con la entrada por la fase
+                                // STOP (hold de distancia contra A6/A8 durante segundos) el
+                                // objeto está confirmado de sobra: fantasma es casi imposible.
+                                // Si la pared realmente no aparece bordeando, el timeout de
+                                // pared perdida (5s → reposo) ya cubre ese caso sin volver
+                                // hacia el obstáculo.
+                                line_state = LINE_STATE_OBJ_PAUSA_GIRO;
                                 // Mismo freno de continuidad que la salida de fase 1.
                                 line_pivot_active = 1;
                                 motorRightVelocity = (int16_t)clampf_local(
-                                    -(pwm_sat - LINE_ROT_BRAKE), -60.0f, 60.0f);
+                                    -(pwm_sat - LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(
-                                    -(pwm_sat + LINE_ROT_BRAKE), -60.0f, 60.0f);
+                                    -(pwm_sat + LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
                             } else {
-                                float pivot = LINE_ROT_PIVOT * 0.5f;   // suave: es un retoque
+                                float pivot = LINE_ROT_PIVOT * 0.5f * rot_dir;   // suave: es un retoque
                                 line_pivot_active = 1;
                                 motorRightVelocity = (int16_t)clampf_local(
                                     -(pwm_sat + pivot), -60.0f, 60.0f);
@@ -5034,7 +5147,14 @@ static void ControlStep10ms(void)
                         // Balance estático 2s, luego pasa directo a OBJ_BORDEAR_PARED
                         // (se prueba saltear OBJ_BUSCAR_PARED, ver Registro de Cambios 2026-07-05).
                         steering_adjustment = 0.0f;
-                        if (obj_hold_start_ms == 0) obj_hold_start_ms = HAL_GetTick();
+                        if (obj_hold_start_ms == 0) {
+                            obj_hold_start_ms = HAL_GetTick();
+                            // Ancla del hold de posición (ver setpoint de PAUSA_GIRO).
+                            __disable_irq();
+                            obj_pausa_r0 = encoder_right;
+                            obj_pausa_l0 = encoder_left;
+                            __enable_irq();
+                        }
                         if (f_fallen) {
                             line_state        = LINE_STATE_FOLLOWING;
                             line_integral     = 0.0f;
@@ -5060,7 +5180,7 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_OBJ_BUSCAR_PARED:
                     {
-                        // Avanza despacio (PI de velocidad) hasta que ADC7 detecta la pared.
+                        // Avanza despacio (PI de velocidad) hasta que el lateral activo detecta la pared.
                         // Timeout OBJ_WALL_APPROACH_TIMEOUT → vuelve a FOLLOWING si no encuentra pared.
                         uint8_t wall_found = ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD);
                         if (f_fallen) {
@@ -5087,10 +5207,10 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_OBJ_BORDEAR_PARED:
                     {
-                        // Wall-following: avanza mientras ADC7 ve el objeto.
-                        // Si pierde el objeto → pivot izquierda. Si ve línea (tras 3s) → FOLLOWING.
-                        // ADC7 < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
-                        // TOO_CLOSE_THOLD → pivot derecha igual que OBJ_ROTATE.
+                        // Wall-following: avanza mientras el lateral activo ve el objeto.
+                        // Si pierde el objeto → pivot hacia la pared. Si ve línea (tras 3s) → FOLLOWING.
+                        // Lateral < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
+                        // TOO_CLOSE_THOLD → pivot alejándose de la pared.
                         if (obj_wall_fwd_start_ms == 0)
                             obj_wall_fwd_start_ms = HAL_GetTick();
                         // Ignora línea solo los primeros OBJ_WALL_LINE_IGNORE_MS desde que
@@ -5130,12 +5250,12 @@ static void ControlStep10ms(void)
                             obj_rev_steer_f += corr_delta;
                             steering_adjustment = obj_rev_steer_f;
                         } else if (too_close) {
-                            // Demasiado cerca: pivot derecha (alejar del obstáculo)
+                            // Demasiado cerca: pivot alejándose de la pared (según sentido)
                             line_pivot_active  = 1;
                             motorRightVelocity = (int16_t)clampf_local(
-                                -(pwm_sat + OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                                -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
                             motorLeftVelocity  = (int16_t)clampf_local(
-                                -(pwm_sat - OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                                -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
                         } else if (!wall_visible) {
                             // Perdió la pared: en vez de girar ya mismo, avanza un poco más
                             // (OBJ_WALL_CLEAR_COUNTS) para no quedar pivoteando pegado a la
@@ -5204,9 +5324,9 @@ static void ControlStep10ms(void)
                         } else if (too_close) {
                             line_pivot_active  = 1;
                             motorRightVelocity = (int16_t)clampf_local(
-                                -(pwm_sat + OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                                -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
                             motorLeftVelocity  = (int16_t)clampf_local(
-                                -(pwm_sat - OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                                -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
                         } else if (clear_counts >= OBJ_WALL_CLEAR_COUNTS) {
                             line_state                 = LINE_STATE_OBJ_GIRO_PARED;
                             steering_adjustment        = 0.0f;
@@ -5220,9 +5340,9 @@ static void ControlStep10ms(void)
 
                     case LINE_STATE_OBJ_GIRO_PARED:
                     {
-                        // Pivot izquierda hasta re-ver el objeto en ADC7 o detectar línea.
-                        // ADC7 < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
-                        // TOO_CLOSE_THOLD → pivot derecha en cambio.
+                        // Pivot hacia la pared hasta re-verla en el lateral activo o detectar línea.
+                        // Lateral < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
+                        // TOO_CLOSE_THOLD → pivot alejándose en cambio.
                         float wall_adc       = (float)adcAvg[OBJ_WALL_ADC_IDX];
                         uint8_t wall_visible = (wall_adc < OBJ_WALL_THRESHOLD);
                         uint8_t wall_reverse = obj_wall_rev_latch;   // por counts (2026-07-10)
@@ -5255,24 +5375,25 @@ static void ControlStep10ms(void)
                             obj_rev_steer_f += corr_delta;
                             steering_adjustment = obj_rev_steer_f;
                         } else if (too_close) {
-                            // Demasiado cerca: pivot derecha (alejar del obstáculo)
+                            // Demasiado cerca: pivot alejándose de la pared (según sentido)
                             line_pivot_active  = 1;
                             motorRightVelocity = (int16_t)clampf_local(
-                                -(pwm_sat + OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                                -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
                             motorLeftVelocity  = (int16_t)clampf_local(
-                                -(pwm_sat - OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                                -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
                         } else if (wall_visible) {
                             line_state            = LINE_STATE_OBJ_BORDEAR_PARED;
                             line_pivot_active     = 0;
                             obj_wall_fwd_start_ms = HAL_GetTick();
                             obj_wall_vel_integral = 0.0f;
                         } else {
-                            // Pivot izquierda: signo opuesto a OBJ_ROTATE (que pivotea derecha).
+                            // Pivot hacia el lado de la pared (opuesto al giro de esquive):
+                            // izquierda si se esquivó a derecha, y viceversa.
                             line_pivot_active  = 1;
                             motorRightVelocity = (int16_t)clampf_local(
-                                -(pwm_sat - OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                                -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
                             motorLeftVelocity  = (int16_t)clampf_local(
-                                -(pwm_sat + OBJ_WALL_PIVOT_POWER), -30.0f, 30.0f);
+                                -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
                         }
                         break;
                     }
@@ -6109,7 +6230,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+  sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
