@@ -366,7 +366,7 @@ typedef enum {
 #define OBJ_REV_HOLD_BAND          400.0f    // banda muerta por encima de CLEAR (3500..3900 = quieto; 300 era "muy ambiciosa", pedido 2026-07-10)
 #define OBJ_REV_HOLD_FINE_BAND     60.0f     // banda muerta chica alrededor del centro: adentro no corrige, deja frenar/asentar
 #define OBJ_REV_HOLD_ANGLE_MIN     0.9f      // corrección mínima cuando apenas se sale de la zona fina
-#define OBJ_REV_HOLD_ANGLE_MAX     1.6f      // tope de corrección del hold: más suave que el bang-bang previo
+#define OBJ_REV_HOLD_ANGLE_MAX     2.6f      // tope de corrección del hold (2026-07-14: 1.6→2.6, "intenta corregir pero el ángulo no le da"; el anti-stall sigue de respaldo)
 #define OBJ_REV_HOLD_ERR_FOR_MAX   220.0f    // error (ADC) a partir del cual ya usa ANGLE_MAX
 // 2026-07-10: damping por velocidad en el hold (el término D que le faltaba).
 // El hold era P puro sobre distancia: el robot es un doble integrador
