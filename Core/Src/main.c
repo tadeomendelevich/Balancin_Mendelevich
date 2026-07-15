@@ -62,7 +62,6 @@ typedef enum {
     LINE_STATE_EDGE_FWD,       // Post-90°: avanza con velocidad controlada hasta encontrar la línea
     LINE_STATE_GIVEN_UP,       // Ni el giro de 180 ni el de 90 encontraron la línea: reposo total hasta reponerla a mano
     LINE_STATE_PERP_ROTATE,    // Los 4 ADC en negro sin manipulación: cruce perpendicular, gira 90° (sentido del último esquive)
-    LINE_STATE_PERP_SETTLE,    // Post-giro perpendicular: STOP neto de 2s sobre la línea (freno + hold de posición) antes de retomar FOLLOWING sin envión
     LINE_STATE_OBJ_ESPERA_REVERSA, // (fuera de la cadena activa desde 2026-07-14: sin ancla, el robot derivaba hacia atrás y perdía la pared)
     LINE_STATE_OBJ_RETROCESO,    // (fuera de la cadena activa desde 2026-07-14: la reversa la hace el hold del STOP)
     LINE_STATE_OBJ_FRENO_REVERSA,      // Fase STOP: entra DIRECTO al detectar objeto — frena la inercia y lleva/sostiene la distancia (A6/A8 en banda) hasta estabilizarse → giro
@@ -402,12 +401,7 @@ typedef enum {
 #define OBJ_PAUSA_POS_KP           0.06f     // grados por count de deriva (≈1° cada 10 cm)
 #define OBJ_PAUSA_POS_MAX          1.5f      // tope de la corrección de posición (°)
 #define OBJ_PAUSA_POS_DB_COUNTS    3.0f      // banda muerta (≈2 cm): adentro no corrige, deja asentar
-// 2026-07-14: STOP neto post-giro perpendicular ("frene sobre la línea y luego
-// siga sin envión"): al reencontrar la línea después del esquive, el robot
-// llegaba con velocidad y retomaba FOLLOWING lanzado, desestabilizándose.
-// Después del giro de PERP_ROTATE se queda PERP_SETTLE_MS quieto sobre la
-// línea (freno + mismo hold de posición que PAUSA_GIRO) y recién ahí sigue.
-#define PERP_SETTLE_MS             2000U     // duración del STOP post-giro perpendicular
+#define OBJ_FINAL_TURN_WINDOW_MS   1500U     // la línea hallada al salir del bordeo debe disparar PERP dentro de esta ventana
 // 2026-07-13: esquive alternado. `obj_esquive_dir` = +1 → giro 90° a la DERECHA
 // y pared seguida con el lateral izquierdo ADC7 (adcAvg[6]) — el comportamiento
 // de siempre. -1 → todo espejado: giro a la IZQUIERDA y pared con el lateral
@@ -476,6 +470,7 @@ typedef enum {
 #define OBJ_WALL_REVERSE_SETTLE_VEL 0.15f    // m/s por debajo del cual se considera "quieto"
 #define OBJ_WALL_PIVOT_POWER       8.0f      // potencia del pivot en WALL_TURN/WALL_FWD
 #define OBJ_WALL_LINE_IGNORE_MS    5000U     // ms desde la entrada al wall-following en que se ignora la línea (2026-07-14: 3s→5s, veía la línea al arrancar pared>avanza/gira y abortaba la esquiva)
+#define OBJ_WALL_LINE_CONFIRM_CYC  5U        // lecturas consecutivas (5×10ms=50ms) antes de abandonar el bordeo por línea
 #define OBJ_WALL_CLEAR_COUNTS      100       // counts de encoder a avanzar tras perder la pared, antes de girar
 
 // Parámetros del arco evasivo (OBJ_ARC) — ajustables en runtime desde Qt
@@ -549,6 +544,10 @@ static float roll_deg = 0.0f;	// Ángulo de balanceo (eje Y, usado para el equil
 static float pitch_deg = 0.0f;	// Ángulo de inclinación (eje X)
 
 volatile uint16_t adcValues[8];
+// Snapshot coherente de una secuencia DMA completa. adcValues[] pertenece al
+// DMA y no debe leerse canal por canal mientras el periférico puede escribirlo.
+static volatile uint16_t adcSnapshot[8] = {0};
+static volatile uint32_t adc_snapshot_seq = 0;
 // Cuarentena de sensores de línea enganchados (2026-07-10): un canal clavado
 // en el tope (~4095, típico de soldadura fría — baja al presionarlo con el
 // dedo — o emisor IR caído) finge "línea" permanente de ese lado: arrastra el
@@ -565,8 +564,6 @@ static uint8_t  line_ch_quarantine[4] = {0, 0, 0, 0};
 static uint16_t adcBuf[BAR_COUNT][ADC_AVERAGE_SIZE] = {{0}};		// Buffers circulares: [canal][posición en la ventana]
 static uint8_t maIndex = 0;		// Índice circular común para todos los canales
 static uint16_t adcAvg[BAR_COUNT] = {0};
-static volatile uint32_t adc_dma_last_ms = 0;
-static volatile uint8_t  adc_recover_pending = 0;
 
 uint8_t i2c1_tx_busy = 0;
 
@@ -772,9 +769,9 @@ static uint32_t obj_rev_band_enter_ms = 0;        // entrada a la banda 3600..39
 static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
 static int32_t  obj_pausa_r0         = 0;         // ancla de posición del hold post-giro (PAUSA_GIRO)
 static int32_t  obj_pausa_l0         = 0;
-static uint32_t perp_settle_start_ms = 0;         // inicio del STOP post-giro perpendicular (PERP_SETTLE)
-static int32_t  perp_settle_r0       = 0;         // ancla de posición del PERP_SETTLE
-static int32_t  perp_settle_l0       = 0;
+static uint32_t obj_final_turn_pending_ms = 0;     // línea reencontrada al salir del bordeo; espera el giro final PERP
+static uint8_t  perp_from_obj_avoidance   = 0;     // el PERP_ROTATE actual es el giro final de un esquive
+static uint32_t perp_obj_brake_start_ms   = 0;     // inicio real del contrafreno suave del giro final de esquive
 static float    obj_arc_steer_int    = 0.0f;      // integral del PI de diferencial en OBJ_ARC
 static uint32_t obj_wall_approach_start_ms = 0;    // timestamp de entrada a WALL_APPROACH
 static uint32_t obj_wall_fwd_start_ms = 0;         // timestamp de entrada a WALL_FWD (init de PI/estado, no se usa para ignorar línea)
@@ -786,6 +783,7 @@ static uint32_t obj_wall_seq_start_ms = 0;         // timestamp de entrada a TOD
                                                     // esos 3 estados -- ver fix 2026-07-05 "ignora la línea todo el tiempo"
 static int32_t  obj_wall_clear_r0 = 0;
 static int32_t  obj_wall_clear_l0 = 0;
+static uint8_t  obj_wall_line_confirm_cnt = 0;     // debounce compartido por los 3 estados de pared
 
 volatile uint8_t tick2ms_count = 0;
 static uint8_t encoder_sampler_initialized = 0;
@@ -914,7 +912,6 @@ static void ControlStep10ms(void);
 static float ComputeSteeringPID(float speed_r, float speed_l, float sp);
 static void  SteeringPID_Reset(void);
 static void  SampleEncoders250us(void);
-static void  ADC1_Recover(uint8_t clear_buffers);
 static void  I2C1_Recover(void);
 
 static inline uint32_t micros(void) {
@@ -1030,14 +1027,15 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ADC1) {
-        adc_dma_last_ms = HAL_GetTick();
-    }
-}
-
-void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
-{
-    if (hadc->Instance == ADC1) {
-        adc_recover_pending = 1;
+        // Seqlock: impar mientras se copia, par cuando el snapshot está completo.
+        // El próximo trigger llega 250us después y copiar 8 halfwords tarda una
+        // fracción mínima de esa ventana.
+        adc_snapshot_seq++;
+        __DMB();
+        for (uint8_t ch = 0; ch < 8; ++ch)
+            adcSnapshot[ch] = adcValues[ch];
+        __DMB();
+        adc_snapshot_seq++;
     }
 }
 
@@ -1522,51 +1520,29 @@ void UpdateADC_MovingAverage(void) {
     // buffer de ventana). El DMA escribe ese buffer a 4 kHz: si actualizaba entre
     // ambas lecturas, lo sumado != lo guardado, y al restar esa posición después
     // quedaba un residuo PERMANENTE en adcSum — el promedio quedaba inflado para
-    // siempre (y ADC1_Recover con clear_buffers=0 no lo tocaba, por eso ninguna
-    // recuperación lo arreglaba). Ahora: UNA sola lectura por canal y el promedio
-    // se recalcula desde la ventana completa — sin acumulador, sin drift posible.
+    // siempre. Ahora el promedio se recalcula desde la ventana completa y consume
+    // únicamente snapshots publicados al completar los 8 ranks.
+    uint16_t sample[8];
+    uint32_t seq_before, seq_after;
+    for (;;) {
+        seq_before = adc_snapshot_seq;
+        if (seq_before & 1U) continue;
+        __DMB();
+        for (uint8_t ch = 0; ch < 8; ++ch)
+            sample[ch] = adcSnapshot[ch];
+        __DMB();
+        seq_after = adc_snapshot_seq;
+        if (seq_before == seq_after && !(seq_after & 1U)) break;
+    }
+
     for (uint8_t ch = 0; ch < BAR_COUNT; ++ch) {
-        adcBuf[ch][maIndex] = adcValues[ch];   // única lectura del buffer DMA
+        adcBuf[ch][maIndex] = sample[ch];
         uint32_t sum = 0;
         for (uint8_t i = 0; i < ADC_AVERAGE_SIZE; ++i)
             sum += adcBuf[ch][i];
         adcAvg[ch] = (uint16_t)(sum / ADC_AVERAGE_SIZE);
     }
     maIndex = (maIndex + 1) % ADC_AVERAGE_SIZE;	    // Avanza en el buffer circular
-}
-
-// clear_buffers=1 (recuperación por falla real): además de reiniciar el DMA/ADC, borra
-// el promedio móvil (arranca de 0, como antes). clear_buffers=0 (barrido preventivo
-// periódico, ver USER CODE BEGIN 3): solo reinicia el hardware del DMA/ADC sin tocar
-// adcSum/adcBuf/adcAvg -- evita un bache de "todo blanco" cada vez que corre, ya que el
-// promedio móvil se va actualizando solo con las lecturas nuevas en los próximos ciclos.
-static void ADC1_Recover(uint8_t clear_buffers)
-{
-    HAL_ADC_Stop_DMA(&hadc1);
-    __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
-    __HAL_DMA_DISABLE(hadc1.DMA_Handle);
-    __HAL_DMA_CLEAR_FLAG(hadc1.DMA_Handle,
-                         DMA_FLAG_TCIF0_4 | DMA_FLAG_HTIF0_4 |
-                         DMA_FLAG_TEIF0_4 | DMA_FLAG_DMEIF0_4 | DMA_FLAG_FEIF0_4);
-    // OJO: acá NO se rehabilita el stream a mano (__HAL_DMA_ENABLE). Hacerlo
-    // dejaba el EN=1 con el NDTR viejo un instante antes de HAL_ADC_Start_DMA:
-    // si el stream no llegaba a apagarse, la reconfiguración del HAL se ignora
-    // en silencio y la DMA sigue a mitad del buffer → TODOS los canales quedan
-    // rotados un lugar (un canal de línea pasa a leer el ~4095 de un canal de
-    // objeto) hasta la próxima recuperación. HAL_ADC_Start_DMA ya rearma y
-    // habilita el stream correctamente desde cero.
-
-    if (clear_buffers) {
-        memset(adcBuf, 0, sizeof(adcBuf));
-        memset(adcAvg, 0, sizeof(adcAvg));
-        maIndex = 0;
-    }
-
-    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcValues, 8);
-
-    adc_dma_last_ms = HAL_GetTick();
-    adc_recover_pending = 0;
-    USB_Debug("ADC RECOVER\r\n");
 }
 
 static void esp01_chpd(uint8_t val) {
@@ -1617,6 +1593,17 @@ static float apply_deadbandf(float value, float deadband)
     if (value > deadband) return value - deadband;
     if (value < -deadband) return value + deadband;
     return 0.0f;
+}
+
+static uint8_t ObjWall_LineConfirmed(uint8_t line_detected, uint8_t line_ignore)
+{
+    if (line_ignore || !line_detected) {
+        obj_wall_line_confirm_cnt = 0;
+        return 0;
+    }
+    if (obj_wall_line_confirm_cnt < OBJ_WALL_LINE_CONFIRM_CYC)
+        obj_wall_line_confirm_cnt++;
+    return (obj_wall_line_confirm_cnt >= OBJ_WALL_LINE_CONFIRM_CYC);
 }
 
 // Anti-stall genérico (2026-07-10): boost de ángulo en rampa para estados que
@@ -1914,7 +1901,6 @@ static const char *LineStateStr(void)
         case LINE_STATE_EDGE_FWD:           return "EVUELV";
         case LINE_STATE_GIVEN_UP:           return "PARADO";
         case LINE_STATE_PERP_ROTATE:        return "PGIRO";
-        case LINE_STATE_PERP_SETTLE:        return "PSTOP";
         case LINE_STATE_OBJ_ESPERA_REVERSA: return "ESPER";
         case LINE_STATE_OBJ_RETROCESO:      return "RETRO";
         case LINE_STATE_OBJ_FRENO_REVERSA:  return "STOP";
@@ -2792,6 +2778,7 @@ static void ControlStep10ms(void)
                     obj_rot_phase       = 0;
                     obj_rot_heading     = 0.0f;
                     obj_rot_phase1_ms   = 0;
+                    obj_wall_line_confirm_cnt = 0;
                 }
             }
 
@@ -2887,6 +2874,12 @@ static void ControlStep10ms(void)
                             all_black_elapsed < PERP_MAX_ELAPSED_MS &&
                             last_partial_line_ms != 0 &&
                             (all_black_start_ms - last_partial_line_ms) < PERP_PARTIAL_WIN_MS) {
+                            uint32_t now_ms = HAL_GetTick();
+                            perp_from_obj_avoidance =
+                                (obj_final_turn_pending_ms != 0) &&
+                                ((now_ms - obj_final_turn_pending_ms) <= OBJ_FINAL_TURN_WINDOW_MS);
+                            obj_final_turn_pending_ms = 0;
+                            perp_obj_brake_start_ms = 0;
                             line_state          = LINE_STATE_PERP_ROTATE;
                             obj_rot_initialized = 0;
                             obj_rot_phase       = 0;
@@ -3050,6 +3043,10 @@ static void ControlStep10ms(void)
             lost_fwd_vel_integral = 0.0f;
             all_black_start_ms  = 0;
             last_partial_line_ms = 0;
+            obj_final_turn_pending_ms = 0;
+            perp_from_obj_avoidance   = 0;
+            perp_obj_brake_start_ms   = 0;
+            obj_wall_line_confirm_cnt = 0;
             odom_x_m            = 0.0f;   // odometría: origen = punto de entrada al modo
             odom_y_m            = 0.0f;
             odom_theta_deg      = 0.0f;
@@ -3343,27 +3340,6 @@ static void ControlStep10ms(void)
                 // Rotación: upright sin avance, sin freno de encoders
                 base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
                 brake_setpoint_target = 0.0f;
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_PERP_SETTLE) {
-                // STOP neto post-giro perpendicular: upright + freno de encoders +
-                // hold de posición (mismo patrón y constantes que PAUSA_GIRO).
-                // Gate con perp_settle_start_ms != 0: el ancla se estampa en el
-                // case del estado (corre después) — el primer ciclo no corrige.
-                float psettle_corr = 0.0f;
-                if (perp_settle_start_ms != 0) {
-                    __disable_irq();
-                    int32_t sdr = encoder_right - perp_settle_r0;
-                    int32_t sdl = encoder_left  - perp_settle_l0;
-                    __enable_irq();
-                    float psettle_drift = (float)(sdr + sdl) * 0.5f;
-                    if (fabsf(psettle_drift) > OBJ_PAUSA_POS_DB_COUNTS) {
-                        psettle_corr = clampf_local(-OBJ_PAUSA_POS_KP * psettle_drift,
-                                                    -OBJ_PAUSA_POS_MAX, OBJ_PAUSA_POS_MAX);
-                    }
-                }
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim + psettle_corr;
-                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
                 line_enc_angle_corr   = 0.0f;
                 line_reverse_boost    = 0.0f;
             } else if (line_state == LINE_STATE_OBJ_PAUSA_GIRO) {
@@ -4585,11 +4561,14 @@ static void ControlStep10ms(void)
                         const float  PROT_ENC_TARGET  = 440.0f; // calibración base de 90°
                         const float  PROT_PIVOT       = 14.0f;
                         const float  PROT_BRAKE       = 16.0f;
+                        const float  PROT_OBJ_BRAKE   = 8.0f;  // contrafreno suave solo para el giro final de esquive
                         const float  PROT_SLOWDOWN_DEG = 55.0f;
                         const float  PROT_ABS_TARGET  = 90.0f;
                         const uint32_t PROT_P0_MAX    = 1500U;
                         const uint32_t PROT_P1_MAX    = 800U;
                         const uint32_t PROT_BRAKE_DURATION = 400U;
+                        const uint32_t PROT_OBJ_BRAKE_RAMP_MS = 200U;
+                        const uint32_t PROT_OBJ_BRAKE_DURATION = 300U;
                         const float  PROT_ENC_FRAC    = 0.60f;
                         const float  PROT_DIR         = (float)obj_esquive_dir; // sentido del último esquive (+1 derecha por defecto)
 
@@ -4603,6 +4582,7 @@ static void ControlStep10ms(void)
                             obj_rot_phase       = 0;
                             obj_rot_heading     = 0.0f;
                             obj_rot_phase1_ms   = 0;
+                            perp_obj_brake_start_ms = 0;
                         }
 
                         float prot_gz = (float)gz / 100.0f;
@@ -4639,13 +4619,26 @@ static void ControlStep10ms(void)
                             uint32_t p1e      = HAL_GetTick() - obj_rot_phase1_ms;
                             int enc_done      = (prot_counts >= PROT_ENC_TARGET);
                             int overshoot     = (prot_abs_hdg > PROT_ABS_TARGET * 1.2f);
-                            if ((enc_done && p1e >= PROT_BRAKE_DURATION) || p1e >= PROT_P1_MAX || overshoot) {
+                            uint32_t obj_brake_elapsed = 0;
+                            if (enc_done && perp_from_obj_avoidance) {
+                                if (perp_obj_brake_start_ms == 0)
+                                    perp_obj_brake_start_ms = HAL_GetTick();
+                                obj_brake_elapsed = HAL_GetTick() - perp_obj_brake_start_ms;
+                            }
+                            int brake_done = perp_from_obj_avoidance
+                                ? (enc_done && obj_brake_elapsed >= PROT_OBJ_BRAKE_DURATION)
+                                : (enc_done && p1e >= PROT_BRAKE_DURATION);
+                            int phase_timeout = perp_from_obj_avoidance
+                                ? (!enc_done && p1e >= PROT_P1_MAX)
+                                : (p1e >= PROT_P1_MAX);
+                            if (brake_done || phase_timeout || overshoot) {
                                 // 2026-07-14: antes retomaba FOLLOWING directo — llegando
                                 // del esquive con velocidad, arrancaba lanzado y se
-                                // desestabilizaba. Ahora pasa por un STOP neto de 2s
-                                // sobre la línea (PERP_SETTLE) antes de seguir.
-                                line_state          = LINE_STATE_PERP_SETTLE;
-                                perp_settle_start_ms = 0;
+                                // Sin pausa posterior: el giro final lento ya entrega
+                                // el robot directamente al seguidor de línea.
+                                line_state = LINE_STATE_FOLLOWING;
+                                perp_from_obj_avoidance = 0;
+                                perp_obj_brake_start_ms = 0;
                                 line_seen_since_entry = 1;
                                 line_integral       = 0.0f;
                                 line_error_prev     = 0.0f;
@@ -4659,6 +4652,7 @@ static void ControlStep10ms(void)
                                 // otro PERP_ROTATE apenas vuelva a FOLLOWING -> giro en círculos.
                                 all_black_start_ms  = 0;
                             } else if (!enc_done) {
+                                perp_obj_brake_start_ms = 0;
                                 float remaining = PROT_ENC_TARGET - prot_counts;
                                 float ramp = fminf(remaining / (PROT_ENC_TARGET * 0.15f), 1.0f);
                                 float pivot = PROT_DIR * PROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
@@ -4666,39 +4660,18 @@ static void ControlStep10ms(void)
                                 motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
                             } else {
-                                float pivot = PROT_DIR * PROT_BRAKE;
+                                float brake_power = PROT_BRAKE;
+                                if (perp_from_obj_avoidance) {
+                                    float brake_ramp = fminf(
+                                        (float)obj_brake_elapsed / (float)PROT_OBJ_BRAKE_RAMP_MS,
+                                        1.0f);
+                                    brake_power = PROT_OBJ_BRAKE * brake_ramp;
+                                }
+                                float pivot = PROT_DIR * brake_power;
                                 line_pivot_active  = 1;
                                 motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
                                 motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
                             }
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_PERP_SETTLE:
-                    {
-                        // STOP neto post-giro perpendicular (2026-07-14): 2s quieto
-                        // sobre la línea antes de retomar FOLLOWING — sin esto, el
-                        // robot llegaba del esquive con velocidad y arrancaba a
-                        // seguir la línea lanzado ("envión que lo desestabiliza").
-                        // Setpoint (freno + hold de posición) en la sección de
-                        // setpoints; acá solo el timer, el ancla y la salida.
-                        steering_adjustment = 0.0f;
-                        if (perp_settle_start_ms == 0) {
-                            perp_settle_start_ms = HAL_GetTick();
-                            __disable_irq();
-                            perp_settle_r0 = encoder_right;
-                            perp_settle_l0 = encoder_left;
-                            __enable_irq();
-                        }
-                        if ((HAL_GetTick() - perp_settle_start_ms) >= PERP_SETTLE_MS) {
-                            line_state           = LINE_STATE_FOLLOWING;
-                            perp_settle_start_ms = 0;
-                            line_integral        = 0.0f;
-                            line_error_prev      = 0.0f;
-                            line_error_f_d       = 0.0f;
-                            line_lost_ms         = HAL_GetTick();
-                            all_black_start_ms   = 0;
                         }
                         break;
                     }
@@ -5289,8 +5262,10 @@ static void ControlStep10ms(void)
                         uint8_t wall_visible  = (wall_adc < OBJ_WALL_THRESHOLD);
                         uint8_t wall_reverse  = obj_wall_rev_latch;   // por counts (2026-07-10)
                         uint8_t too_close     = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
-                        if (line_detected && !line_ignore) {
+                        if (ObjWall_LineConfirmed(line_detected, line_ignore)) {
                             line_seen_since_entry = 1;
+                            obj_wall_line_confirm_cnt = 0;
+                            obj_final_turn_pending_ms = HAL_GetTick();
                             line_state          = LINE_STATE_FOLLOWING;
                             line_integral       = 0.0f;
                             line_error_prev     = 0.0f;
@@ -5364,8 +5339,10 @@ static void ControlStep10ms(void)
                         // la secuencia (obj_wall_seq_start_ms) — ver fix 2026-07-05.
                         uint8_t line_ignore2 = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
 
-                        if (line_detected && !line_ignore2) {
+                        if (ObjWall_LineConfirmed(line_detected, line_ignore2)) {
                             line_seen_since_entry = 1;
+                            obj_wall_line_confirm_cnt = 0;
+                            obj_final_turn_pending_ms = HAL_GetTick();
                             line_state          = LINE_STATE_FOLLOWING;
                             line_integral       = 0.0f;
                             line_error_prev     = 0.0f;
@@ -5415,8 +5392,10 @@ static void ControlStep10ms(void)
                         // Misma ventana que BORDEAR_PARED/PARED_LIBRE, medida desde la
                         // entrada a toda la secuencia (obj_wall_seq_start_ms).
                         uint8_t line_ignore2 = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
-                        if (line_detected && !line_ignore2) {
+                        if (ObjWall_LineConfirmed(line_detected, line_ignore2)) {
                             line_seen_since_entry = 1;
+                            obj_wall_line_confirm_cnt = 0;
+                            obj_final_turn_pending_ms = HAL_GetTick();
                             line_state          = LINE_STATE_FOLLOWING;
                             line_integral       = 0.0f;
                             line_error_prev     = 0.0f;
@@ -5486,7 +5465,6 @@ static void ControlStep10ms(void)
                     if (steering_adjustment == 0.0f &&
                         (line_state == LINE_STATE_LOST     ||
                          line_state == LINE_STATE_SEARCHING ||
-                         line_state == LINE_STATE_PERP_SETTLE ||
                          line_state == LINE_STATE_OBJ_ESPERA_REVERSA ||
                          line_state == LINE_STATE_OBJ_PAUSA_GIRO ||
                          line_state == LINE_STATE_OBJ_BUSCAR_PARED ||
@@ -5630,10 +5608,10 @@ static void ControlStep10ms(void)
             wlog.i_line              = log_i_line;
             wlog.d_line              = log_d_line;
             wlog.steering_adjustment = steering_adjustment;
-            wlog.adc1                = adcValues[0];
-            wlog.adc2                = adcValues[1];
-            wlog.adc3                = adcValues[2];
-            wlog.adc4                = adcValues[3];
+            wlog.adc1                = adcAvg[0];
+            wlog.adc2                = adcAvg[1];
+            wlog.adc3                = adcAvg[2];
+            wlog.adc4                = adcAvg[3];
 
             UNER_SendWifiLogData(&wlog);
         }
@@ -5889,8 +5867,9 @@ int main(void)
   nBytesTx = 0;
   HAL_UART_Receive_IT(&huart1, &dataRx, 1);
 
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcValues, 8);
-  adc_dma_last_ms = HAL_GetTick();
+  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcValues, 8) != HAL_OK) {
+      Error_Handler();
+  }
   HAL_TIM_Base_Start_IT(&htim1);   // 10 ms
   HAL_TIM_Base_Start_IT(&htim2);   // 250 us (si lo vas a usar)
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
@@ -5919,7 +5898,7 @@ int main(void)
   unerTx.buff = unerTxBuffer;
   unerTx.mask = TXBUFSIZE - 1;
   UNER_Init(&unerRx, &unerTx, &ax, &ay, &az, &gx, &gy, &gz);
-  UNER_RegisterADCBuffer(adcAvg, 8);  // array adcValues[8]
+  UNER_RegisterADCBuffer(adcAvg, 8);  // promedios coherentes de los 8 canales
   UNER_RegisterMotorSpeed(&motorRightVelocity, &motorLeftVelocity);
   UNER_RegisterAngle(&roll_deg, &pitch_deg);
   UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &KV_brake_value);
@@ -6043,23 +6022,6 @@ int main(void)
 
 	      static uint8_t subtick = 0;
 	      subtick = (subtick + 1) % 10;
-
-          // Recuperación periódica preventiva: el watchdog de arriba solo detecta si
-          // TODA la transferencia DMA de 8 canales se frena — si un solo canal queda
-          // trabado en un valor (p.ej. ADC1 después de ver negro y no volver a bajar)
-          // mientras los otros 7 siguen actualizando, ese watchdog nunca se entera.
-          // Forzar un ADC1_Recover() de rutina cada pocos segundos limpia ese caso sin
-          // necesidad de detectar el canal trabado uno por uno.
-          static uint32_t adc_periodic_recover_ms = 0;
-          if (adc_periodic_recover_ms == 0) adc_periodic_recover_ms = HAL_GetTick();
-          uint8_t adc_periodic_due = (HAL_GetTick() - adc_periodic_recover_ms) > 3000U;
-          uint8_t adc_fault = adc_recover_pending ||
-              (adc_dma_last_ms != 0 && (HAL_GetTick() - adc_dma_last_ms) > 50U);
-
-          if (adc_fault || adc_periodic_due) {
-              ADC1_Recover(adc_fault ? 1 : 0);
-              adc_periodic_recover_ms = HAL_GetTick();
-          }
 
 	      // Estas dos van siempre — son rápidas y críticas
 	      ESP01_Timeout10ms();
