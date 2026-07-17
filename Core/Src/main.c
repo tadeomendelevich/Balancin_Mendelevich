@@ -62,12 +62,12 @@ typedef enum {
     LINE_STATE_EDGE_FWD,       // Post-90°: avanza con velocidad controlada hasta encontrar la línea
     LINE_STATE_GIVEN_UP,       // Ni el giro de 180 ni el de 90 encontraron la línea: reposo total hasta reponerla a mano
     LINE_STATE_PERP_ROTATE,    // Los 4 ADC en negro sin manipulación: cruce perpendicular, gira 90° (sentido del último esquive)
-    LINE_STATE_OBJ_ESPERA_REVERSA, // (fuera de la cadena activa desde 2026-07-14: sin ancla, el robot derivaba hacia atrás y perdía la pared)
-    LINE_STATE_OBJ_RETROCESO,    // (fuera de la cadena activa desde 2026-07-14: la reversa la hace el hold del STOP)
+    // NOTA (2026-07-16): OBJ_ESPERA_REVERSA, OBJ_RETROCESO y OBJ_ARC eliminados
+    // (muertos desde 2026-07-14). Esto RENUMERA los estados OBJ_* que viajan a
+    // Qt en WifiOdomData_t.line_state — si Qt interpreta el valor, actualizar su mirror.
     LINE_STATE_OBJ_FRENO_REVERSA,      // Fase STOP: entra DIRECTO al detectar objeto — frena la inercia y lleva/sostiene la distancia (A6/A8 en banda) hasta estabilizarse → giro
     LINE_STATE_OBJ_GIRO_ESQUIVE,     // Objeto detectado: girando 90° por encoders (sentido según obj_esquive_dir)
     LINE_STATE_OBJ_PAUSA_GIRO,          // Post-rotación: balance estático espera 2s
-    LINE_STATE_OBJ_ARC,           // (no usado) reservado
     LINE_STATE_OBJ_BUSCAR_PARED, // Avanza despacio (2°) hasta encontrar la pared en el lateral activo (ADC7/ADC5)
     LINE_STATE_OBJ_BORDEAR_PARED,      // Wall-following: avanza mientras el lateral activo ve la pared
     LINE_STATE_OBJ_PARED_LIBRE,    // Perdió la pared en WALL_FWD: avanza un poco más antes de girar (no chocar la esquina)
@@ -98,7 +98,7 @@ typedef enum {
 
 
 #define MPU_AVERAGE_SIZE 	10
-#define ADC_AVERAGE_SIZE 	4
+#define ADC_HISTORY_SIZE 	32U   // 8ms de historial a 4kHz para mediana anti-picos
 
 #define BAR_COUNT    		8
 #define BAR_SPACING  		2
@@ -285,18 +285,6 @@ typedef enum {
 #define LINE_REV_BOOST_DOWN     0.10f  // bajada max por ciclo de control
 #define LINE_REV_VEL_START      0.05f  // m/s de reversa desde donde empieza a actuar
 #define LINE_REV_VEL_FULL       0.35f  // m/s de reversa para aplicar boost maximo
-#define LINE_OBJ_REV_TILT_MAX   8.5f   // tope de inclinacion hacia atras en reversa (limite negativo del setpoint)
-// 2026-07-13: la reversa por obstáculo dejó de ser un PI de velocidad cerrado.
-// Ese lazo no tenía equilibrio posible: el target (≤0.30 m/s) quedaba DEBAJO del
-// piso de medición (deadband 0.35 sobre la velocidad cuantizada de encoders) —
-// medido 0 → empuje máximo + windup; al cruzar el deadband el error saltaba
-// negativo de golpe (KP=28 → 3° por escalón del LPF) → freno activo → quieto →
-// empuje máximo otra vez. Ese bang-bang era el "tambaleo sin poder ir atrás".
-// Ahora: inclinación feedforward fija escalada por la aproximación (la fricción
-// la cubre el anti-stall) y freno proporcional suave solo con sobrevelocidad
-// REAL (por encima del deadband, es decir > ~0.35 m/s medibles de verdad).
-#define OBJ_REV_PUSH_ANGLE      3.5f   // grados de inclinación hacia atrás (feedforward)
-#define OBJ_REV_BRAKE_KP        6.0f   // grados por m/s de sobrevelocidad real (freno suave)
 // Corrección de rumbo sin línea: P simple sobre diferencia de velocidad de ruedas,
 // en PWM absoluto (mismas unidades que steering_adjustment/pwm_sat). REV_STRAIGHT_MAX
 // es chico a propósito: nunca puede acercarse a pwm_sat, así que ninguna rueda se
@@ -324,15 +312,6 @@ typedef enum {
 // reversa y el robot salía torcido (reportado).
 #define REV_STRAIGHT_KC   -0.4f   // PWM por count de diferencia acumulada L/R
 #define REV_STRAIGHT_ACT_MS 250U  // ms sin ticks de encoder para considerar "quieto" (sin corrección)
-// 2026-07-10: aproximación desacelerada al setpoint de distancia de la reversa.
-// El corte es por ADC (A6 y A8 ≥ CLEAR) pero se llegaba a velocidad plena y la
-// inercia lo pasaba de largo → el hold del STOP tenía que devolverlo →
-// oscilación alrededor del setpoint. En los últimos APPROACH_BAND counts de
-// ADC antes del corte, la velocidad objetivo y el tope de inclinación se
-// reducen linealmente hasta el piso APPROACH_MIN: llega despacio y el STOP
-// arranca casi sin inercia que corregir.
-#define OBJ_REV_APPROACH_BAND   250.0f  // ADC antes de CLEAR donde empieza a desacelerar
-#define OBJ_REV_APPROACH_MIN    0.35f   // piso del factor (0.20 dejaba la reversa sin empuje al final)
 // Inner steering PI (lazo cerrado con encoder diferencial)
 #define LINE_STEER_ENC_SCALE    0.12f  // escala steering_cmd [PWM] → diff_sp [rps]
 #define LINE_STEER_MAX_RPS      2.0f   // límite del setpoint diferencial
@@ -345,28 +324,18 @@ typedef enum {
 
 #define OBJ_DETECT_THRESHOLD_VAL   3200.0f   // objeto detectado si ADC < este valor (sin objeto: ~4095, con objeto: <2000)
 #define OBJ_DETECT_DEBOUNCE_CNT    10         // ciclos consecutivos (100 ms) para confirmar objeto
-// Pausa antes de retroceder al ver un objeto: antes era un tiempo fijo sin chequear si
-// el robot realmente estaba quieto. Ahora, igual que LOST_SETTLE: sale por tiempo mínimo
-// Y velocidad/inclinación estabilizadas, con un timeout de seguridad más largo (no un
-// corte normal) por si nunca llega a asentarse del todo.
-#define OBJ_PRE_REVERSE_HOLD_MS    1000U      // tiempo mínimo de balance estático antes de retroceder (2026-07-11: 5000→2000; 2026-07-14: →1000)
-#define OBJ_PRE_REVERSE_TIMEOUT    6000U      // colchón de seguridad si nunca se asienta
-#define OBJ_PRE_REVERSE_VEL_THR    0.10f      // m/s por debajo del cual se considera "quieto"
-#define OBJ_PRE_REVERSE_TILT_THR   3.0f       // grados de error respecto al setpoint para considerar "quieto"
-// Reversa inicial post-detección: corta por distancia frontal (ADC6 y ADC8, que miran
-// adelante) en vez de counts de encoder — la distancia final al objeto queda siempre
-// igual, sin importar a qué distancia se lo detectó. El encoder queda solo como tope
-// de seguridad por si los ADC nunca despejan (sensor tapado, objeto muy ancho).
-#define OBJ_REV_CLEAR_ADC          3500.0f   // retrocede hasta que ADC6 Y ADC8 lean ≥ esto
-#define OBJ_REV_CLEAR_CNT          4         // ciclos consecutivos (40 ms) para aceptar el corte
-#define OBJ_REV_MAX_COUNTS         300       // tope de seguridad de la reversa (~25 cm; si corta siempre por acá, el que no despeja es A6 o A8 — ver display)
-// Hold de distancia durante el STOP post-reversa: si vuelve a acercarse (ADC < CLEAR)
+// Distancia objetivo al objeto: el hold del STOP (OBJ_FRENO_REVERSA) retrocede/
+// avanza hasta que ADC6 y ADC8 (los frontales) lean dentro de la banda
+// CLEAR..CLEAR+BAND — así la distancia final al objeto es siempre la misma,
+// sin importar a qué distancia se lo detectó.
+#define OBJ_REV_CLEAR_ADC          3500.0f   // piso de la banda de distancia en ADC6/ADC8
+// Hold de distancia durante el STOP: si vuelve a acercarse (ADC < CLEAR)
 // corrige hacia atrás; si se alejó de más (ADC > CLEAR+BAND) corrige hacia adelante;
 // dentro de la banda queda quieto con freno de encoders.
 #define OBJ_REV_HOLD_BAND          400.0f    // banda muerta por encima de CLEAR (3500..3900 = quieto; 300 era "muy ambiciosa", pedido 2026-07-10)
 #define OBJ_REV_HOLD_FINE_BAND     60.0f     // banda muerta chica alrededor del centro: adentro no corrige, deja frenar/asentar
-#define OBJ_REV_HOLD_ANGLE_MIN     0.9f      // corrección mínima cuando apenas se sale de la zona fina
-#define OBJ_REV_HOLD_ANGLE_MAX     2.6f      // tope de corrección del hold (2026-07-14: 1.6→2.6, "intenta corregir pero el ángulo no le da"; el anti-stall sigue de respaldo)
+#define OBJ_REV_HOLD_ANGLE_MIN     0.7f      // corrección mínima cuando apenas se sale de la zona fina
+#define OBJ_REV_HOLD_ANGLE_MAX     2.2f      // tope de corrección del hold (2026-07-14: 1.6→2.6, "intenta corregir pero el ángulo no le da"; el anti-stall sigue de respaldo)
 #define OBJ_REV_HOLD_ERR_FOR_MAX   220.0f    // error (ADC) a partir del cual ya usa ANGLE_MAX
 // 2026-07-10: damping por velocidad en el hold (el término D que le faltaba).
 // El hold era P puro sobre distancia: el robot es un doble integrador
@@ -380,12 +349,6 @@ typedef enum {
 #define OBJ_REV_HOLD_KV            4.0f      // grados por m/s en contra del movimiento
 #define OBJ_REV_HOLD_VEL_DB        0.15f     // deadband de velocidad (m/s)
 #define OBJ_REV_HOLD_DAMP_MAX      2.5f      // tope del término de damping (grados)
-// Freno ACTIVO durante la reversa: el PI de velocidad de OBJ_RETROCESO estaba
-// clampeado a ángulo ≤0 (solo empujar hacia atrás o soltar) — con sobrevelocidad
-// no podía inclinar hacia adelante para frenar de verdad, por eso "no llega a
-// frenar y siempre se pasa" aunque el target de aproximación baje. Ahora puede
-// inclinar hasta este tope hacia adelante cuando va más rápido que el objetivo.
-#define OBJ_REV_ACTIVE_BRAKE_MAX   2.5f      // grados de inclinación de frenado en reversa
 // El giro de esquive recién arranca cuando la distancia estuvo DENTRO de la banda
 // (3600..3900 en A6 y A8) durante STABLE_MS continuos — si la corrección lo está
 // moviendo, el giro espera. Timeout total como colchón por si nunca se estabiliza.
@@ -465,22 +428,13 @@ typedef enum {
 #define OBJ_WALL_FWD_ANGLE         3.3f      // ángulo máximo de avance en WALL_FWD (°; era 3.5 — acelerón; 2.5 le pareció poco al usuario)
 #define OBJ_WALL_BRAKE_ANGLE       4.0f      // freno activo máximo por sobrevelocidad en WALL_FWD (°)
 // Antes de arrancar la reversa por pared, si el robot todavía tiene velocidad residual
-// (viniendo de avanzar), frena primero (mismo patrón que OBJ_PRE_REVERSE_HOLD) para no
+// (viniendo de avanzar), frena primero para no
 // entorpecer la reversa con inercia hacia adelante.
 #define OBJ_WALL_REVERSE_SETTLE_VEL 0.15f    // m/s por debajo del cual se considera "quieto"
 #define OBJ_WALL_PIVOT_POWER       8.0f      // potencia del pivot en WALL_TURN/WALL_FWD
 #define OBJ_WALL_LINE_IGNORE_MS    5000U     // ms desde la entrada al wall-following en que se ignora la línea (2026-07-14: 3s→5s, veía la línea al arrancar pared>avanza/gira y abortaba la esquiva)
 #define OBJ_WALL_LINE_CONFIRM_CYC  5U        // lecturas consecutivas (5×10ms=50ms) antes de abandonar el bordeo por línea
 #define OBJ_WALL_CLEAR_COUNTS      100       // counts de encoder a avanzar tras perder la pared, antes de girar
-
-// Parámetros del arco evasivo (OBJ_ARC) — ajustables en runtime desde Qt
-// OBJ_ARC_DIFF_TARGET: diferencial de velocidad deseado entre ruedas [rps] (derecha - izquierda)
-// Positivo = gira a la izquierda, negativo = gira a la derecha (convención empírica). Típico: ±0.3–1.5
-float OBJ_ARC_DIFF_TARGET =  0.5f;   // rps diferencial objetivo; positivo = izquierda (convención empírica); tunable
-float OBJ_ARC_ANGLE       =  0.5f;   // ángulo de avance durante el arco (°); tunable
-#define OBJ_ARC_KP          15.0f    // ganancia proporcional del PI de diferencial
-#define OBJ_ARC_KI           3.0f    // ganancia integral del PI de diferencial
-#define OBJ_ARC_STEER_MAX   30.0f    // límite de steering_adjustment durante el arco
 
 #define DISPLAY_UPDATE_INTERVAL_IDLE_MS    100U
 #define DISPLAY_UPDATE_INTERVAL_ACTIVE_MS   60U
@@ -544,9 +498,11 @@ static float roll_deg = 0.0f;	// Ángulo de balanceo (eje Y, usado para el equil
 static float pitch_deg = 0.0f;	// Ángulo de inclinación (eje X)
 
 volatile uint16_t adcValues[8];
-// Snapshot coherente de una secuencia DMA completa. adcValues[] pertenece al
-// DMA y no debe leerse canal por canal mientras el periférico puede escribirlo.
-static volatile uint16_t adcSnapshot[8] = {0};
+// Historial de secuencias DMA completas. La mediana de 32 barridos rechaza
+// picos breves por EMI sin ocultar un nivel alto sostenido en el pin.
+static volatile uint16_t adcHistory[ADC_HISTORY_SIZE][8] = {{0}};
+static volatile uint8_t adc_history_write = 0;
+static volatile uint8_t adc_history_count = 0;
 static volatile uint32_t adc_snapshot_seq = 0;
 // Cuarentena de sensores de línea enganchados (2026-07-10): un canal clavado
 // en el tope (~4095, típico de soldadura fría — baja al presionarlo con el
@@ -561,8 +517,6 @@ static volatile uint32_t adc_snapshot_seq = 0;
 #define LINE_STUCK_MS    8000U    // tiempo continuo arriba de STUCK_ADC para cuarentena
 static uint32_t line_ch_stuck_t0[4]   = {0, 0, 0, 0};
 static uint8_t  line_ch_quarantine[4] = {0, 0, 0, 0};
-static uint16_t adcBuf[BAR_COUNT][ADC_AVERAGE_SIZE] = {{0}};		// Buffers circulares: [canal][posición en la ventana]
-static uint8_t maIndex = 0;		// Índice circular común para todos los canales
 static uint16_t adcAvg[BAR_COUNT] = {0};
 
 uint8_t i2c1_tx_busy = 0;
@@ -731,7 +685,6 @@ static uint32_t lrot_brake_start_ms        = 0;  // inicio del frenado previo al
 static uint8_t  line_quiet_cycles          = 0;  // ciclos consecutivos con velocidad cruda baja (gate de quietud de LOST_BRAKE/EDGE_WAIT)
 static uint32_t lrot_settle_start_ms       = 0;  // inicio de la pausa de estabilización post-180°
 static uint32_t edge_wait_start_ms         = 0;  // inicio del frenado previo al giro de 90° (perdida por un extremo)
-static uint32_t obj_pre_rev_start_ms = 0;
 static uint8_t  obj_rot_initialized  = 0;
 static int32_t  obj_rot_r0           = 0;
 static int32_t  obj_rot_l0           = 0;
@@ -742,10 +695,8 @@ static uint32_t obj_rot_phase1_ms    = 0;    // inicio de fase 1
 static float    obj_rot_p2_c0        = 0.0f; // counts al entrar al ajuste fino por ADC7
 static uint32_t obj_rot_p2_ms        = 0;    // inicio del ajuste fino
 static uint8_t  obj_rot_adc_good_cnt = 0;    // ciclos seguidos con ADC7 < OBJ_ROT_ADC_GOOD
-static uint8_t  obj_rev_initialized  = 0;         // flag sesión actual de OBJ_REVERSE
 static int32_t  obj_rev_r0           = 0;
 static int32_t  obj_rev_l0           = 0;
-static uint8_t  obj_rev_clear_cnt    = 0;         // debounce del corte por ADC6/ADC8 de la reversa inicial
 static float    obj_rev_steer_f      = 0.0f;      // corrección de rumbo rampeada, PWM absoluto (sin línea), durante OBJ_REVERSE
 static int32_t  obj_rev_last_counts  = 0;         // último rev_counts visto (gate de actividad del rumbo)
 static uint32_t obj_rev_last_move_ms = 0;         // tick del último cambio de counts en la reversa
@@ -766,13 +717,12 @@ static float    obj_wall_vel_integral = 0.0f;     // integral del PI de velocida
 static uint32_t obj_brake_start_ms   = 0;         // inicio de OBJ_BRAKE (file-scope para reset en caída)
 static uint32_t obj_pre_rotate_ms    = 0;         // inicio del wait post-freno antes de OBJ_ROTATE
 static uint32_t obj_rev_band_enter_ms = 0;        // entrada a la banda 3600..3900 de A6/A8 en STOP (0 = fuera de banda)
-static uint32_t obj_hold_start_ms    = 0;         // inicio de OBJ_HOLD (timer 2s antes de OBJ_ARC)
+static uint32_t obj_hold_start_ms    = 0;         // inicio de la pausa post-giro (PAUSA_GIRO, 2s)
 static int32_t  obj_pausa_r0         = 0;         // ancla de posición del hold post-giro (PAUSA_GIRO)
 static int32_t  obj_pausa_l0         = 0;
 static uint32_t obj_final_turn_pending_ms = 0;     // línea reencontrada al salir del bordeo; espera el giro final PERP
 static uint8_t  perp_from_obj_avoidance   = 0;     // el PERP_ROTATE actual es el giro final de un esquive
 static uint32_t perp_obj_brake_start_ms   = 0;     // inicio real del contrafreno suave del giro final de esquive
-static float    obj_arc_steer_int    = 0.0f;      // integral del PI de diferencial en OBJ_ARC
 static uint32_t obj_wall_approach_start_ms = 0;    // timestamp de entrada a WALL_APPROACH
 static uint32_t obj_wall_fwd_start_ms = 0;         // timestamp de entrada a WALL_FWD (init de PI/estado, no se usa para ignorar línea)
 static uint32_t obj_wall_lost_ms      = 0;         // (sin uso para ignorar línea, ver obj_wall_seq_start_ms)
@@ -1027,13 +977,15 @@ void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ADC1) {
-        // Seqlock: impar mientras se copia, par cuando el snapshot está completo.
-        // El próximo trigger llega 250us después y copiar 8 halfwords tarda una
-        // fracción mínima de esa ventana.
+        // Seqlock: impar mientras se publica, par cuando el historial es coherente.
         adc_snapshot_seq++;
         __DMB();
+        uint8_t row = adc_history_write;
         for (uint8_t ch = 0; ch < 8; ++ch)
-            adcSnapshot[ch] = adcValues[ch];
+            adcHistory[row][ch] = adcValues[ch];
+        adc_history_write = (uint8_t)((row + 1U) % ADC_HISTORY_SIZE);
+        if (adc_history_count < ADC_HISTORY_SIZE)
+            adc_history_count++;
         __DMB();
         adc_snapshot_seq++;
     }
@@ -1254,6 +1206,10 @@ void MotorControl(int16_t setMotorRight, int16_t setMotorLeft)
     uint32_t dutyR = (setMotorRight >= 0) ? (uint32_t)setMotorRight : (uint32_t)(-setMotorRight);
     uint32_t dutyL = (setMotorLeft  >= 0) ? (uint32_t)setMotorLeft  : (uint32_t)(-setMotorLeft);
 
+    // De % de potencia a registro de comparación del timer: el contador PWM
+    // cuenta de 0 a ARR (959) y el pin está en alto mientras cuenta < CCR, así
+    // que duty% = CCR/(ARR+1). Despejando: CCR = (ARR+1)·duty/100.
+    // Ej.: 50% → CCR=480 → pin en alto 480 de cada 960 ticks del timer.
     uint32_t ccrR = ((arr3 + 1) * dutyR) / 100U;
     uint32_t ccrL = ((arr4 + 1) * dutyL) / 100U;
 
@@ -1515,34 +1471,50 @@ void calculate_tilt(int16_t ax, int16_t ay, int16_t az,
 }
 
 void UpdateADC_MovingAverage(void) {
-    // 2026-07-05, fix del "ADC1 pegado en negro para siempre": la versión anterior
-    // leía adcValues[ch] DOS veces (una para el acumulador adcSum, otra para el
-    // buffer de ventana). El DMA escribe ese buffer a 4 kHz: si actualizaba entre
-    // ambas lecturas, lo sumado != lo guardado, y al restar esa posición después
-    // quedaba un residuo PERMANENTE en adcSum — el promedio quedaba inflado para
-    // siempre. Ahora el promedio se recalcula desde la ventana completa y consume
-    // únicamente snapshots publicados al completar los 8 ranks.
-    uint16_t sample[8];
+    // Copia coherente de los últimos 32 barridos completos (~8ms). A diferencia
+    // del filtro anterior, que elegía una sola de las ~40 secuencias disponibles
+    // cada 10ms, la mediana usa el flujo real de 4kHz y rechaza pulsos aislados a
+    // 4095 causados por conmutación/EMI. Un nivel alto sostenido no se oculta.
+    uint16_t history_copy[ADC_HISTORY_SIZE][8];
+    uint16_t channel_samples[ADC_HISTORY_SIZE];
     uint32_t seq_before, seq_after;
+    uint8_t sample_count;
     for (;;) {
         seq_before = adc_snapshot_seq;
         if (seq_before & 1U) continue;
         __DMB();
-        for (uint8_t ch = 0; ch < 8; ++ch)
-            sample[ch] = adcSnapshot[ch];
+        sample_count = adc_history_count;
+        for (uint8_t i = 0; i < sample_count; ++i)
+            for (uint8_t ch = 0; ch < 8; ++ch)
+                history_copy[i][ch] = adcHistory[i][ch];
         __DMB();
         seq_after = adc_snapshot_seq;
         if (seq_before == seq_after && !(seq_after & 1U)) break;
     }
 
+    if (sample_count == 0) return;
+
     for (uint8_t ch = 0; ch < BAR_COUNT; ++ch) {
-        adcBuf[ch][maIndex] = sample[ch];
-        uint32_t sum = 0;
-        for (uint8_t i = 0; i < ADC_AVERAGE_SIZE; ++i)
-            sum += adcBuf[ch][i];
-        adcAvg[ch] = (uint16_t)(sum / ADC_AVERAGE_SIZE);
+        for (uint8_t i = 0; i < sample_count; ++i)
+            channel_samples[i] = history_copy[i][ch];
+
+        // Insertion sort: n<=32, costo pequeño a 100Hz y sin memoria dinámica.
+        for (uint8_t i = 1; i < sample_count; ++i) {
+            uint16_t key = channel_samples[i];
+            int j = (int)i - 1;
+            while (j >= 0 && channel_samples[j] > key) {
+                channel_samples[j + 1] = channel_samples[j];
+                j--;
+            }
+            channel_samples[j + 1] = key;
+        }
+
+        uint8_t mid = sample_count / 2U;
+        adcAvg[ch] = (sample_count & 1U)
+                   ? channel_samples[mid]
+                   : (uint16_t)(((uint32_t)channel_samples[mid - 1U] +
+                                 (uint32_t)channel_samples[mid]) / 2U);
     }
-    maIndex = (maIndex + 1) % ADC_AVERAGE_SIZE;	    // Avanza en el buffer circular
 }
 
 static void esp01_chpd(uint8_t val) {
@@ -1676,17 +1648,17 @@ static void SteeringPID_Reset(void)
 // Convención de signo: positivo → rueda derecha más lenta → gira a la derecha.
 static float ComputeSteeringPID(float speed_r, float speed_l, float sp)
 {
-    float error = sp - (speed_r - speed_l);
+    float steer_err = sp - (speed_r - speed_l);
 
-    float p = STEER_KP * error;
+    float p = STEER_KP * steer_err;
 
-    steer_pid_integral += error * DT_CTRL_FIXED;
+    steer_pid_integral += steer_err * DT_CTRL_FIXED;
     if (steer_pid_integral >  STEER_I_MAX) steer_pid_integral =  STEER_I_MAX;
     if (steer_pid_integral < -STEER_I_MAX) steer_pid_integral = -STEER_I_MAX;
     float i = STEER_KI * steer_pid_integral;
 
-    float d = STEER_KD * (error - steer_pid_prev_error) / DT_CTRL_FIXED;
-    steer_pid_prev_error = error;
+    float d = STEER_KD * (steer_err - steer_pid_prev_error) / DT_CTRL_FIXED;
+    steer_pid_prev_error = steer_err;
 
     float out = p + i + d;
     if (out >  STEER_OUT_MAX) out =  STEER_OUT_MAX;
@@ -1901,8 +1873,6 @@ static const char *LineStateStr(void)
         case LINE_STATE_EDGE_FWD:           return "EVUELV";
         case LINE_STATE_GIVEN_UP:           return "PARADO";
         case LINE_STATE_PERP_ROTATE:        return "PGIRO";
-        case LINE_STATE_OBJ_ESPERA_REVERSA: return "ESPER";
-        case LINE_STATE_OBJ_RETROCESO:      return "RETRO";
         case LINE_STATE_OBJ_FRENO_REVERSA:  return "STOP";
         case LINE_STATE_OBJ_GIRO_ESQUIVE:   return "ESQUIV";
         case LINE_STATE_OBJ_PAUSA_GIRO:     return "PAUSA";
@@ -2464,3247 +2434,3350 @@ static void I2C1_Recover(void)
     USB_DebugStr("I2C RECOVER\r\n");
 }
 
-static void ControlStep10ms(void)
+// ═══════════════════════════════════════════════════════════════════════════
+//  LOOP DE CONTROL (100 Hz) — etapas de ControlStep10ms
+//
+//  ControlStep10ms (al final de este bloque) es solo el orquestador: llama a
+//  las etapas en orden. Cada etapa es una función Ctrl_* de acá abajo, en el
+//  mismo orden en que se ejecutan. Las variables de este bloque son el
+//  "contexto del ciclo": se recalculan completas en cada ciclo de 10ms y
+//  comunican los resultados de una etapa a las siguientes (eran locales de la
+//  función original; mantienen exactamente los mismos nombres y semántica).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// dt del control: fijo por diseño (desacopla el PID del jitter del sensor).
+static const float dt_ctrl = DT_CTRL_FIXED;
+// Vestigio: siempre 0 (ya no se detectan ciclos tardíos). Los `if (!late_cycle)`
+// que quedan en el código son por lo tanto incondicionales; el compilador los elimina.
+static const uint8_t late_cycle = 0;
+
+// ── Contexto del ciclo (sensado) ──
+static int32_t delta_right = 0, delta_left = 0;  // counts de encoder de ESTE ciclo
+static int32_t enc_r = 0, enc_l = 0;             // conteos absolutos (foto atómica)
+static float   gyro_rate_dps = 0.0f;             // gyro X en °/s (telemetría)
+static float   accel_ang_deg = 0.0f;             // roll del accel (filtro + caída)
+static float   steer_correction = 0.0f;          // steering PID de lazo cerrado (opcional)
+
+// ── Contexto del ciclo (seguidor de línea) ──
+static float   line_error = 0.0f;                // centroide [-1..1], izq = +
+static uint8_t line_detected = 0;
+static float   w_sum = 0.0f;                     // suma de pesos del centroide
+static float   line_angle_cmd = 0.0f;            // ángulo pedido por el PI de velocidad
+static float   line_desired_forward_vel = 0.0f;
+static float   line_forward_vel = 0.0f;
+static uint8_t manual_line_override = 0;         // comandos manuales durante LINE sin ver línea
+static uint8_t line_pivot_active = 0;            // 1 = el sub-estado ya escribió los motores
+
+// ── Contexto del ciclo (PID de balance → motores/telemetría) ──
+static float   error = 0.0f;                     // setpoint - roll (°)
+static float   p_term = 0.0f, i_term = 0.0f, d_term = 0.0f;
+static float   output = 0.0f;                    // suma PID sin saturar
+static float   pwm_cmd = 0.0f;                   // comando previo a saturación
+static float   pwm_sat = 0.0f;                   // PWM común final (±50)
+static uint8_t sat_flag = 0;
+static float   log_p_line = 0.0f, log_i_line = 0.0f, log_d_line = 0.0f;
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 1 — Lectura del IMU + métrica de manipulación.
+// Devuelve 0 si el MPU todavía no tiene dato nuevo (el ciclo no corre).
+// ─────────────────────────────────────────────────────────────────────
+static uint8_t Ctrl_LeerIMU(void)
 {
-		if (!MPU6050_IsDataReady()) return;
-		MPU6050_ClearDataReady();
+    if (!MPU6050_IsDataReady()) return 0;
+    MPU6050_ClearDataReady();
 
-		MPU6050_GetAccel(&ax, &ay, &az);
-		MPU6050_GetGyro(&gx, &gy, &gz);
+    MPU6050_GetAccel(&ax, &ay, &az);
+    MPU6050_GetGyro(&gx, &gy, &gz);
 
-		// Métrica de "se está moviendo/manipulando con la mano": suma de |delta|
-		// del acelerómetro crudo entre ciclos, suavizada. Quieto sobre una
-		// superficie (aunque no vea la línea) da un valor bajo y estable; en la
-		// mano, aunque se intente sostener firme, siempre hay variación sostenida.
-		// Usado para distinguir "lo levantaron" de "está parado sobre blanco".
-		static int16_t accel_prev_x = 0, accel_prev_y = 0, accel_prev_z = 0;
-		static uint8_t accel_prev_init = 0;
-		if (!accel_prev_init) {
-			accel_prev_x = ax; accel_prev_y = ay; accel_prev_z = az;
-			accel_prev_init = 1;
-		}
-		float accel_delta = fabsf((float)(ax - accel_prev_x)) +
-		                     fabsf((float)(ay - accel_prev_y)) +
-		                     fabsf((float)(az - accel_prev_z));
-		accel_motion_f += 0.30f * (accel_delta - accel_motion_f);
-		accel_prev_x = ax; accel_prev_y = ay; accel_prev_z = az;
+    // Métrica de "se está moviendo/manipulando con la mano": suma de |delta|
+    // del acelerómetro crudo entre ciclos, suavizada. Quieto sobre una
+    // superficie (aunque no vea la línea) da un valor bajo y estable; en la
+    // mano, aunque se intente sostener firme, siempre hay variación sostenida.
+    // Usado para distinguir "lo levantaron" de "está parado sobre blanco".
+    static int16_t accel_prev_x = 0, accel_prev_y = 0, accel_prev_z = 0;
+    static uint8_t accel_prev_init = 0;
+    if (!accel_prev_init) {
+        accel_prev_x = ax; accel_prev_y = ay; accel_prev_z = az;
+        accel_prev_init = 1;
+    }
+    float accel_delta = fabsf((float)(ax - accel_prev_x)) +
+                         fabsf((float)(ay - accel_prev_y)) +
+                         fabsf((float)(az - accel_prev_z));
+    accel_motion_f += 0.30f * (accel_delta - accel_motion_f);
+    accel_prev_x = ax; accel_prev_y = ay; accel_prev_z = az;
+    return 1;
+}
 
-		// Encoder speed — leer conteos acumulados desde IRQ y calcular velocidad
-		static int32_t enc_right_prev = 0;
-		static int32_t enc_left_prev  = 0;
-		__disable_irq();
-		int32_t enc_r = encoder_right;
-		int32_t enc_l = encoder_left;
-		__enable_irq();
-		int32_t delta_right = enc_r - enc_right_prev;
-		int32_t delta_left  = enc_l - enc_left_prev;
-		enc_right_prev = enc_r;
-		enc_left_prev  = enc_l;
-		#define ENC_CPR        28  // 4x quadrature: ambos canales A y B, RISING+FALLING
-		#define ENC_VEL_SCALE  0.17750f  // 2π × r_rueda (radio 2.825 cm) → m/s
-		float speed_right_rps = (float)delta_right / (ENC_CPR * DT_CTRL_FIXED);
-		float speed_left_rps  = (float)delta_left  / (ENC_CPR * DT_CTRL_FIXED);
-		float vel_enc = -((speed_right_rps + speed_left_rps) * 0.5f) * ENC_VEL_SCALE;
-		vel_enc = clampf_local(vel_enc, -20.0f, 20.0f);
-		velocity_est    = vel_enc;
-		velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
-		velocity_est_slow_f += VEL_SLOW_BETA * (velocity_est - velocity_est_slow_f);
-		speed_right_rps_s = speed_right_rps;
-		speed_left_rps_s  = speed_left_rps;
-		if (delta_right != 0) wheel_r_last_tick_ms = HAL_GetTick();
-		if (delta_left  != 0) wheel_l_last_tick_ms = HAL_GetTick();
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 2 — Velocidad por encoders: counts acumulados por la IRQ de TIM2
+// → delta del ciclo → m/s (velocity_est y sus versiones filtradas).
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_VelocidadEncoders(void)
+{
+    static int32_t enc_right_prev = 0;
+    static int32_t enc_left_prev  = 0;
+    __disable_irq();
+    enc_r = encoder_right;
+    enc_l = encoder_left;
+    __enable_irq();
+    delta_right = enc_r - enc_right_prev;
+    delta_left  = enc_l - enc_left_prev;
+    enc_right_prev = enc_r;
+    enc_left_prev  = enc_l;
+    #define ENC_CPR        28  // 4x quadrature: ambos canales A y B, RISING+FALLING
+    #define ENC_VEL_SCALE  0.17750f  // 2π × r_rueda (radio 2.825 cm) → m/s
+    // De counts a velocidad, por análisis dimensional:
+    //   delta [counts/ciclo] ÷ ENC_CPR [counts/vuelta] = vueltas por ciclo
+    //   ÷ DT_CTRL_FIXED [s/ciclo]                      = vueltas por segundo (rps)
+    //   × ENC_VEL_SCALE [m/vuelta]  (perímetro = 2πr)  = metros por segundo
+    // Promedio de ambas ruedas = velocidad del centro del robot. El signo
+    // negativo fija la convención global: AVANCE = velocity_est NEGATIVA
+    // (los encoders cuentan al revés del sentido "adelante" del chasis).
+    float speed_right_rps = (float)delta_right / (ENC_CPR * DT_CTRL_FIXED);
+    float speed_left_rps  = (float)delta_left  / (ENC_CPR * DT_CTRL_FIXED);
+    float vel_enc = -((speed_right_rps + speed_left_rps) * 0.5f) * ENC_VEL_SCALE;
+    vel_enc = clampf_local(vel_enc, -20.0f, 20.0f);
+    velocity_est    = vel_enc;
+    // Filtro EMA (pasa-bajos de 1er orden): y += β·(x − y). Cada ciclo la
+    // salida se acerca una fracción β al valor nuevo → constante de tiempo
+    // τ ≈ dt/β. Con β=0.35 → τ≈29ms (rápido, para control); con β=0.02 →
+    // τ≈0.5s (lento, para decisiones que no deben reaccionar a un tick suelto).
+    velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
+    velocity_est_slow_f += VEL_SLOW_BETA * (velocity_est - velocity_est_slow_f);
+    speed_right_rps_s = speed_right_rps;
+    speed_left_rps_s  = speed_left_rps;
+    if (delta_right != 0) wheel_r_last_tick_ms = HAL_GetTick();
+    if (delta_left  != 0) wheel_l_last_tick_ms = HAL_GetTick();
+}
 
-		// ── Latch de reversa de pared por counts (2026-07-10) ──
-		// Se dispara con el lateral activo (ADC7/ADC5) < THOLD y queda activo hasta retroceder
-		// OBJ_WALL_REV_COUNTS (o timeout). Lo consumen las ramas de setpoint
-		// y de motores de los 3 estados de pared — reemplaza al chequeo
-		// instantáneo de ADC que cortaba la reversa apenas se despegaba.
-		if (line_state == LINE_STATE_OBJ_BORDEAR_PARED ||
-		    line_state == LINE_STATE_OBJ_PARED_LIBRE  ||
-		    line_state == LINE_STATE_OBJ_GIRO_PARED) {
-			if (!obj_wall_rev_latch &&
-			    (float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_REVERSE_THOLD) {
-				obj_wall_rev_latch    = 1;
-				obj_wall_rev_goal     = OBJ_WALL_REV_COUNTS;
-				obj_wall_rev_latch_r0 = enc_r;
-				obj_wall_rev_latch_l0 = enc_l;
-				obj_wall_rev_latch_ms = HAL_GetTick();
-			}
-
-			// Detección de atorado (2026-07-10): sin reversa activa, si en
-			// OBJ_WALL_STUCK_WIN_MS el movimiento acumulado de encoders no llega
-			// a STUCK_COUNTS, está trabado contra la pared (empuja sin avanzar o
-			// pivot atorado) → reversa LARGA de destrabe (ESCAPE_COUNTS).
-			if (!obj_wall_rev_latch) {
-				if (obj_wall_stuck_ms == 0) {
-					obj_wall_stuck_ms = HAL_GetTick();
-					obj_wall_stuck_r0 = enc_r;
-					obj_wall_stuck_l0 = enc_l;
-				} else if (HAL_GetTick() - obj_wall_stuck_ms >= OBJ_WALL_STUCK_WIN_MS) {
-					int32_t stuck_moved = (abs(enc_r - obj_wall_stuck_r0) +
-					                       abs(enc_l - obj_wall_stuck_l0)) / 2;
-					if (stuck_moved < OBJ_WALL_STUCK_COUNTS) {
-						obj_wall_rev_latch    = 1;
-						obj_wall_rev_goal     = OBJ_WALL_REV_ESCAPE_COUNTS;
-						obj_wall_rev_latch_r0 = enc_r;
-						obj_wall_rev_latch_l0 = enc_l;
-						obj_wall_rev_latch_ms = HAL_GetTick();
-					}
-					obj_wall_stuck_ms = 0;   // nueva ventana
-				}
-			} else {
-				obj_wall_stuck_ms = 0;       // en reversa: la ventana no corre
-			}
-
-			if (obj_wall_rev_latch) {
-				int32_t wall_rev_done = (abs(enc_r - obj_wall_rev_latch_r0) +
-				                         abs(enc_l - obj_wall_rev_latch_l0)) / 2;
-				// Timeout doble para la reversa de escape (recorrido más largo).
-				uint32_t rev_tout = (obj_wall_rev_goal > OBJ_WALL_REV_COUNTS)
-				                  ? (OBJ_WALL_REV_TIMEOUT_MS * 2U)
-				                  : OBJ_WALL_REV_TIMEOUT_MS;
-				if (wall_rev_done >= obj_wall_rev_goal ||
-				    (HAL_GetTick() - obj_wall_rev_latch_ms) > rev_tout)
-					obj_wall_rev_latch = 0;
-			}
-
-			// ── Timeout de pared perdida (2026-07-11) ──
-			// Si en toda la secuencia de pared no se vuelve a ver el objeto
-			// (lateral activo < OBJ_WALL_THRESHOLD) durante OBJ_WALL_MISSING_TIMEOUT_MS
-			// continuos, se abandona la búsqueda: reposo (IDLE) en vez de
-			// seguir avanzando/pivoteando a ciegas y arriesgar un choque.
-			// Durante la reversa de pared el timer no corre: retroceder aleja
-			// la pared de la vista del lateral a propósito (la de escape dura
-			// hasta 6s y dispararía el timeout en plena maniobra válida).
-			if (obj_wall_rev_latch ||
-			    (float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD) {
-				obj_wall_missing_since_ms = 0;
-			} else {
-				if (obj_wall_missing_since_ms == 0) {
-					obj_wall_missing_since_ms = HAL_GetTick();
-				} else if (HAL_GetTick() - obj_wall_missing_since_ms >= OBJ_WALL_MISSING_TIMEOUT_MS) {
-					robot_state               = ROBOT_STATE_IDLE;
-					obj_wall_missing_since_ms = 0;
-					obj_wall_rev_latch        = 0;
-					obj_wall_stuck_ms         = 0;
-				}
-			}
-		} else {
-			obj_wall_rev_latch        = 0;
-			obj_wall_stuck_ms         = 0;
-			obj_wall_missing_since_ms = 0;
-		}
-
-		// ── ODOMETRÍA DE POSE ────────────────────────────────────────────
-		// Distancia por encoders + rumbo por gyro Z, integrados cada ciclo.
-		// Con la convención de signos actual, deltas positivos = avance
-		// (velocity_est_f negativo = adelante, ver vel_enc arriba).
-		// Durante caídas no se integra: las ruedas pueden girar sin traccionar.
-		if (!f_fallen) {
-			// Bias residual de gz aprendido con el robot quieto (ver defines ODOM_GZ_*):
-			// encoders sin ticks + gz chico durante 500ms → EMA lenta del residuo.
-			if (delta_right == 0 && delta_left == 0 &&
-			    fabsf((float)gz - odom_gz_bias_f) < ODOM_GZ_STILL_LSB) {
-				if (odom_still_cnt < 65535) odom_still_cnt++;
-				if (odom_still_cnt >= ODOM_STILL_MIN_CYCLES) {
-					odom_gz_bias_f += ODOM_GZ_BIAS_ALPHA * ((float)gz - odom_gz_bias_f);
-					odom_gz_bias_f = clampf_local(odom_gz_bias_f,
-					                              -ODOM_GZ_BIAS_MAX_LSB, ODOM_GZ_BIAS_MAX_LSB);
-				}
-			} else {
-				odom_still_cnt = 0;
-			}
-			float gz_odom_dps = ((float)gz - odom_gz_bias_f) / 100.0f;
-
-			float odom_d = ((float)(delta_right + delta_left) * 0.5f / ENC_CPR) * ENC_VEL_SCALE;
-
-			// Gating de pivot: rotando en el lugar, el avance neto de ±1 count por
-			// ciclo es ruido de cuantización/timing, no traslación real — integrarlo
-			// con el rumbo cambiando hace "caminar" la posición (ver defines arriba).
-			if (fabsf(gz_odom_dps) > ODOM_PIVOT_GZ_DPS &&
-			    abs(delta_right + delta_left) <= ODOM_PIVOT_MAX_COUNTS) {
-				odom_d = 0.0f;
-			}
-
-			// Integración de 2º orden: la traslación usa el rumbo de MITAD de paso
-			// (θ + Δθ/2), no el rumbo final — menos sesgo sistemático en arcos.
-			float odom_dth = ODOM_THETA_SIGN * gz_odom_dps * DT_CTRL_FIXED;
-			float odom_th_mid_rad = (odom_theta_deg + 0.5f * odom_dth) * (M_PI / 180.0f);
-			odom_theta_deg += odom_dth;
-			if      (odom_theta_deg >  180.0f) odom_theta_deg -= 360.0f;
-			else if (odom_theta_deg < -180.0f) odom_theta_deg += 360.0f;
-			odom_x_m += odom_d * cosf(odom_th_mid_rad);
-			odom_y_m += odom_d * sinf(odom_th_mid_rad);
-		}
-
-		// Steering PID de lazo cerrado: disponible mientras speed_r/l están en scope.
-		// steer_correction se usa en la sección de motores BALANCE más adelante.
-		static float steer_correction = 0.0f;
-		if (steer_pid_enabled) {
-		    steer_correction = ComputeSteeringPID(speed_right_rps, speed_left_rps, 0.0f);
-		} else {
-		    steer_correction = 0.0f;
-		    SteeringPID_Reset();
-		}
-
-		// -------------------------------------------------------
-		// TIMING — usar timestamp real del IRQ del MPU
-		// -------------------------------------------------------
-		static uint32_t last_mpu_us = 0;
-
-		uint32_t sample_us = mpu_irq_timestamp_us;
-		const float dt_ctrl = DT_CTRL_FIXED;
-
-		if (last_mpu_us == 0) {
-		    last_mpu_us = sample_us;
-		    dt_real = DT_CTRL_FIXED;
-		    return;   // primer ciclo: todavía no hay dt válido
-		}
-
-		uint32_t diff_us = sample_us - last_mpu_us;
-		last_mpu_us = sample_us;
-
-		dt_real = (float)diff_us * 1e-6f;
-		// micros() envuelve cada ~44.7 s (CYCCNT/96 no es potencia de 2): en el ciclo
-		// del wrap diff_us da basura enorme. Solo afecta telemetría (dt_ctrl es fijo).
-		if (dt_real > 1.0f) dt_real = DT_CTRL_FIXED;
-
-        // El control usa un dt fijo para desacoplar el PID del jitter del sensor y de las latencias.
-        const uint8_t late_cycle = 0;  // ya no tiene sentido detectar ciclos tardíos
-
-        // -------------------------------------------------------
-        // FILTRO IMU
-        // -------------------------------------------------------
-        const float ANG_SIGN = +1.0f;
-
-        float gyro_rate_dps = ANG_SIGN * ((float)gx / 100.0f);
-        if (gyro_rate_dps >  250.0f) gyro_rate_dps =  250.0f;
-        if (gyro_rate_dps < -250.0f) gyro_rate_dps = -250.0f;
-
-        gyro_f = gyro_rate_dps;
-        if (gyro_f >  180.0f) gyro_f =  180.0f;
-        if (gyro_f < -180.0f) gyro_f = -180.0f;
-
-        float accel_ang_deg = ANG_SIGN * (atan2f((float)ay, (float)az) * (180.0f / M_PI));
-
-        // Inicialización del filtro en la primera muestra — evita que arranque en 0°
-        static uint8_t filter_init = 0;
-        if (!filter_init) {
-            filtered_roll_deg = accel_ang_deg;
-            filter_init = 1;
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 3 — Latches del wall-following: reversa por counts, detección de
+// atorado y timeout de pared perdida. Solo hace algo en los 3 estados de
+// pared; fuera de ellos deja todo desarmado.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_LatchesPared(void)
+{
+    // ── Latch de reversa de pared por counts (2026-07-10) ──
+    // Se dispara con el lateral activo (ADC7/ADC5) < THOLD y queda activo hasta retroceder
+    // OBJ_WALL_REV_COUNTS (o timeout). Lo consumen las ramas de setpoint
+    // y de motores de los 3 estados de pared — reemplaza al chequeo
+    // instantáneo de ADC que cortaba la reversa apenas se despegaba.
+    if (line_state == LINE_STATE_OBJ_BORDEAR_PARED ||
+        line_state == LINE_STATE_OBJ_PARED_LIBRE  ||
+        line_state == LINE_STATE_OBJ_GIRO_PARED) {
+        if (!obj_wall_rev_latch &&
+            (float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_REVERSE_THOLD) {
+            obj_wall_rev_latch    = 1;
+            obj_wall_rev_goal     = OBJ_WALL_REV_COUNTS;
+            obj_wall_rev_latch_r0 = enc_r;
+            obj_wall_rev_latch_l0 = enc_l;
+            obj_wall_rev_latch_ms = HAL_GetTick();
         }
 
-        // Filtro complementario (fusión gyro + accel)
-        filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_ctrl)
-                          + (1.0f - ALPHA) * accel_ang_deg;
+        // Detección de atorado (2026-07-10): sin reversa activa, si en
+        // OBJ_WALL_STUCK_WIN_MS el movimiento acumulado de encoders no llega
+        // a STUCK_COUNTS, está trabado contra la pared (empuja sin avanzar o
+        // pivot atorado) → reversa LARGA de destrabe (ESCAPE_COUNTS).
+        if (!obj_wall_rev_latch) {
+            if (obj_wall_stuck_ms == 0) {
+                obj_wall_stuck_ms = HAL_GetTick();
+                obj_wall_stuck_r0 = enc_r;
+                obj_wall_stuck_l0 = enc_l;
+            } else if (HAL_GetTick() - obj_wall_stuck_ms >= OBJ_WALL_STUCK_WIN_MS) {
+                int32_t stuck_moved = (abs(enc_r - obj_wall_stuck_r0) +
+                                       abs(enc_l - obj_wall_stuck_l0)) / 2;
+                if (stuck_moved < OBJ_WALL_STUCK_COUNTS) {
+                    obj_wall_rev_latch    = 1;
+                    obj_wall_rev_goal     = OBJ_WALL_REV_ESCAPE_COUNTS;
+                    obj_wall_rev_latch_r0 = enc_r;
+                    obj_wall_rev_latch_l0 = enc_l;
+                    obj_wall_rev_latch_ms = HAL_GetTick();
+                }
+                obj_wall_stuck_ms = 0;   // nueva ventana
+            }
+        } else {
+            obj_wall_stuck_ms = 0;       // en reversa: la ventana no corre
+        }
 
-        if (filtered_roll_deg >  180.0f) filtered_roll_deg =  180.0f;
-        if (filtered_roll_deg < -180.0f) filtered_roll_deg = -180.0f;
+        if (obj_wall_rev_latch) {
+            int32_t wall_rev_done = (abs(enc_r - obj_wall_rev_latch_r0) +
+                                     abs(enc_l - obj_wall_rev_latch_l0)) / 2;
+            // Timeout doble para la reversa de escape (recorrido más largo).
+            uint32_t rev_tout = (obj_wall_rev_goal > OBJ_WALL_REV_COUNTS)
+                              ? (OBJ_WALL_REV_TIMEOUT_MS * 2U)
+                              : OBJ_WALL_REV_TIMEOUT_MS;
+            if (wall_rev_done >= obj_wall_rev_goal ||
+                (HAL_GetTick() - obj_wall_rev_latch_ms) > rev_tout)
+                obj_wall_rev_latch = 0;
+        }
 
-        // Inclinación LATERAL (banking alrededor del eje de avance — el tercer
-        // eje, 2026-07-10): accel-only con EMA suave. No participa de ningún
-        // control, solo viaja en el push de odometría para que la Vista 3D de
-        // Qt reaccione también a este eje. Misma fórmula que calculate_tilt().
+        // ── Timeout de pared perdida (2026-07-11) ──
+        // Si en toda la secuencia de pared no se vuelve a ver el objeto
+        // (lateral activo < OBJ_WALL_THRESHOLD) durante OBJ_WALL_MISSING_TIMEOUT_MS
+        // continuos, se abandona la búsqueda: reposo (IDLE) en vez de
+        // seguir avanzando/pivoteando a ciegas y arriesgar un choque.
+        // Durante la reversa de pared el timer no corre: retroceder aleja
+        // la pared de la vista del lateral a propósito (la de escape dura
+        // hasta 6s y dispararía el timeout en plena maniobra válida).
+        if (obj_wall_rev_latch ||
+            (float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD) {
+            obj_wall_missing_since_ms = 0;
+        } else {
+            if (obj_wall_missing_since_ms == 0) {
+                obj_wall_missing_since_ms = HAL_GetTick();
+            } else if (HAL_GetTick() - obj_wall_missing_since_ms >= OBJ_WALL_MISSING_TIMEOUT_MS) {
+                robot_state               = ROBOT_STATE_IDLE;
+                obj_wall_missing_since_ms = 0;
+                obj_wall_rev_latch        = 0;
+                obj_wall_stuck_ms         = 0;
+            }
+        }
+    } else {
+        obj_wall_rev_latch        = 0;
+        obj_wall_stuck_ms         = 0;
+        obj_wall_missing_since_ms = 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 4 — Odometría de pose (x, y, θ) por dead-reckoning:
+// distancia por encoders + rumbo por gyro Z. No integra durante caídas.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_Odometria(void)
+{
+    // ── ODOMETRÍA DE POSE ────────────────────────────────────────────
+    // Distancia por encoders + rumbo por gyro Z, integrados cada ciclo.
+    // Con la convención de signos actual, deltas positivos = avance
+    // (velocity_est_f negativo = adelante, ver vel_enc arriba).
+    // Durante caídas no se integra: las ruedas pueden girar sin traccionar.
+    if (!f_fallen) {
+        // Bias residual de gz aprendido con el robot quieto (ver defines ODOM_GZ_*):
+        // encoders sin ticks + gz chico durante 500ms → EMA lenta del residuo.
+        if (delta_right == 0 && delta_left == 0 &&
+            fabsf((float)gz - odom_gz_bias_f) < ODOM_GZ_STILL_LSB) {
+            if (odom_still_cnt < 65535) odom_still_cnt++;
+            if (odom_still_cnt >= ODOM_STILL_MIN_CYCLES) {
+                odom_gz_bias_f += ODOM_GZ_BIAS_ALPHA * ((float)gz - odom_gz_bias_f);
+                odom_gz_bias_f = clampf_local(odom_gz_bias_f,
+                                              -ODOM_GZ_BIAS_MAX_LSB, ODOM_GZ_BIAS_MAX_LSB);
+            }
+        } else {
+            odom_still_cnt = 0;
+        }
+        float gz_odom_dps = ((float)gz - odom_gz_bias_f) / 100.0f;
+
+        // Distancia recorrida este ciclo [m]: promedio de counts de ambas
+        // ruedas (= avance del centro) ÷ counts/vuelta × metros/vuelta (2πr).
+        // Misma conversión que la velocidad, pero sin dividir por dt.
+        float odom_d = ((float)(delta_right + delta_left) * 0.5f / ENC_CPR) * ENC_VEL_SCALE;
+
+        // Gating de pivot: rotando en el lugar, el avance neto de ±1 count por
+        // ciclo es ruido de cuantización/timing, no traslación real — integrarlo
+        // con el rumbo cambiando hace "caminar" la posición (ver defines arriba).
+        if (fabsf(gz_odom_dps) > ODOM_PIVOT_GZ_DPS &&
+            abs(delta_right + delta_left) <= ODOM_PIVOT_MAX_COUNTS) {
+            odom_d = 0.0f;
+        }
+
+        // Integración de 2º orden: la traslación usa el rumbo de MITAD de paso
+        // (θ + Δθ/2), no el rumbo final — menos sesgo sistemático en arcos.
+        // La pose se acumula por dead-reckoning clásico:
+        //   Δθ = ω·dt   (gyro Z [°/s] × 10ms)
+        //   x += d·cos(θ_medio),  y += d·sin(θ_medio)
+        // es decir, el paso 'd' se descompone en sus componentes según hacia
+        // dónde apuntaba el robot. Usar el rumbo del MEDIO del paso equivale
+        // a la regla del trapecio: en una curva, ni el rumbo viejo ni el
+        // nuevo son representativos del arco — el promedio sí.
+        float odom_dth = ODOM_THETA_SIGN * gz_odom_dps * DT_CTRL_FIXED;
+        float odom_th_mid_rad = (odom_theta_deg + 0.5f * odom_dth) * (M_PI / 180.0f);
+        odom_theta_deg += odom_dth;
+        if      (odom_theta_deg >  180.0f) odom_theta_deg -= 360.0f;
+        else if (odom_theta_deg < -180.0f) odom_theta_deg += 360.0f;
+        odom_x_m += odom_d * cosf(odom_th_mid_rad);
+        odom_y_m += odom_d * sinf(odom_th_mid_rad);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 5 — Steering PID de lazo cerrado por encoders (opcional, según
+// steer_pid_enabled). steer_correction se usa en los motores de BALANCE.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_SteeringLazoCerrado(void)
+{
+    if (steer_pid_enabled) {
+        steer_correction = ComputeSteeringPID(speed_right_rps_s, speed_left_rps_s, 0.0f);
+    } else {
+        steer_correction = 0.0f;
+        SteeringPID_Reset();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 6 — Timing: dt real entre muestras del MPU (solo telemetría; el
+// control usa dt fijo). Devuelve 0 en el primer ciclo (sin dt válido).
+// ─────────────────────────────────────────────────────────────────────
+static uint8_t Ctrl_TimingDt(void)
+{
+    static uint32_t last_mpu_us = 0;
+
+    uint32_t sample_us = mpu_irq_timestamp_us;
+
+    if (last_mpu_us == 0) {
+        last_mpu_us = sample_us;
+        dt_real = DT_CTRL_FIXED;
+        return 0;   // primer ciclo: todavía no hay dt válido
+    }
+
+    uint32_t diff_us = sample_us - last_mpu_us;
+    last_mpu_us = sample_us;
+
+    dt_real = (float)diff_us * 1e-6f;
+    // micros() envuelve cada ~44.7 s (CYCCNT/96 no es potencia de 2): en el ciclo
+    // del wrap diff_us da basura enorme. Solo afecta telemetría (dt_ctrl es fijo).
+    if (dt_real > 1.0f) dt_real = DT_CTRL_FIXED;
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 7 — Filtro de actitud: gyro crudo → °/s, ángulo por accel,
+// filtro complementario (filtered_roll_deg) y tilt lateral para Qt.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_FiltroIMU(void)
+{
+    const float ANG_SIGN = +1.0f;
+
+    // Gyro crudo (int16 LSB) → velocidad angular en °/s: se divide por la
+    // sensibilidad [LSB por °/s]. El valor teórico del datasheet para el
+    // fondo de escala configurado sería 131 (±250 dps), pero 100 es el que
+    // quedó calibrado empíricamente contra giros reales medidos en el robot
+    // (ver Registro 2026-07-05/06 en CLAUDE.md — NO volver a 131).
+    gyro_rate_dps = ANG_SIGN * ((float)gx / 100.0f);
+    if (gyro_rate_dps >  250.0f) gyro_rate_dps =  250.0f;
+    if (gyro_rate_dps < -250.0f) gyro_rate_dps = -250.0f;
+
+    gyro_f = gyro_rate_dps;
+    if (gyro_f >  180.0f) gyro_f =  180.0f;
+    if (gyro_f < -180.0f) gyro_f = -180.0f;
+
+    // Ángulo de roll desde el acelerómetro, por trigonometría de la gravedad:
+    // con el robot quieto, el accel solo mide g. Parado vertical, g cae toda
+    // en el eje Z (ay≈0, az≈+g) → ángulo 0°. Al inclinarse, parte de g se
+    // proyecta en Y: tan(roll) = ay/az → roll = atan2(ay, az). Se usa atan2
+    // (y no atan del cociente) porque maneja az=0 y los 4 cuadrantes sin
+    // dividir por cero. × 180/π pasa de radianes a grados.
+    // Vale solo en cuasi-estático: acelerando, el accel mide g + movimiento
+    // y este ángulo miente — por eso el filtro complementario le cree poco.
+    accel_ang_deg = ANG_SIGN * (atan2f((float)ay, (float)az) * (180.0f / M_PI));
+
+    // Inicialización del filtro en la primera muestra — evita que arranque en 0°
+    static uint8_t filter_init = 0;
+    if (!filter_init) {
+        filtered_roll_deg = accel_ang_deg;
+        filter_init = 1;
+    }
+
+    // Filtro complementario (fusión gyro + accel):
+    //   ángulo = 0.98 · (ángulo_anterior + gyro·dt) + 0.02 · ángulo_accel
+    // El primer término integra el gyro (ángulo_anterior + velocidad×tiempo):
+    // preciso a corto plazo pero acumula deriva. El segundo mezcla un 2% del
+    // ángulo absoluto del accel: ruidoso pero sin deriva. El 98/2 equivale a
+    // pasa-altos sobre el gyro + pasa-bajos sobre el accel con constante de
+    // tiempo τ = α·dt/(1−α) ≈ 0.49s: la deriva del gyro se corrige en ~½s y
+    // el ruido/aceleraciones del accel entra atenuado ~50 veces.
+    filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_ctrl)
+                      + (1.0f - ALPHA) * accel_ang_deg;
+
+    if (filtered_roll_deg >  180.0f) filtered_roll_deg =  180.0f;
+    if (filtered_roll_deg < -180.0f) filtered_roll_deg = -180.0f;
+
+    // Inclinación LATERAL (banking alrededor del eje de avance — el tercer
+    // eje, 2026-07-10): accel-only con EMA suave. No participa de ningún
+    // control, solo viaja en el push de odometría para que la Vista 3D de
+    // Qt reaccione también a este eje. Misma fórmula que calculate_tilt().
+    {
+        // Misma idea que el roll del accel, pero para el eje X: el cateto
+        // opuesto es la proyección de g en X y el adyacente es lo que queda
+        // de g en el plano YZ (pitágoras: √(ay²+az²)) — así el ángulo lateral
+        // no se contamina cuando el robot además está inclinado en roll.
+        float lat_acc = atan2f(-(float)ax,
+                               sqrtf((float)ay * (float)ay +
+                                     (float)az * (float)az)) * (180.0f / M_PI);
+        lat_tilt_f += 0.10f * (lat_acc - lat_tilt_f);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 8 — Cuarentena de sensores de línea clavados en el tope
+// (defensa contra soldadura fría/emisor caído, ver LINE_STUCK_*).
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_CuarentenaLinea(void)
+{
+    for (uint8_t ch = 0; ch < 4; ch++) {
+        if (adcAvg[ch] >= (uint16_t)LINE_STUCK_ADC) {
+            if (line_ch_stuck_t0[ch] == 0) {
+                line_ch_stuck_t0[ch] = HAL_GetTick();
+            } else if (!line_ch_quarantine[ch] &&
+                       (HAL_GetTick() - line_ch_stuck_t0[ch]) >= LINE_STUCK_MS) {
+                line_ch_quarantine[ch] = 1;
+            }
+        } else {
+            line_ch_stuck_t0[ch] = 0;
+            if (adcAvg[ch] < (uint16_t)LINE_THRESHOLD)
+                line_ch_quarantine[ch] = 0;   // leyó blanco: el sensor volvió
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 9 — Entradas del seguidor de línea (solo en modo LINE_FOLLOWING):
+// detección de obstáculo, centroide de línea, "todo negro" (cruce
+// perpendicular vs. en el aire) y PI de velocidad → line_angle_cmd.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_EntradasLinea(void)
+{
+    line_error = 0.0f;
+    line_angle_cmd = LINE_ANGLE;
+    line_desired_forward_vel = 0.0f;
+    line_forward_vel = 0.0f;
+    line_detected = 0;
+    w_sum = 0.0f;
+    if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+        // Detección de objetos: sensores de largo alcance ADC 5-8 (índices 4-7).
+        // Si cualquier sensor baja del umbral durante OBJ_DETECT_DEBOUNCE_CNT ciclos
+        // consecutivos (10 ciclos = 100 ms), arranca la secuencia de evasión.
         {
-            float lat_acc = atan2f(-(float)ax,
-                                   sqrtf((float)ay * (float)ay +
-                                         (float)az * (float)az)) * (180.0f / M_PI);
-            lat_tilt_f += 0.10f * (lat_acc - lat_tilt_f);
-        }
-
-        // ── Cuarentena de sensores de línea enganchados (ver defines LINE_STUCK_*) ──
-        for (uint8_t ch = 0; ch < 4; ch++) {
-            if (adcAvg[ch] >= (uint16_t)LINE_STUCK_ADC) {
-                if (line_ch_stuck_t0[ch] == 0) {
-                    line_ch_stuck_t0[ch] = HAL_GetTick();
-                } else if (!line_ch_quarantine[ch] &&
-                           (HAL_GetTick() - line_ch_stuck_t0[ch]) >= LINE_STUCK_MS) {
-                    line_ch_quarantine[ch] = 1;
-                }
-            } else {
-                line_ch_stuck_t0[ch] = 0;
-                if (adcAvg[ch] < (uint16_t)LINE_THRESHOLD)
-                    line_ch_quarantine[ch] = 0;   // leyó blanco: el sensor volvió
+            static uint8_t obj_cnt = 0;
+            uint8_t obj_now = ((float)adcAvg[4] < OBJ_DETECT_THRESHOLD_f ||
+                               (float)adcAvg[5] < OBJ_DETECT_THRESHOLD_f ||
+                               (float)adcAvg[6] < OBJ_DETECT_THRESHOLD_f ||
+                               (float)adcAvg[7] < OBJ_DETECT_THRESHOLD_f);
+            if (obj_now) { if (obj_cnt < OBJ_DETECT_DEBOUNCE_CNT) obj_cnt++; }
+            else         { obj_cnt = 0; }
+            if (obj_cnt >= OBJ_DETECT_DEBOUNCE_CNT &&
+                line_state == LINE_STATE_FOLLOWING &&
+                HAL_GetTick() >= obj_detect_ignore_until_ms) {
+                // 2026-07-14: directo a la fase STOP, sin pasar por ESPERA_REVERSA.
+                // El balance libre de ESPERA no tiene ancla de posición: llegando
+                // con inercia el robot se iba un poco para atrás y perdía la pared
+                // (reportado). El hold de distancia del STOP frena la inercia
+                // (hold_damp) y sostiene/lleva la distancia a la banda 3500..3900
+                // de A6/A8 desde el primer ciclo — no queda ningún período libre.
+                line_state           = LINE_STATE_OBJ_FRENO_REVERSA;
+                obj_brake_start_ms   = 0;
+                obj_pre_rotate_ms    = 0;
+                obj_rev_band_enter_ms = 0;
+                obj_cnt              = 0;
+                // Sentido alternado (2026-07-13): esta esquiva usa el sentido
+                // programado y deja armado el opuesto para el próximo objeto.
+                obj_esquive_dir      = obj_esquive_next_dir;
+                obj_esquive_next_dir = (int8_t)-obj_esquive_next_dir;
+                steering_adjustment = 0.0f;
+                line_integral       = 0.0f;
+                line_error_prev     = 0.0f;
+                line_error_f_d      = 0.0f;
+                obj_rev_steer_f     = 0.0f;
+                obj_rot_initialized = 0;
+                obj_rot_phase       = 0;
+                obj_rot_heading     = 0.0f;
+                obj_rot_phase1_ms   = 0;
+                obj_wall_line_confirm_cnt = 0;
             }
         }
 
-        // -------------------------------------------------------
-        // LINE FOLLOWER INPUTS
-        // -------------------------------------------------------
-        float line_error = 0.0f;
-        float line_angle_cmd = LINE_ANGLE;
-        float line_desired_forward_vel = 0.0f;
-        float line_forward_vel = 0.0f;
-        float line_obj_reverse_angle_cmd = 0.0f;
-        uint8_t line_detected = 0;
-        float w_sum = 0.0f;
-        if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-            // Detección de objetos: sensores de largo alcance ADC 5-8 (índices 4-7).
-            // Si cualquier sensor baja del umbral durante OBJ_DETECT_DEBOUNCE_CNT ciclos
-            // consecutivos (10 ciclos = 100 ms), arranca la secuencia de evasión.
-            {
-                static uint8_t obj_cnt = 0;
-                uint8_t obj_now = ((float)adcAvg[4] < OBJ_DETECT_THRESHOLD_f ||
-                                   (float)adcAvg[5] < OBJ_DETECT_THRESHOLD_f ||
-                                   (float)adcAvg[6] < OBJ_DETECT_THRESHOLD_f ||
-                                   (float)adcAvg[7] < OBJ_DETECT_THRESHOLD_f);
-                if (obj_now) { if (obj_cnt < OBJ_DETECT_DEBOUNCE_CNT) obj_cnt++; }
-                else         { obj_cnt = 0; }
-                if (obj_cnt >= OBJ_DETECT_DEBOUNCE_CNT &&
-                    line_state == LINE_STATE_FOLLOWING &&
-                    HAL_GetTick() >= obj_detect_ignore_until_ms) {
-                    // 2026-07-14: directo a la fase STOP, sin pasar por ESPERA_REVERSA.
-                    // El balance libre de ESPERA no tiene ancla de posición: llegando
-                    // con inercia el robot se iba un poco para atrás y perdía la pared
-                    // (reportado). El hold de distancia del STOP frena la inercia
-                    // (hold_damp) y sostiene/lleva la distancia a la banda 3500..3900
-                    // de A6/A8 desde el primer ciclo — no queda ningún período libre.
-                    line_state           = LINE_STATE_OBJ_FRENO_REVERSA;
-                    obj_brake_start_ms   = 0;
-                    obj_pre_rotate_ms    = 0;
-                    obj_rev_band_enter_ms = 0;
-                    obj_cnt              = 0;
-                    // Sentido alternado (2026-07-13): esta esquiva usa el sentido
-                    // programado y deja armado el opuesto para el próximo objeto.
-                    obj_esquive_dir      = obj_esquive_next_dir;
-                    obj_esquive_next_dir = (int8_t)-obj_esquive_next_dir;
-                    steering_adjustment = 0.0f;
-                    line_integral       = 0.0f;
-                    line_error_prev     = 0.0f;
-                    line_error_f_d      = 0.0f;
-                    obj_rev_initialized = 0;
-                    obj_rev_steer_f     = 0.0f;
-                    obj_rot_initialized = 0;
-                    obj_rot_phase       = 0;
-                    obj_rot_heading     = 0.0f;
-                    obj_rot_phase1_ms   = 0;
-                    obj_wall_line_confirm_cnt = 0;
-                }
+        // adcAvg[] es la mediana de los últimos 32 barridos DMA completos
+        // (~8ms a 4kHz): rechaza picos EMI aislados sin agregar el retardo de
+        // la antigua ventana de 40ms.
+        // Centroide cuadrático con sustracción de baseline.
+        // Sensores a posiciones relativas {-3,-1,+1,+3} × 5.75 mm desde el centro.
+        // Peso cuadrático: pos² × sign(pos) → coeficientes {-9,-1,+1,+9}.
+        // Normalización: 9 × w_sum → error en [-1, +1].
+        // Convención: izquierda = positivo, derecha = negativo.
+        float s[4] = {
+            (float)adcAvg[0], (float)adcAvg[1],
+            (float)adcAvg[2], (float)adcAvg[3]
+        };
+
+        // Sustracción de baseline: peso = señal por encima del fondo de cada sensor.
+        // Si el ADC no supera el umbral, contribuye 0 (ruido/luz ambiente).
+        float w[4];
+        for (int i = 0; i < 4; i++) {
+            float signal = s[i] - ADC_BASELINE[i];
+            w[i] = (!line_ch_quarantine[i] && s[i] > LINE_THRESHOLD)
+                 ? fmaxf(signal, 0.0f) : 0.0f;
+        }
+        w_sum = w[0] + w[1] + w[2] + w[3];
+
+        line_detected = (w_sum > 0.0f);
+
+        // Detección de "en el aire": todos los 4 sensores en negro Y el
+        // acelerómetro variando constantemente (= lo tienen en la mano).
+        // Si los 4 sensores están en negro pero el acelerómetro está quieto,
+        // significa que el robot está parado sobre el piso — NO se detienen
+        // los motores. Dos sub-casos según esté siguiendo línea o buscando:
+        // (a) en LINE_STATE_FOLLOWING, los 4 sensores en negro a la vez con
+        //     el robot quieto/sin manipular significa que está cruzando una
+        //     línea PERPENDICULAR a su dirección de avance (ej. una "+"): la
+        //     franja negra cubre los 4 sensores de punta a punta. Dispara un
+        //     giro instantáneo de 90° (LINE_STATE_PERP_ROTATE) para alinearse
+        //     y retomar el seguimiento normal. Debounce corto (50ms) para
+        //     filtrar ruido de un solo ciclo, no los 2s de "en el aire".
+        // (b) en cualquier otro sub-estado (buscando la línea), no hace nada
+        //     especial — sigue el flujo normal de búsqueda (LOST/EDGE).
+        // Umbral de movimiento (ACCEL_MOTION_THRESHOLD) es un punto de
+        // partida, ajustar según pruebas físicas (unidades: LSB crudos del
+        // MPU6050 por ciclo, EMA). "En el aire" sigue necesitando >2s.
+        // Cuando baja al piso (all_black→0) → ignorar obstáculos 3s (mano al soltar).
+        {
+            const float ACCEL_MOTION_THRESHOLD = 300.0f;
+            const uint32_t PERP_DEBOUNCE_MS = 50U;
+            // Tras dejar de mover el acelerómetro (lo soltaron/apoyaron), el timer de
+            // all_black puede venir arrastrando segundos acumulados desde que estaba
+            // en el aire — sin esto, apoyarlo sobre cualquier zona momentáneamente
+            // oscura (o el punto de partida) disparaba PERP_ROTATE al instante. Exige
+            // además un mínimo de quietud continua del acelerómetro antes de habilitar
+            // el disparo de cruce perpendicular.
+            const uint32_t ACCEL_SETTLE_MS = 400U;
+            // Guardas anti "giro fantasma al apoyar el robot" (2026-07-05): un cruce
+            // perpendicular REAL ocurre mientras se sigue la línea — los 4 sensores
+            // pasan de "línea parcial" (línea + blanco a los costados) a todo negro
+            // en un instante, y el todo-negro dura poco. Viniendo del aire, en cambio,
+            // los 4 sensores llevan MUCHO tiempo en negro y nunca hubo vista parcial
+            // (en el aire all_black implica line_detected, así que el timer de línea
+            // no discrimina — esta variable sí).
+            const uint32_t PERP_MAX_ELAPSED_MS  = 800U;  // todo-negro más viejo que esto NO es un cruce
+            const uint32_t PERP_PARTIAL_WIN_MS  = 400U;  // el todo-negro debe empezar a menos de esto de la última vista parcial
+            // Canal en cuarentena → all_black imposible (conservador: mejor
+            // perderse un cruce perpendicular real que girar por un sensor roto).
+            uint8_t all_black = (adcAvg[0] > (uint16_t)LINE_THRESHOLD && !line_ch_quarantine[0] &&
+                                 adcAvg[1] > (uint16_t)LINE_THRESHOLD && !line_ch_quarantine[1] &&
+                                 adcAvg[2] > (uint16_t)LINE_THRESHOLD && !line_ch_quarantine[2] &&
+                                 adcAvg[3] > (uint16_t)LINE_THRESHOLD && !line_ch_quarantine[3]);
+            if (line_detected && !all_black)
+                last_partial_line_ms = HAL_GetTick();
+            uint8_t accel_moving = (accel_motion_f > ACCEL_MOTION_THRESHOLD);
+            if (accel_moving) {
+                accel_settled_start_ms = 0;
+            } else if (accel_settled_start_ms == 0) {
+                accel_settled_start_ms = HAL_GetTick();
             }
-
-            // Usa adcAvg[] en lugar del snapshot DMA crudo. OJO: aunque el ADC convierte
-            // a 4 kHz, UpdateADC_MovingAverage() corre desde is10ms (100 Hz) y toma UN
-            // snapshot por ciclo — con ADC_AVERAGE_SIZE=4 la ventana real es de 40 ms,
-            // no 3.75 ms. Mejora pendiente: promediar en el callback del DMA a 4 kHz.
-            // Centroide cuadrático con sustracción de baseline.
-            // Sensores a posiciones relativas {-3,-1,+1,+3} × 5.75 mm desde el centro.
-            // Peso cuadrático: pos² × sign(pos) → coeficientes {-9,-1,+1,+9}.
-            // Normalización: 9 × w_sum → error en [-1, +1].
-            // Convención: izquierda = positivo, derecha = negativo.
-            float s[4] = {
-                (float)adcAvg[0], (float)adcAvg[1],
-                (float)adcAvg[2], (float)adcAvg[3]
-            };
-
-            // Sustracción de baseline: peso = señal por encima del fondo de cada sensor.
-            // Si el ADC no supera el umbral, contribuye 0 (ruido/luz ambiente).
-            float w[4];
-            for (int i = 0; i < 4; i++) {
-                float signal = s[i] - ADC_BASELINE[i];
-                w[i] = (!line_ch_quarantine[i] && s[i] > LINE_THRESHOLD)
-                     ? fmaxf(signal, 0.0f) : 0.0f;
-            }
-            w_sum = w[0] + w[1] + w[2] + w[3];
-
-            line_detected = (w_sum > 0.0f);
-
-            // Detección de "en el aire": todos los 4 sensores en negro Y el
-            // acelerómetro variando constantemente (= lo tienen en la mano).
-            // Si los 4 sensores están en negro pero el acelerómetro está quieto,
-            // significa que el robot está parado sobre el piso — NO se detienen
-            // los motores. Dos sub-casos según esté siguiendo línea o buscando:
-            // (a) en LINE_STATE_FOLLOWING, los 4 sensores en negro a la vez con
-            //     el robot quieto/sin manipular significa que está cruzando una
-            //     línea PERPENDICULAR a su dirección de avance (ej. una "+"): la
-            //     franja negra cubre los 4 sensores de punta a punta. Dispara un
-            //     giro instantáneo de 90° (LINE_STATE_PERP_ROTATE) para alinearse
-            //     y retomar el seguimiento normal. Debounce corto (50ms) para
-            //     filtrar ruido de un solo ciclo, no los 2s de "en el aire".
-            // (b) en cualquier otro sub-estado (buscando la línea), no hace nada
-            //     especial — sigue el flujo normal de búsqueda (LOST/EDGE).
-            // Umbral de movimiento (ACCEL_MOTION_THRESHOLD) es un punto de
-            // partida, ajustar según pruebas físicas (unidades: LSB crudos del
-            // MPU6050 por ciclo, EMA). "En el aire" sigue necesitando >2s.
-            // Cuando baja al piso (all_black→0) → ignorar obstáculos 3s (mano al soltar).
-            {
-                const float ACCEL_MOTION_THRESHOLD = 300.0f;
-                const uint32_t PERP_DEBOUNCE_MS = 50U;
-                // Tras dejar de mover el acelerómetro (lo soltaron/apoyaron), el timer de
-                // all_black puede venir arrastrando segundos acumulados desde que estaba
-                // en el aire — sin esto, apoyarlo sobre cualquier zona momentáneamente
-                // oscura (o el punto de partida) disparaba PERP_ROTATE al instante. Exige
-                // además un mínimo de quietud continua del acelerómetro antes de habilitar
-                // el disparo de cruce perpendicular.
-                const uint32_t ACCEL_SETTLE_MS = 400U;
-                // Guardas anti "giro fantasma al apoyar el robot" (2026-07-05): un cruce
-                // perpendicular REAL ocurre mientras se sigue la línea — los 4 sensores
-                // pasan de "línea parcial" (línea + blanco a los costados) a todo negro
-                // en un instante, y el todo-negro dura poco. Viniendo del aire, en cambio,
-                // los 4 sensores llevan MUCHO tiempo en negro y nunca hubo vista parcial
-                // (en el aire all_black implica line_detected, así que el timer de línea
-                // no discrimina — esta variable sí).
-                const uint32_t PERP_MAX_ELAPSED_MS  = 800U;  // todo-negro más viejo que esto NO es un cruce
-                const uint32_t PERP_PARTIAL_WIN_MS  = 400U;  // el todo-negro debe empezar a menos de esto de la última vista parcial
-                // Canal en cuarentena → all_black imposible (conservador: mejor
-                // perderse un cruce perpendicular real que girar por un sensor roto).
-                uint8_t all_black = (adcAvg[0] > (uint16_t)LINE_THRESHOLD && !line_ch_quarantine[0] &&
-                                     adcAvg[1] > (uint16_t)LINE_THRESHOLD && !line_ch_quarantine[1] &&
-                                     adcAvg[2] > (uint16_t)LINE_THRESHOLD && !line_ch_quarantine[2] &&
-                                     adcAvg[3] > (uint16_t)LINE_THRESHOLD && !line_ch_quarantine[3]);
-                if (line_detected && !all_black)
-                    last_partial_line_ms = HAL_GetTick();
-                uint8_t accel_moving = (accel_motion_f > ACCEL_MOTION_THRESHOLD);
+            uint8_t accel_settled = (accel_settled_start_ms != 0) &&
+                ((HAL_GetTick() - accel_settled_start_ms) > ACCEL_SETTLE_MS);
+            if (all_black) {
+                if (all_black_start_ms == 0) all_black_start_ms = HAL_GetTick();
+                uint32_t all_black_elapsed = HAL_GetTick() - all_black_start_ms;
                 if (accel_moving) {
-                    accel_settled_start_ms = 0;
-                } else if (accel_settled_start_ms == 0) {
-                    accel_settled_start_ms = HAL_GetTick();
-                }
-                uint8_t accel_settled = (accel_settled_start_ms != 0) &&
-                    ((HAL_GetTick() - accel_settled_start_ms) > ACCEL_SETTLE_MS);
-                if (all_black) {
-                    if (all_black_start_ms == 0) all_black_start_ms = HAL_GetTick();
-                    uint32_t all_black_elapsed = HAL_GetTick() - all_black_start_ms;
-                    if (accel_moving) {
-                        if (all_black_elapsed > 2000U) f_in_air = 1;
-                    } else {
-                        f_in_air = 0;
-                        if (line_state == LINE_STATE_FOLLOWING &&
-                            accel_settled &&
-                            all_black_elapsed > PERP_DEBOUNCE_MS &&
-                            all_black_elapsed < PERP_MAX_ELAPSED_MS &&
-                            last_partial_line_ms != 0 &&
-                            (all_black_start_ms - last_partial_line_ms) < PERP_PARTIAL_WIN_MS) {
-                            uint32_t now_ms = HAL_GetTick();
-                            perp_from_obj_avoidance =
-                                (obj_final_turn_pending_ms != 0) &&
-                                ((now_ms - obj_final_turn_pending_ms) <= OBJ_FINAL_TURN_WINDOW_MS);
-                            obj_final_turn_pending_ms = 0;
-                            perp_obj_brake_start_ms = 0;
-                            line_state          = LINE_STATE_PERP_ROTATE;
-                            obj_rot_initialized = 0;
-                            obj_rot_phase       = 0;
-                            obj_rot_heading     = 0.0f;
-                            obj_rot_phase1_ms   = 0;
-                            obj_rot_start_ms    = 0;
-                            steering_adjustment = 0.0f;
-                        }
-                    }
+                    if (all_black_elapsed > 2000U) f_in_air = 1;
                 } else {
-                    all_black_start_ms = 0;
                     f_in_air = 0;
+                    if (line_state == LINE_STATE_FOLLOWING &&
+                        accel_settled &&
+                        all_black_elapsed > PERP_DEBOUNCE_MS &&
+                        all_black_elapsed < PERP_MAX_ELAPSED_MS &&
+                        last_partial_line_ms != 0 &&
+                        (all_black_start_ms - last_partial_line_ms) < PERP_PARTIAL_WIN_MS) {
+                        uint32_t now_ms = HAL_GetTick();
+                        perp_from_obj_avoidance =
+                            (obj_final_turn_pending_ms != 0) &&
+                            ((now_ms - obj_final_turn_pending_ms) <= OBJ_FINAL_TURN_WINDOW_MS);
+                        obj_final_turn_pending_ms = 0;
+                        perp_obj_brake_start_ms = 0;
+                        line_state          = LINE_STATE_PERP_ROTATE;
+                        obj_rot_initialized = 0;
+                        obj_rot_phase       = 0;
+                        obj_rot_heading     = 0.0f;
+                        obj_rot_phase1_ms   = 0;
+                        obj_rot_start_ms    = 0;
+                        steering_adjustment = 0.0f;
+                    }
                 }
-                if (prev_all_line_black && !all_black)
-                    obj_detect_ignore_until_ms = HAL_GetTick() + 3000U;
-                prev_all_line_black = all_black;
-            }
-
-            if (line_detected) {
-                // Numerador cuadrático: coeficientes {+9,+1,-1,-9} (izq=positivo)
-                float num = 9.0f*w[0] + 1.0f*w[1] - 1.0f*w[2] - 9.0f*w[3];
-                line_error = num / (9.0f * w_sum) + line_error_trim_f;
-
-                // Umbral más bajo porque sensores internos solo generan ±0.11
-                if (line_error > 0.02f)       last_line_dir =  1.0f;
-                else if (line_error < -0.02f) last_line_dir = -1.0f;
-
-                // Snapshot literal: ¿el único sensor con señal fue un extremo, sin
-                // ningún soporte de los sensores del medio? Se congela en su último
-                // valor al perder la línea (este bloque solo corre con line_detected).
-                last_detected_edge_only = ((w[0] > 0.0f || w[3] > 0.0f) &&
-                                            w[1] <= 0.0f && w[2] <= 0.0f);
-            }
-            line_error_disp    = line_error;
-            line_detected_disp = (uint8_t)line_detected;
-
-            // Velocidad deseada cae cuadráticamente con el error de línea.
-            // Floor 10%: en curva cerrada el robot frena casi al mínimo (era 25%).
-            // Sin floor: speed_factor→0 → line_angle_cmd=0 → pwm_sat→0 → spin puro.
-            float speed_factor = fmaxf(0.0f, 1.0f - fabsf(line_error) / 0.45f);
-            speed_factor *= speed_factor;
-            line_desired_forward_vel = line_detected
-                ? fmaxf(LINE_SPEED_TARGET * 0.20f, LINE_SPEED_TARGET * speed_factor)
-                : 0.0f;
-            // deadband para filtrar ruido de cuantización de encoders (ver BRAKE_VEL_DEADBAND)
-            line_forward_vel = apply_deadbandf(fmaxf(0.0f, -velocity_est_f), BRAKE_VEL_DEADBAND);
-
-            // PI de velocidad → inclinación de avance
-            if (line_state == LINE_STATE_FOLLOWING) {
-                float vel_error = line_desired_forward_vel - line_forward_vel;
-                float line_vel_kp_eff;
-                if (vel_error > 0.0f) {
-                    // Acelerando: acumula integral solo en positivo
-                    line_vel_integral += vel_error * DT_CTRL_FIXED;
-                    line_vel_integral = clampf_local(line_vel_integral, 0.0f, LINE_VEL_I_MAX);
-                    line_vel_kp_eff = LINE_VEL_KP;
-                } else {
-                    // Sobre-velocidad: decae la integral (freno no depende del windup)
-                    // y usa ganancia P más alta para frenar de verdad, no solo soltar el gas.
-                    line_vel_integral *= 0.80f;
-                    line_vel_kp_eff = LINE_VEL_KP_BRAKE;
-                }
-                line_angle_cmd = clampf_local(
-                    line_vel_kp_eff * vel_error + LINE_VEL_KI * line_vel_integral,
-                    -3.0f, LINE_ANGLE
-                );
             } else {
-                line_vel_integral *= 0.80f;
-                line_angle_cmd = 0.0f;
+                all_black_start_ms = 0;
+                f_in_air = 0;
             }
-
-            if (line_state == LINE_STATE_OBJ_RETROCESO) {
-                // Aproximación desacelerada al setpoint de distancia (2026-07-10):
-                // el factor cae linealmente de 1 (lejos del corte) al piso
-                // APPROACH_MIN (llegando a CLEAR), gobernado por el MENOR de
-                // A6/A8 — el mismo sensor que decide el corte. Llega "en puntas
-                // de pie" y el hold del STOP arranca casi sin inercia que corregir.
-                float rev_front_min = fminf((float)adcAvg[5], (float)adcAvg[7]);
-                float rev_approach  = clampf_local(
-                    (OBJ_REV_CLEAR_ADC - rev_front_min) / OBJ_REV_APPROACH_BAND,
-                    OBJ_REV_APPROACH_MIN, 1.0f);
-
-                // Empuje feedforward + freno solo con sobrevelocidad real
-                // (2026-07-13, ver nota en OBJ_REV_PUSH_ANGLE: el PI cerrado
-                // anterior no tenía equilibrio posible y bang-bangueaba).
-                float rev_overspeed = apply_deadbandf(fmaxf(0.0f, velocity_est_f),
-                                                      BRAKE_VEL_DEADBAND);
-                float reverse_angle_mag = fmaxf(
-                    OBJ_REV_PUSH_ANGLE * rev_approach -
-                    OBJ_REV_BRAKE_KP * rev_overspeed,
-                    -OBJ_REV_ACTIVE_BRAKE_MAX
-                );
-                line_obj_reverse_angle_cmd = -reverse_angle_mag;
-                // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto en reversa.
-                line_obj_reverse_angle_cmd -= AntiStall_Tick(7,
-                    reverse_angle_mag > 0.0f, ANTISTALL_MAX_REV);
-            }
-
-        } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
-                   (robot_state == ROBOT_STATE_BALANCE_ONLY)) {
-            // velocity_est ya actualizado desde encoders al inicio del ciclo
+            if (prev_all_line_black && !all_black)
+                obj_detect_ignore_until_ms = HAL_GetTick() + 3000U;
+            prev_all_line_black = all_black;
         }
 
-        // Comandos manuales durante LINE_FOLLOWING (WiFi/USB), SOLO si no ve la
-        // línea: reutiliza el mismo control que ROBOT_STATE_MANUAL_CONTROL (PI de
-        // velocidad + giro suave + corrección de rumbo recto) extendiendo las
-        // condiciones de esas dos ramas (más abajo, cálculo de setpoint y mezcla
-        // de motores) en vez de duplicar el algoritmo. En cuanto vuelve a ver la
-        // línea, se ignoran los comandos y el seguidor retoma el control normal
-        // (line_state ya queda forzado en LINE_STATE_FOLLOWING mientras el
-        // override está activo, así que retoma limpio). Se exige además que el
-        // comando haya llegado hace poco (<250ms): mientras se sigue la línea
-        // normalmente el decay de manual_setpoint_cmd/steering_cmd NO corre (vive
-        // en la rama MANUAL, que acá no se ejecuta) — sin este chequeo, un comando
-        // viejo (de hace rato, ya soltado) quedaría "congelado" y dispararía el
-        // override de golpe apenas se pierda la línea más tarde, sin que el
-        // usuario esté mandando nada en ese momento.
-        uint8_t manual_line_override =
-            (robot_state == ROBOT_STATE_LINE_FOLLOWING) && !line_detected &&
-            (HAL_GetTick() - manual_cmd_last_ms) < 250U &&
-            (fabsf(manual_setpoint_cmd) > 0.01f || fabsf(manual_steering_cmd) > 0.5f);
+        if (line_detected) {
+            // Centroide = promedio de las posiciones de los sensores pesado
+            // por cuánta línea ve cada uno: Σ(coef_i·w_i) / Σw_i. Los sensores
+            // están en posiciones {-3,-1,+1,+3} (en unidades de 5.75mm); se usa
+            // pos²·signo(pos) = {+9,+1,-1,-9} en vez de la posición lineal para
+            // que los extremos pesen 9× (reacción fuerte apenas la línea se
+            // escapa hacia una punta). Dividir por 9·w_sum normaliza: el peor
+            // caso (toda la señal en un sensor extremo) da num = ±9·w_sum →
+            // error = ±1. Resultado en [-1,+1], izquierda = positivo.
+            float num = 9.0f*w[0] + 1.0f*w[1] - 1.0f*w[2] - 9.0f*w[3];
+            line_error = num / (9.0f * w_sum) + line_error_trim_f;
 
-        // -------------------------------------------------------
-        // CAMBIOS DE ESTADO
-        // -------------------------------------------------------
-        static eRobotState prev_robot_state   = ROBOT_STATE_IDLE;
-        static uint8_t     display_before_line = 0;  // guarda el display previo al modo línea
+            // Umbral más bajo porque sensores internos solo generan ±0.11
+            if (line_error > 0.02f)       last_line_dir =  1.0f;
+            else if (line_error < -0.02f) last_line_dir = -1.0f;
 
-        if (robot_state == ROBOT_STATE_LINE_FOLLOWING && prev_robot_state != ROBOT_STATE_LINE_FOLLOWING) {
-            display_before_line = f_change_display;  // guardar display actual
-            f_change_display    = 1;                 // cambiar al display de línea
+            // Snapshot literal: ¿el único sensor con señal fue un extremo, sin
+            // ningún soporte de los sensores del medio? Se congela en su último
+            // valor al perder la línea (este bloque solo corre con line_detected).
+            last_detected_edge_only = ((w[0] > 0.0f || w[3] > 0.0f) &&
+                                        w[1] <= 0.0f && w[2] <= 0.0f);
+        }
+        line_error_disp    = line_error;
+        line_detected_disp = (uint8_t)line_detected;
+
+        // Velocidad deseada cae cuadráticamente con el error de línea.
+        // La recta 1 − |e|/0.45 vale 1 centrado y llega a 0 con |e|=0.45
+        // (línea ya bien afuera del centro); elevarla al cuadrado hace la
+        // caída suave cerca del centro (0.1 de error solo quita ~40%) y
+        // agresiva en curvas (0.3 de error quita ~90%): recto rápido, curva lento.
+        // Floor 10%: en curva cerrada el robot frena casi al mínimo (era 25%).
+        // Sin floor: speed_factor→0 → line_angle_cmd=0 → pwm_sat→0 → spin puro.
+        float speed_factor = fmaxf(0.0f, 1.0f - fabsf(line_error) / 0.45f);
+        speed_factor *= speed_factor;
+        line_desired_forward_vel = line_detected
+            ? fmaxf(LINE_SPEED_TARGET * 0.20f, LINE_SPEED_TARGET * speed_factor)
+            : 0.0f;
+        // deadband para filtrar ruido de cuantización de encoders (ver BRAKE_VEL_DEADBAND)
+        line_forward_vel = apply_deadbandf(fmaxf(0.0f, -velocity_est_f), BRAKE_VEL_DEADBAND);
+
+        // PI de velocidad → inclinación de avance. Convierte un error de
+        // velocidad [m/s] en un ángulo de setpoint [°]: ángulo = Kp·e + Ki·∫e.
+        // Es el lazo EXTERNO de un control en cascada: este PI pide grados,
+        // y el PID de balance (lazo interno) convierte esos grados en PWM.
+        // Físicamente: más inclinación = más aceleración de avance (péndulo
+        // invertido), así que "ir más rápido" se pide inclinándose más.
+        if (line_state == LINE_STATE_FOLLOWING) {
+            float vel_error = line_desired_forward_vel - line_forward_vel;
+            float line_vel_kp_eff;
+            if (vel_error > 0.0f) {
+                // Acelerando: acumula integral solo en positivo
+                line_vel_integral += vel_error * DT_CTRL_FIXED;
+                line_vel_integral = clampf_local(line_vel_integral, 0.0f, LINE_VEL_I_MAX);
+                line_vel_kp_eff = LINE_VEL_KP;
+            } else {
+                // Sobre-velocidad: decae la integral (freno no depende del windup)
+                // y usa ganancia P más alta para frenar de verdad, no solo soltar el gas.
+                line_vel_integral *= 0.80f;
+                line_vel_kp_eff = LINE_VEL_KP_BRAKE;
+            }
+            line_angle_cmd = clampf_local(
+                line_vel_kp_eff * vel_error + LINE_VEL_KI * line_vel_integral,
+                -3.0f, LINE_ANGLE
+            );
+        } else {
+            line_vel_integral *= 0.80f;
+            line_angle_cmd = 0.0f;
+        }
+
+    } else if ((robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ||
+               (robot_state == ROBOT_STATE_BALANCE_ONLY)) {
+        // velocity_est ya actualizado desde encoders al inicio del ciclo
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 10 — Override manual durante el modo línea.
+// Comandos manuales durante LINE_FOLLOWING (WiFi/USB), SOLO si no ve la
+// línea: reutiliza el mismo control que ROBOT_STATE_MANUAL_CONTROL (PI de
+// velocidad + giro suave + corrección de rumbo recto) extendiendo las
+// condiciones de esas dos ramas (setpoint y mezcla de motores) en vez de
+// duplicar el algoritmo. En cuanto vuelve a ver la línea, se ignoran los
+// comandos y el seguidor retoma el control normal (line_state ya queda
+// forzado en LINE_STATE_FOLLOWING mientras el override está activo, así
+// que retoma limpio). Se exige además que el comando haya llegado hace
+// poco (<250ms): mientras se sigue la línea normalmente el decay de
+// manual_setpoint_cmd/steering_cmd NO corre (vive en la rama MANUAL, que
+// acá no se ejecuta) — sin este chequeo, un comando viejo (ya soltado)
+// quedaría "congelado" y dispararía el override de golpe apenas se
+// pierda la línea más tarde, sin que el usuario esté mandando nada.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_OverrideManualLinea(void)
+{
+    manual_line_override =
+        (robot_state == ROBOT_STATE_LINE_FOLLOWING) && !line_detected &&
+        (HAL_GetTick() - manual_cmd_last_ms) < 250U &&
+        (fabsf(manual_setpoint_cmd) > 0.01f || fabsf(manual_steering_cmd) > 0.5f);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 11 — Cambios de estado del robot: al entrar/salir de cada modo
+// se resetean integrales, filtros, odometría y display.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_CambiosDeEstado(void)
+{
+    static eRobotState prev_robot_state   = ROBOT_STATE_IDLE;
+    static uint8_t     display_before_line = 0;  // guarda el display previo al modo línea
+
+    if (robot_state == ROBOT_STATE_LINE_FOLLOWING && prev_robot_state != ROBOT_STATE_LINE_FOLLOWING) {
+        display_before_line = f_change_display;  // guardar display actual
+        f_change_display    = 1;                 // cambiar al display de línea
+        integral            = 0.0f;
+        line_integral       = 0.0f;
+        line_error_prev     = 0.0f;
+        line_error_f_d      = 0.0f;
+        steering_adjustment = 0.0f;
+        velocity_est        = 0.0f;
+        velocity_est_f      = 0.0f;
+        velocity_est_slow_f = 0.0f;
+        vel_from_accel      = 0.0f;
+        line_vel_integral   = 0.0f;
+        line_enc_angle_corr = 0.0f;
+        line_reverse_boost  = 0.0f;
+        balance_hold_active = 0;
+        line_steer_fb_int   = 0.0f;
+        speed_right_rps_s   = 0.0f;
+        speed_left_rps_s    = 0.0f;
+        line_state          = LINE_STATE_FOLLOWING;
+        line_seen_since_entry = 0;
+        obj_esquive_dir     = 1;   // esquive alternado: arranca por derecha
+        obj_esquive_next_dir = 1;
+        line_was_centered_on_lost = 1;
+        last_detected_edge_only   = 0;
+        dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
+        dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
+        base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
+        brake_setpoint_f    = 0.0f;
+        line_lost_ms        = HAL_GetTick();
+        line_angle_ramped   = 0.0f;
+        lost_fwd_vel_integral = 0.0f;
+        all_black_start_ms  = 0;
+        last_partial_line_ms = 0;
+        obj_final_turn_pending_ms = 0;
+        perp_from_obj_avoidance   = 0;
+        perp_obj_brake_start_ms   = 0;
+        obj_wall_line_confirm_cnt = 0;
+        odom_x_m            = 0.0f;   // odometría: origen = punto de entrada al modo
+        odom_y_m            = 0.0f;
+        odom_theta_deg      = 0.0f;
+        line_loss_pose_valid = 0;     // snapshot viejo queda en el marco anterior
+        lost_ret_ov_active   = 0;
+    }
+
+    if (robot_state != ROBOT_STATE_LINE_FOLLOWING && prev_robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+        f_change_display = display_before_line;  // restaurar display anterior
+    }
+
+    // Sub-estado línea: entrar/salir de modo evasión cambia display 1 ↔ 6
+    {
+        static eLineState prev_line_state_disp = LINE_STATE_FOLLOWING;
+        if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+            int prev_obj = (prev_line_state_disp >= LINE_STATE_OBJ_FRENO_REVERSA);
+            int curr_obj = (line_state           >= LINE_STATE_OBJ_FRENO_REVERSA);
+            if (!prev_obj && curr_obj) {
+                f_change_display = 6;  // entrar en evasión → pantalla OBJ
+            } else if (prev_obj && !curr_obj) {
+                f_change_display = 1;  // volver al seguidor de línea
+            }
+        }
+        prev_line_state_disp = line_state;
+    }
+
+    if (robot_state == ROBOT_STATE_IDLE && prev_robot_state != ROBOT_STATE_IDLE) {
+        integral            = 0.0f;
+        pwm_sat_prev        = 0.0f;
+        dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
+        dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
+        base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
+        brake_setpoint_f    = 0.0f;
+    }
+
+    if ((robot_state == ROBOT_STATE_BALANCE_ONLY ||
+         robot_state == ROBOT_STATE_BALANCE_AND_SPEED ||
+         robot_state == ROBOT_STATE_MANUAL_CONTROL) &&
+        (prev_robot_state != robot_state)) {
+
+        integral            = 0.0f;
+        steering_adjustment = 0.0f;
+        velocity_est        = 0.0f;
+        velocity_est_f      = 0.0f;
+        velocity_est_slow_f = 0.0f;
+        vel_from_accel      = 0.0f;
+        dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
+        dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
+        base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
+        brake_setpoint_f    = 0.0f;
+        pwm_sat_prev        = 0.0f;
+
+        odom_x_m       = 0.0f;   // odometría: origen = punto de entrada al modo
+        odom_y_m       = 0.0f;
+        odom_theta_deg = 0.0f;
+
+        if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+            manual_setpoint_cmd     = 0.0f;
+            manual_steering_cmd     = 0.0f;
+            manual_cmd_last_ms      = HAL_GetTick();
+            manual_setpoint_ramped  = 0.0f;
+            manual_vel_integral     = 0.0f;
+            manual_straight_steer_f = 0.0f;
+            steering_adjustment     = 0.0f;
+            obj_rev_steer_f         = 0.0f;
+        }
+    }
+
+    prev_robot_state = robot_state;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 12 — Setpoint dinámico: cada modo/sub-estado decide cuántos
+// grados inclinarse (base) más el freno traslacional (brake); el
+// resultado rampa hacia dynamic_setpoint_f, la referencia del PID.
+// Acá vive la "personalidad" del robot.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_SetpointDinamico(void)
+{
+    float base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+    float brake_setpoint_target = 0.0f;
+
+    if (robot_state == ROBOT_STATE_LINE_FOLLOWING && !manual_line_override) {
+        if (line_state == LINE_STATE_FOLLOWING && line_detected) {
+            // Regulación de velocidad por encoders:
+            // - vel < 0 (avance): reducir ángulo si va muy rápido → frena
+            // - vel > 0 (reversa): scale=1 siempre → ángulo completo → empuja hacia adelante
+            float vel_fwd = fminf(0.0f, velocity_est_f);
+            float vel_scale = fmaxf(0.0f, 1.0f - fabsf(vel_fwd) / (LINE_SPEED_TARGET * 0.9f));
+            float stability_scale = 1.0f;
+            // Referencia: base_setpoint_f (setpoint actual de línea), no el upright (0°).
+            // Sin esto, stability_scale penaliza la inclinación correcta de avance.
+            float balance_err_abs = fabsf(filtered_roll_deg - base_setpoint_f);
+            float gyro_abs = fabsf(gyro_f);
+
+            if (balance_err_abs > 1.5f)
+                stability_scale *= fmaxf(0.60f, 1.0f - (balance_err_abs - 1.5f) / 3.0f);
+            if (gyro_abs > 20.0f)
+                stability_scale *= fmaxf(0.60f, 1.0f - (gyro_abs - 20.0f) / 45.0f);
+
+            // Corrección P directa por déficit de velocidad de encoder:
+            // frac=1 cuando el robot está parado, frac=0 cuando alcanza la vel deseada.
+            float enc_deficit = fmaxf(0.0f, line_desired_forward_vel - line_forward_vel);
+            float enc_deficit_frac = (line_desired_forward_vel > 0.01f)
+                ? clampf_local(enc_deficit / line_desired_forward_vel, 0.0f, 1.0f)
+                : 0.0f;
+            line_enc_angle_corr = clampf_local(
+                LINE_ENC_CORR_KP * enc_deficit_frac, 0.0f, LINE_ENC_CORR_MAX);
+
+            float reverse_vel = fmaxf(0.0f, velocity_est_f);
+            float reverse_target = 0.0f;
+            if (reverse_vel > LINE_REV_VEL_START) {
+                reverse_target = LINE_REV_BOOST_MAX *
+                    clampf_local(
+                        (reverse_vel - LINE_REV_VEL_START) /
+                        (LINE_REV_VEL_FULL - LINE_REV_VEL_START),
+                        0.0f, 1.0f
+                    );
+                if (stability_scale < 0.75f) stability_scale = 0.75f;
+            }
+
+            float reverse_delta = reverse_target - line_reverse_boost;
+            float reverse_step = (reverse_delta > 0.0f) ? LINE_REV_BOOST_UP : LINE_REV_BOOST_DOWN;
+            if (reverse_delta >  reverse_step) reverse_delta =  reverse_step;
+            if (reverse_delta < -reverse_step) reverse_delta = -reverse_step;
+            line_reverse_boost += reverse_delta;
+
+            if (line_angle_cmd < 0.0f) {
+                // Freno activo: no aplicar boosts positivos ni vel_scale (que sería 0 y mataría el freno)
+                base_setpoint_target = line_angle_cmd * stability_scale;
+            } else {
+                float line_angle_with_boost = clampf_local(
+                    line_angle_cmd + line_enc_angle_corr + line_reverse_boost,
+                    0.0f, LINE_ANGLE + LINE_ENC_CORR_MAX + LINE_REV_BOOST_MAX
+                );
+                base_setpoint_target = line_angle_with_boost * vel_scale * stability_scale;
+            }
+        } else if (line_state == LINE_STATE_OBJ_FRENO_REVERSA) {
+            // Frenado post-reversa + hold de distancia por ADC6/ADC8: la reversa
+            // cortó en OBJ_REV_CLEAR_ADC; acá se sostiene esa distancia mientras
+            // dura el STOP. Antes era bang-bang puro con ±2.75° fijos: se pasaba
+            // hacia atrás/adelante y nunca lograba quedarse estable. Ahora la
+            // corrección es proporcional y suave, con una zona fina muerta en el
+            // centro para que pueda asentarse y cumplir la ventana de estabilidad.
+            float front_min = fminf((float)adcAvg[5], (float)adcAvg[7]);
+            float hold_center = OBJ_REV_CLEAR_ADC + 0.5f * OBJ_REV_HOLD_BAND;
+            float hold_err    = hold_center - front_min;  // >0 = quedó cerca → retroceder
+            float hold_abs    = fabsf(hold_err);
+
+            // Término D del hold (2026-07-10): inclinación en contra del
+            // movimiento con la velocidad RÁPIDA de encoders. Es lo que
+            // frena la inercia ANTES de pasarse (en ambos sentidos: yendo
+            // atrás tras el corte de la reversa, y volviendo hacia adelante
+            // no se estrella contra la pared). Ver OBJ_REV_HOLD_KV.
+            // velocity_est_f > 0 = reversa → damp positivo = inclina adelante.
+            float hold_damp = clampf_local(
+                OBJ_REV_HOLD_KV * apply_deadbandf(velocity_est_f, OBJ_REV_HOLD_VEL_DB),
+                -OBJ_REV_HOLD_DAMP_MAX, OBJ_REV_HOLD_DAMP_MAX);
+
+            if (hold_abs > OBJ_REV_HOLD_FINE_BAND) {
+                float hold_mag = clampf_local(
+                    (hold_abs - OBJ_REV_HOLD_FINE_BAND) / OBJ_REV_HOLD_ERR_FOR_MAX,
+                    0.0f, 1.0f);
+                float hold_angle = OBJ_REV_HOLD_ANGLE_MIN +
+                    (OBJ_REV_HOLD_ANGLE_MAX - OBJ_REV_HOLD_ANGLE_MIN) * hold_mag;
+                base_setpoint_target = SETPOINT_ANGLE + setpoint_trim +
+                    ((hold_err > 0.0f) ? -hold_angle : hold_angle) + hold_damp;
+                // Anti-stall (ver AntiStall_Tick): el STOP es la entrada al
+                // detectar objeto y este hold cubre TODA la reversa hasta la
+                // banda. Si la fricción puede con ANGLE_MAX, sin esto quedaría
+                // clavado cerca del objeto hasta el timeout de 10s y giraría
+                // demasiado cerca. Empuja en el sentido de la corrección.
+                base_setpoint_target += ((hold_err > 0.0f) ? -1.0f : 1.0f) *
+                    AntiStall_Tick(9, 1, ANTISTALL_MAX_REV);
+                brake_setpoint_target = 0.0f;
+            } else {
+                // Dentro de la zona fina: solo el damping (el freno general
+                // de ComputeBrakeSetpointTarget ahora usa la velocidad LENTA
+                // —anti-bamboleo en parado— y acá llegaba ~0.5s tarde, justo
+                // cuando la inercia post-reversa es máxima).
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim + hold_damp;
+                brake_setpoint_target = 0.0f;
+            }
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_LOST_FWD) {
+            // Avance post-180°: PI de velocidad (ver LOST_FWD_* arriba), con deadband
+            // (BRAKE_VEL_DEADBAND) y anti-windup igual que el PI de línea normal.
+            {
+                float lfwd_vel_raw = fmaxf(0.0f, -velocity_est_f);
+                float lfwd_vel     = apply_deadbandf(lfwd_vel_raw, BRAKE_VEL_DEADBAND);
+                float vel_error    = LOST_FWD_SPEED_TARGET - lfwd_vel;
+                float kp           = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;
+                if (!late_cycle) {
+                    if (vel_error > 0.0f) {
+                        lost_fwd_vel_integral += vel_error * dt_ctrl;
+                        lost_fwd_vel_integral = clampf_local(
+                            lost_fwd_vel_integral, 0.0f, LOST_FWD_VEL_I_MAX);
+                    } else {
+                        lost_fwd_vel_integral *= 0.80f;
+                    }
+                }
+                base_setpoint_target = clampf_local(
+                    kp * vel_error + LOST_FWD_KI * lost_fwd_vel_integral,
+                    -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
+
+                // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
+                base_setpoint_target += AntiStall_Tick(1,
+                    base_setpoint_target > 0.0f, ANTISTALL_MAX_FWD);
+            }
+            brake_setpoint_target = 0.0f;
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_LOST_BRAKE) {
+            // Frenado previo al giro 180°: upright con freno de encoders MÁS INTENSO
+            // que el freno estándar de balance (LOST_BRAKE_BOOST), para no alejarse
+            // tanto de donde se perdió la línea antes de empezar a buscar. No se
+            // sube el freno estándar de ComputeBrakeSetpointTarget en general porque
+            // eso reintroduciría la oscilación en balance común (ver fix anterior).
+            base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_target = clampf_local(
+                ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY) * LOST_BRAKE_BOOST,
+                -BRAKE_TILT_MAX, BRAKE_TILT_MAX);
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_LOST_SETTLE) {
+            // Estabilización post-180°: upright con freno de encoders, sin avance
+            base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_EDGE_WAIT) {
+            // Frenado previo al giro (perdida por un extremo), mismo boost que LOST_BRAKE.
+            base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_target = clampf_local(
+                ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY) * LOST_BRAKE_BOOST,
+                -BRAKE_TILT_MAX, BRAKE_TILT_MAX);
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_EDGE_SETTLE) {
+            // Estabilización post-90°: upright con freno de encoders, sin avance
+            base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_EDGE_FWD) {
+            // Avance post-giro: mismo control PI que LOST_FWD, mismo deadband,
+            // mismo integral compartido (los dos estados son mutuamente excluyentes).
+            {
+                float efwd_vel_raw = fmaxf(0.0f, -velocity_est_f);
+                float efwd_vel     = apply_deadbandf(efwd_vel_raw, BRAKE_VEL_DEADBAND);
+                float vel_error    = LOST_FWD_SPEED_TARGET - efwd_vel;
+                float kp           = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;
+                if (!late_cycle) {
+                    if (vel_error > 0.0f) {
+                        lost_fwd_vel_integral += vel_error * dt_ctrl;
+                        lost_fwd_vel_integral = clampf_local(
+                            lost_fwd_vel_integral, 0.0f, LOST_FWD_VEL_I_MAX);
+                    } else {
+                        lost_fwd_vel_integral *= 0.80f;
+                    }
+                }
+                base_setpoint_target = clampf_local(
+                    kp * vel_error + LOST_FWD_KI * lost_fwd_vel_integral,
+                    -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
+                // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
+                base_setpoint_target += AntiStall_Tick(2,
+                    base_setpoint_target > 0.0f, ANTISTALL_MAX_FWD);
+            }
+            brake_setpoint_target = 0.0f;
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_GIVEN_UP) {
+            // Reposo total: ni el giro de 180 ni el de 90 encontraron la línea.
+            // Upright con freno de encoders, sin ningún intento de búsqueda.
+            base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_OBJ_GIRO_ESQUIVE ||
+                   line_state == LINE_STATE_LOST_ROTATE ||
+                   line_state == LINE_STATE_EDGE_ROTATE ||
+                   line_state == LINE_STATE_PERP_ROTATE) {
+            // Rotación: upright sin avance, sin freno de encoders
+            base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_target = 0.0f;
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_OBJ_PAUSA_GIRO) {
+            // Hold post-rotación: upright con freno traslacional, yaw-lock en switch.
+            // 2026-07-14: + hold de POSICIÓN por encoders (ver OBJ_PAUSA_POS_*):
+            // counts netos positivos = avance (ver signo de vel_enc) → inclina
+            // hacia atrás para volver al punto donde terminó el giro, y viceversa.
+            // Gate con obj_hold_start_ms != 0: el ancla se estampa en el case del
+            // estado (que corre después en el ciclo) — el primer ciclo no corrige.
+            float pausa_corr = 0.0f;
+            if (obj_hold_start_ms != 0) {
+                __disable_irq();
+                int32_t pdr = encoder_right - obj_pausa_r0;
+                int32_t pdl = encoder_left  - obj_pausa_l0;
+                __enable_irq();
+                float pausa_drift = (float)(pdr + pdl) * 0.5f;
+                if (fabsf(pausa_drift) > OBJ_PAUSA_POS_DB_COUNTS) {
+                    pausa_corr = clampf_local(-OBJ_PAUSA_POS_KP * pausa_drift,
+                                              -OBJ_PAUSA_POS_MAX, OBJ_PAUSA_POS_MAX);
+                }
+            }
+            base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim + pausa_corr;
+            brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_OBJ_BUSCAR_PARED) {
+            // PI de velocidad (mismo patrón que OBJ_WALL_FWD, target más cauteloso)
+            // en vez de ángulo fijo, que se aceleraba sin límite buscando la pared.
+            {
+                float wa_vel_raw = fmaxf(0.0f, -velocity_est_f);
+                float wa_vel     = apply_deadbandf(wa_vel_raw, BRAKE_VEL_DEADBAND);
+                float vel_error  = OBJ_WALL_APPROACH_SPEED_TARGET - wa_vel;
+                float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;
+                if (!late_cycle) {
+                    if (vel_error > 0.0f) {
+                        obj_wall_vel_integral += vel_error * dt_ctrl;
+                        obj_wall_vel_integral = clampf_local(
+                            obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);
+                    } else {
+                        obj_wall_vel_integral *= 0.80f;
+                    }
+                }
+                base_setpoint_target = clampf_local(
+                    kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,
+                    -OBJ_WALL_BRAKE_ANGLE, OBJ_WALL_APPROACH_ANGLE_MAX);
+                // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
+                base_setpoint_target += AntiStall_Tick(3,
+                    base_setpoint_target > 0.0f, ANTISTALL_MAX_FWD);
+            }
+            brake_setpoint_target = 0.0f;
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_OBJ_BORDEAR_PARED) {
+            // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás, misma
+            // corrección que la reversa pareja (ver switch más abajo). Si todavía hay
+            // velocidad residual de avance, frena primero (upright + freno de encoders)
+            // en vez de arrancar la reversa de golpe con inercia hacia adelante.
+            if (obj_wall_rev_latch) {   // reversa por counts, ver latch (2026-07-10)
+                obj_wall_vel_integral = 0.0f;
+                if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
+                    base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                    brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                } else {
+                    // Anti-stall: mas inclinación si no arranca (tag 5 compartido).
+                    base_setpoint_target  = -OBJ_WALL_REVERSE_ANGLE -
+                        AntiStall_Tick(5, 1, ANTISTALL_MAX_REV);
+                    brake_setpoint_target = 0.0f;
+                }
+            } else {
+                // PI de velocidad (mismo patrón que LOST_FWD/EDGE_FWD): regula la
+                // velocidad de crucero con precisión en vez de ángulo fijo + freno
+                // bang-bang, que aceleraba a fondo hasta cruzar el umbral y frenaba de golpe.
+                float wf_vel_raw = fmaxf(0.0f, -velocity_est_f);
+                float wf_vel     = apply_deadbandf(wf_vel_raw, BRAKE_VEL_DEADBAND);
+                float vel_error  = OBJ_WALL_SPEED_TARGET - wf_vel;
+                float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;
+                if (!late_cycle) {
+                    if (vel_error > 0.0f) {
+                        obj_wall_vel_integral += vel_error * dt_ctrl;
+                        obj_wall_vel_integral = clampf_local(
+                            obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);
+                    } else {
+                        obj_wall_vel_integral *= 0.80f;
+                    }
+                }
+                base_setpoint_target = clampf_local(
+                    kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,
+                    -OBJ_WALL_BRAKE_ANGLE, OBJ_WALL_FWD_ANGLE);
+                // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
+                base_setpoint_target += AntiStall_Tick(4,
+                    base_setpoint_target > 0.0f, ANTISTALL_MAX_FWD);
+                brake_setpoint_target = 0.0f;
+            }
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_OBJ_PARED_LIBRE) {
+            // Mismo esquema que OBJ_WALL_FWD (reversa si demasiado cerca, si no PI de
+            // velocidad avanzando) -- ver comentarios ahí arriba.
+            if (obj_wall_rev_latch) {   // reversa por counts, ver latch (2026-07-10)
+                obj_wall_vel_integral = 0.0f;
+                if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
+                    base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                    brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                } else {
+                    // Anti-stall: mas inclinación si no arranca (tag 5 compartido).
+                    base_setpoint_target  = -OBJ_WALL_REVERSE_ANGLE -
+                        AntiStall_Tick(5, 1, ANTISTALL_MAX_REV);
+                    brake_setpoint_target = 0.0f;
+                }
+            } else {
+                float wf_vel_raw = fmaxf(0.0f, -velocity_est_f);
+                float wf_vel     = apply_deadbandf(wf_vel_raw, BRAKE_VEL_DEADBAND);
+                float vel_error  = OBJ_WALL_SPEED_TARGET - wf_vel;
+                float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;
+                if (!late_cycle) {
+                    if (vel_error > 0.0f) {
+                        obj_wall_vel_integral += vel_error * dt_ctrl;
+                        obj_wall_vel_integral = clampf_local(
+                            obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);
+                    } else {
+                        obj_wall_vel_integral *= 0.80f;
+                    }
+                }
+                base_setpoint_target = clampf_local(
+                    kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,
+                    -OBJ_WALL_BRAKE_ANGLE, OBJ_WALL_FWD_ANGLE);
+                // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
+                base_setpoint_target += AntiStall_Tick(6,
+                    base_setpoint_target > 0.0f, ANTISTALL_MAX_FWD);
+                brake_setpoint_target = 0.0f;
+            }
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else if (line_state == LINE_STATE_OBJ_GIRO_PARED) {
+            // Wall-following girando: upright puro, motores controlados por line_pivot_active.
+            // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás (reversa pareja),
+            // con la misma espera de estabilidad que en OBJ_WALL_FWD antes de arrancar.
+            if (obj_wall_rev_latch) {   // reversa por counts, ver latch (2026-07-10)
+                if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
+                    base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                    brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                } else {
+                    // Anti-stall: mas inclinación si no arranca (tag 5 compartido).
+                    base_setpoint_target  = -OBJ_WALL_REVERSE_ANGLE -
+                        AntiStall_Tick(5, 1, ANTISTALL_MAX_REV);
+                    brake_setpoint_target = 0.0f;
+                }
+            } else {
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_target = 0.0f;
+            }
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        } else {
+            // Línea perdida (LOST/SEARCHING): upright puro.
+            // El robot pasa por LOST un solo ciclo antes de ir a LOST_ROTATE.
+            base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_target = 0.0f;
+            line_enc_angle_corr   = 0.0f;
+            line_reverse_boost    = 0.0f;
+        }
+
+        // Limitador global de velocidad: frena en CUALQUIER sub-estado si se supera el target.
+        // Solo actúa en estados de avance (brake_setpoint_target==0 y base>0) que no tienen
+        // su propio control de frenado; excluye rotaciones y LINE_STATE_FOLLOWING (que ya
+        // regula su propia velocidad con el PI de línea).
+        if (brake_setpoint_target == 0.0f &&
+            base_setpoint_target  >  0.0f &&
+            line_state != LINE_STATE_FOLLOWING &&
+            line_state != LINE_STATE_LOST_ROTATE &&
+            line_state != LINE_STATE_OBJ_GIRO_ESQUIVE  &&
+            line_state != LINE_STATE_EDGE_ROTATE &&
+            line_state != LINE_STATE_PERP_ROTATE &&
+            line_state != LINE_STATE_OBJ_GIRO_PARED &&
+            line_state != LINE_STATE_OBJ_BORDEAR_PARED &&
+            line_state != LINE_STATE_OBJ_PARED_LIBRE &&
+            line_state != LINE_STATE_OBJ_BUSCAR_PARED) {
+            float global_fwd_vel = fmaxf(0.0f, -velocity_est_f);
+            if (global_fwd_vel > LINE_SPEED_TARGET * 0.90f) {
+                float overspeed_brake = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
+                if (overspeed_brake < base_setpoint_target)
+                    base_setpoint_target = overspeed_brake;
+            }
+        }
+
+        line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
+    } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
+        // Control manual normal (joystick/comandos WiFi-USB). El banco de pruebas
+        // del giro de 90° que vivía acá (activado con el joystick en reposo) se
+        // eliminó a pedido del usuario: MANUAL ahora es exclusivamente para mover
+        // el robot con comandos, sin ningún ciclo automático. También se entra
+        // acá con manual_line_override=1 (LINE_FOLLOWING sin ver la línea +
+        // comando activo) — mismo control, reutilizado tal cual.
+        if (HAL_GetTick() - manual_cmd_last_ms > 60) {
+            manual_setpoint_cmd *= 0.96f;
+            manual_steering_cmd *= 0.90f;
+            if (fabsf(manual_setpoint_cmd) < 0.01f) manual_setpoint_cmd = 0.0f;
+            if (fabsf(manual_steering_cmd) < 0.01f) manual_steering_cmd = 0.0f;
+        }
+
+        // Control de velocidad adelante/atrás por PI (mismo patrón que el
+        // seguidor de línea: LINE_VEL_KP/LINE_VEL_KP_BRAKE/LINE_VEL_KI) en vez
+        // del mapeo directo a un ángulo fijo de antes (4°, casi nunca alcanzaba
+        // a vencer la fricción estática — "no logra avanzar ni retroceder").
+        // manual_setpoint_cmd es ahora la velocidad deseada en m/s con signo
+        // (+ adelante, − atrás), seteada por MOVE_FORWARD/BACKWARD en UNER.c
+        // (antes mandaban ±4.0f como grados; ahora mandan ±1.0f como m/s).
+        const float MANUAL_SPEED_MAX    = 1.0f;   // m/s, tope de velocidad
+        const float MANUAL_ANGLE_MAX    = 6.0f;   // °, tope de inclinación de avance
+        const float MANUAL_VEL_KP       = 6.0f;   // ganancia P acelerando
+        const float MANUAL_VEL_KP_BRAKE = 10.0f;  // ganancia P frenando/revirtiendo
+        const float MANUAL_VEL_KI       = 2.0f;
+        const float MANUAL_VEL_I_MAX    = 2.0f;
+
+        float manual_desired_vel = clampf_local(manual_setpoint_cmd, -MANUAL_SPEED_MAX, MANUAL_SPEED_MAX);
+        float manual_actual_vel  = -velocity_est_f; // + adelante, misma convención que el resto del archivo
+        float manual_vel_error   = manual_desired_vel - manual_actual_vel;
+
+        // "Acelerando" = el error empuja en el mismo sentido que la velocidad
+        // deseada: P floja + acumula integral. Si no (frenando o revirtiendo),
+        // P más fuerte y la integral decae — igual que en el seguidor de línea.
+        uint8_t manual_accelerating = (manual_desired_vel >= 0.0f) ? (manual_vel_error >= 0.0f)
+                                                                    : (manual_vel_error <= 0.0f);
+        float manual_vel_kp_eff;
+        if (manual_accelerating) {
+            manual_vel_integral += manual_vel_error * DT_CTRL_FIXED;
+            manual_vel_integral  = clampf_local(manual_vel_integral, -MANUAL_VEL_I_MAX, MANUAL_VEL_I_MAX);
+            manual_vel_kp_eff = MANUAL_VEL_KP;
+        } else {
+            manual_vel_integral *= 0.80f;
+            manual_vel_kp_eff = MANUAL_VEL_KP_BRAKE;
+        }
+
+        float manual_angle_cmd = clampf_local(
+            manual_vel_kp_eff * manual_vel_error + MANUAL_VEL_KI * manual_vel_integral,
+            -MANUAL_ANGLE_MAX, MANUAL_ANGLE_MAX
+        );
+
+        // Anti-stall (ver AntiStall_Tick): con comando activo y el robot sin
+        // moverse, boost en el sentido comandado (el clamp global de 6.0 manda).
+        if (fabsf(manual_setpoint_cmd) > 0.01f && manual_angle_cmd != 0.0f) {
+            float man_boost = AntiStall_Tick(8, 1, ANTISTALL_MAX_MAN);
+            manual_angle_cmd += (manual_angle_cmd > 0.0f) ? man_boost : -man_boost;
+        }
+        manual_setpoint_ramped = manual_angle_cmd; // telemetría/consistencia con el resto del archivo
+        base_setpoint_target   = SETPOINT_ANGLE + setpoint_trim + manual_angle_cmd;
+        // ComputeBrakeSetpointTarget devuelve 0 directo si el estado es
+        // LINE_FOLLOWING (ver la función) — acá "robot_state" sigue siendo
+        // LINE_FOLLOWING durante manual_line_override, así que hay que forzar
+        // MANUAL_CONTROL explícitamente para que SÍ aplique el freno traslacional.
+        brake_setpoint_target = ComputeBrakeSetpointTarget(
+            manual_line_override ? ROBOT_STATE_MANUAL_CONTROL : robot_state
+        );
+    } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
+        base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
+    } else if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
+        // BALANCE_ONLY: tilt setpoint against velocity to brake post-push drift
+        base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+        brake_setpoint_target = ComputeBrakeSetpointTarget(robot_state);
+    } else {
+        base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
+    }
+
+    // Clamp global de setpoint. MANUAL_CONTROL necesita su propia excepción
+    // (6.0, ver MANUAL_ANGLE_MAX arriba) — sin esto, este clamp recortaba en
+    // silencio el tope manual a 5.0 sin que el usuario se enterara.
+    float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f
+                    : (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) ? 6.0f
+                    : 5.0f;
+    base_setpoint_target = clampf_local(base_setpoint_target,
+                                        -sp_limit - brake_setpoint_target,
+                                         sp_limit - brake_setpoint_target);
+
+    dynamic_setpoint = base_setpoint_target + brake_setpoint_target;
+    if (dynamic_setpoint >  sp_limit) dynamic_setpoint =  sp_limit;
+    if (dynamic_setpoint < -sp_limit) dynamic_setpoint = -sp_limit;
+
+    {
+        static float prev_setpoint_trim = 0.0f;
+        float trim_delta = setpoint_trim - prev_setpoint_trim;
+        const float TRIM_STEP = 0.008f;
+        if (trim_delta >  TRIM_STEP) trim_delta =  TRIM_STEP;
+        if (trim_delta < -TRIM_STEP) trim_delta = -TRIM_STEP;
+        if (trim_delta != 0.0f) {
+            prev_setpoint_trim += trim_delta;
+            base_setpoint_f += trim_delta;
+        }
+    }
+
+    {
+        float sp_step_max;
+
+        if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
+            sp_step_max = 0.1f;
+        } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+            sp_step_max = 0.15f;
+        } else {
+            sp_step_max = 0.1f;
+        }
+
+        float sp_delta = base_setpoint_target - base_setpoint_f;
+
+        if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;
+        if (sp_delta < -sp_step_max) sp_delta = -sp_step_max;
+
+        base_setpoint_f += sp_delta;
+    }
+
+    {
+        float brake_step_max = (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override)
+                             ? BRAKE_TILT_STEP_MAN
+                             : BRAKE_TILT_STEP_BAL;
+
+        float brake_delta = brake_setpoint_target - brake_setpoint_f;
+        if (brake_delta >  brake_step_max) brake_delta =  brake_step_max;
+        if (brake_delta < -brake_step_max) brake_delta = -brake_step_max;
+
+        brake_setpoint_f += brake_delta;
+    }
+
+    // Término de posición: integra velocidad para corregir deriva lenta
+    dynamic_setpoint_f = base_setpoint_f + brake_setpoint_f;
+    dynamic_setpoint_f = clampf_local(dynamic_setpoint_f, -sp_limit, sp_limit);
+    // En modo línea el setpoint nunca inclina más de 3° hacia atrás.
+    if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+        if (dynamic_setpoint_f < -3.0f)
+            dynamic_setpoint_f = -3.0f;
+    }
+    brake_setpoint_f   = dynamic_setpoint_f - base_setpoint_f;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 13 — Detección de caída/recuperación con histéresis y contadores
+// de debounce. Al caer o recuperarse resetea todo el estado de control.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_DeteccionCaida(void)
+{
+    float abs_roll_filt = fabsf(filtered_roll_deg);
+    float abs_roll_raw  = fabsf(accel_ang_deg);
+
+    uint8_t upright_now     = (abs_roll_raw < RECOVER_ANGLE);
+    uint8_t upside_down_now = (abs_roll_raw > UPSIDE_DOWN_ANGLE);
+
+    static uint8_t dead_zone_count = 0;
+
+    if (abs_roll_raw >= FALL_ANGLE) {
+        if (dead_zone_count < 10) dead_zone_count++;
+    } else {
+        dead_zone_count = 0;
+    }
+
+    uint8_t in_dead_zone = (dead_zone_count >= 10);
+
+    if (abs_roll_filt > FALL_ANGLE) {
+        if (fall_count < 5) fall_count++;
+    } else {
+        fall_count = 0;
+    }
+    uint8_t fall_by_angle = (fall_count >= 3);
+
+    if (upright_now) {
+        if (upright_count < 20) upright_count++;
+    } else {
+        upright_count = 0;
+    }
+    uint8_t recover_by_angle = (upright_count >= 5);
+
+    if (upside_down_now) {
+        if (upside_down_count < 20) upside_down_count++;
+    } else {
+        upside_down_count = 0;
+    }
+    uint8_t fall_upside_down = (upside_down_count >= 5);
+
+    if (!f_fallen) {
+        if (fall_by_angle || fall_upside_down || in_dead_zone) {
+            f_fallen = 1;
             integral            = 0.0f;
+            balance_hold_active = 0;
+            velocity_est        = 0.0f;
+            velocity_est_f      = 0.0f;
+            velocity_est_slow_f = 0.0f;
+            vel_from_accel      = 0.0f;
             line_integral       = 0.0f;
             line_error_prev     = 0.0f;
             line_error_f_d      = 0.0f;
             steering_adjustment = 0.0f;
-            velocity_est        = 0.0f;
-            velocity_est_f      = 0.0f;
-            velocity_est_slow_f = 0.0f;
-            vel_from_accel      = 0.0f;
-            line_vel_integral   = 0.0f;
-            line_enc_angle_corr = 0.0f;
-            line_reverse_boost  = 0.0f;
-            balance_hold_active = 0;
-            line_steer_fb_int   = 0.0f;
-            speed_right_rps_s   = 0.0f;
-            speed_left_rps_s    = 0.0f;
-            line_state          = LINE_STATE_FOLLOWING;
-            line_seen_since_entry = 0;
-            obj_esquive_dir     = 1;   // esquive alternado: arranca por derecha
-            obj_esquive_next_dir = 1;
-            line_was_centered_on_lost = 1;
-            last_detected_edge_only   = 0;
+            gyro_f              = 0.0f;
+            motorRightVelocity  = 0;
+            motorLeftVelocity   = 0;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
             base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
             brake_setpoint_f    = 0.0f;
-            line_lost_ms        = HAL_GetTick();
-            line_angle_ramped   = 0.0f;
-            obj_pre_rev_start_ms = 0;
+            pwm_sat_prev        = 0.0f;
+            obj_rev_steer_f     = 0.0f;
             lost_fwd_vel_integral = 0.0f;
-            all_black_start_ms  = 0;
-            last_partial_line_ms = 0;
-            obj_final_turn_pending_ms = 0;
-            perp_from_obj_avoidance   = 0;
-            perp_obj_brake_start_ms   = 0;
-            obj_wall_line_confirm_cnt = 0;
-            odom_x_m            = 0.0f;   // odometría: origen = punto de entrada al modo
-            odom_y_m            = 0.0f;
-            odom_theta_deg      = 0.0f;
-            line_loss_pose_valid = 0;     // snapshot viejo queda en el marco anterior
-            lost_ret_ov_active   = 0;
-        }
-
-        if (robot_state != ROBOT_STATE_LINE_FOLLOWING && prev_robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-            f_change_display = display_before_line;  // restaurar display anterior
-        }
-
-        // Sub-estado línea: entrar/salir de modo evasión cambia display 1 ↔ 6
-        {
-            static eLineState prev_line_state_disp = LINE_STATE_FOLLOWING;
-            if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-                int prev_obj = (prev_line_state_disp >= LINE_STATE_OBJ_ESPERA_REVERSA);
-                int curr_obj = (line_state           >= LINE_STATE_OBJ_ESPERA_REVERSA);
-                if (!prev_obj && curr_obj) {
-                    f_change_display = 6;  // entrar en evasión → pantalla OBJ
-                } else if (prev_obj && !curr_obj) {
-                    f_change_display = 1;  // volver al seguidor de línea
-                }
+            obj_wall_vel_integral = 0.0f;
+            manual_vel_integral   = 0.0f;
+            manual_straight_steer_f = 0.0f;
+            obj_rot_initialized = 0;
+            obj_rot_start_ms    = 0;
+            obj_rot_phase       = 0;
+            obj_rot_heading     = 0.0f;
+            obj_rot_phase1_ms   = 0;
+            obj_brake_start_ms   = 0;
+            obj_pre_rotate_ms    = 0;
+            obj_rev_band_enter_ms = 0;
+            obj_hold_start_ms    = 0;
+            obj_wall_approach_start_ms = 0;
+            obj_wall_fwd_start_ms      = 0;
+            obj_wall_lost_ms           = 0;
+            obj_wall_seq_start_ms      = 0;
+            obj_wall_clear_initialized = 0;
+            lrot_brake_start_ms        = 0;
+            lrot_settle_start_ms       = 0;
+            edge_wait_start_ms         = 0;
+            line_quiet_cycles          = 0;
+            lost_ret_ov_active         = 0;
+            // Si se cayó durante la evasión (LINE_STATE_OBJ_*, últimos del enum, de ahí
+            // el ">="), abandona la evasión y vuelve a FOLLOWING en vez de retomarla.
+            if (line_state >= LINE_STATE_OBJ_FRENO_REVERSA) {
+                line_state                 = LINE_STATE_FOLLOWING;
+                line_seen_since_entry      = 0;
+                line_was_centered_on_lost  = 1;
+                last_detected_edge_only    = 0;
+                obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
             }
-            prev_line_state_disp = line_state;
         }
-
-        if (robot_state == ROBOT_STATE_IDLE && prev_robot_state != ROBOT_STATE_IDLE) {
-            integral            = 0.0f;
-            pwm_sat_prev        = 0.0f;
+    } else {
+        if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
+            f_fallen = 0;
+            accel_roll_f      = accel_ang_deg;
+            filtered_roll_deg = accel_ang_deg;
+            integral                  = 0.0f;
+            balance_hold_active       = 0;
+            velocity_est              = 0.0f;
+            velocity_est_f            = 0.0f;
+            velocity_est_slow_f       = 0.0f;
+            vel_from_accel            = 0.0f;
+            line_integral             = 0.0f;
+            line_error_prev           = 0.0f;
+            line_error_f_d            = 0.0f;
+            steering_adjustment       = 0.0f;
             dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
             dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
             base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
             brake_setpoint_f    = 0.0f;
-        }
-
-        if ((robot_state == ROBOT_STATE_BALANCE_ONLY ||
-             robot_state == ROBOT_STATE_BALANCE_AND_SPEED ||
-             robot_state == ROBOT_STATE_MANUAL_CONTROL) &&
-            (prev_robot_state != robot_state)) {
-
-            integral            = 0.0f;
-            steering_adjustment = 0.0f;
-            velocity_est        = 0.0f;
-            velocity_est_f      = 0.0f;
+            upright_count       = 0;
+            upside_down_count   = 0;
+            fall_count          = 0;
+            dead_zone_count     = 0;
+            pwm_sat_prev        = 0.0f;
+            prev_error          = 0.0f;
+        } else {
+            motorRightVelocity = 0;
+            motorLeftVelocity  = 0;
+            gyro_f = 0.0f;
+            filtered_roll_deg = accel_ang_deg;
+            integral           = 0.0f;
+            velocity_est       = 0.0f;
+            velocity_est_f     = 0.0f;
             velocity_est_slow_f = 0.0f;
-            vel_from_accel      = 0.0f;
-            dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
-            dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
-            base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
-            brake_setpoint_f    = 0.0f;
-            pwm_sat_prev        = 0.0f;
-
-            odom_x_m       = 0.0f;   // odometría: origen = punto de entrada al modo
-            odom_y_m       = 0.0f;
-            odom_theta_deg = 0.0f;
-
-            if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                manual_setpoint_cmd     = 0.0f;
-                manual_steering_cmd     = 0.0f;
-                manual_cmd_last_ms      = HAL_GetTick();
-                manual_setpoint_ramped  = 0.0f;
-                manual_vel_integral     = 0.0f;
-                manual_straight_steer_f = 0.0f;
-                steering_adjustment     = 0.0f;
-                obj_rev_steer_f         = 0.0f;
-            }
+            vel_from_accel     = 0.0f;
+            dynamic_setpoint   = SETPOINT_ANGLE + setpoint_trim;
+            dynamic_setpoint_f = SETPOINT_ANGLE + setpoint_trim;
+            base_setpoint_f    = SETPOINT_ANGLE + setpoint_trim;
+            brake_setpoint_f   = 0.0f;
+            steering_adjustment = 0.0f;
         }
+    }
+}
 
-        prev_robot_state = robot_state;
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 14 — PID de balance: error de ángulo → pwm_sat (PWM común).
+// Incluye balance hold, soft zone, saturaciones, slew-rate y anti-windup.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_PIDBalance(void)
+{
+    error   = dynamic_setpoint_f - filtered_roll_deg;
+    float control_error = error;
+    p_term  = 0.0f;
+    i_term  = 0.0f;
+    d_term  = 0.0f;
+    output  = 0.0f;
+    pwm_cmd = 0.0f;
+    pwm_sat = 0.0f;
+    sat_flag = 0;
 
-        // -------------------------------------------------------
-        // SETPOINT DINÁMICO
-        // -------------------------------------------------------
-        float base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-        float brake_setpoint_target = 0.0f;
+    log_p_line = 0.0f;
+    log_i_line = 0.0f;
+    log_d_line = 0.0f;
 
-        if (robot_state == ROBOT_STATE_LINE_FOLLOWING && !manual_line_override) {
-            if (line_state == LINE_STATE_FOLLOWING && line_detected) {
-                // Regulación de velocidad por encoders:
-                // - vel < 0 (avance): reducir ángulo si va muy rápido → frena
-                // - vel > 0 (reversa): scale=1 siempre → ángulo completo → empuja hacia adelante
-                float vel_fwd = fminf(0.0f, velocity_est_f);
-                float vel_scale = fmaxf(0.0f, 1.0f - fabsf(vel_fwd) / (LINE_SPEED_TARGET * 0.9f));
-                float stability_scale = 1.0f;
-                // Referencia: base_setpoint_f (setpoint actual de línea), no el upright (0°).
-                // Sin esto, stability_scale penaliza la inclinación correcta de avance.
-                float balance_err_abs = fabsf(filtered_roll_deg - base_setpoint_f);
-                float gyro_abs = fabsf(gyro_f);
+    if (f_fallen) return;
 
-                if (balance_err_abs > 1.5f)
-                    stability_scale *= fmaxf(0.60f, 1.0f - (balance_err_abs - 1.5f) / 3.0f);
-                if (gyro_abs > 20.0f)
-                    stability_scale *= fmaxf(0.60f, 1.0f - (gyro_abs - 20.0f) / 45.0f);
+    {
+        // PID clásico: output = Kp·e + Ki·∫e·dt + Kd·de/dt
+        // Unidades: error en grados, salida en %PWM (±50 tras saturar).
+        //   P (Kp=4 %PWM/°): reacción inmediata proporcional a la inclinación.
+        //     Solo con P el robot oscila: siempre llega tarde.
+        //   I (Ki=0.1 %PWM/(°·s)): acumula el error sostenido y corrige
+        //     offsets constantes (centro de masa corrido, piso inclinado)
+        //     que el P solo no puede anular. 'integral' se acumula más abajo.
+        //   D (Kd=0.12 %PWM/(°/s)): reacciona a la VELOCIDAD del error —
+        //     frena la caída apenas empieza, antes de que el ángulo crezca.
+        //     Es el término que amortigua la oscilación del P.
+        p_term = KP_value * control_error;
+        i_term = KI_value * integral;
 
-                // Corrección P directa por déficit de velocidad de encoder:
-                // frac=1 cuando el robot está parado, frac=0 cuando alcanza la vel deseada.
-                float enc_deficit = fmaxf(0.0f, line_desired_forward_vel - line_forward_vel);
-                float enc_deficit_frac = (line_desired_forward_vel > 0.01f)
-                    ? clampf_local(enc_deficit / line_desired_forward_vel, 0.0f, 1.0f)
-                    : 0.0f;
-                line_enc_angle_corr = clampf_local(
-                    LINE_ENC_CORR_KP * enc_deficit_frac, 0.0f, LINE_ENC_CORR_MAX);
+        // Derivada numérica por diferencia finita: de/dt ≈ (e_k − e_k−1)/dt.
+        // Amplifica ruido (un salto de 0.1° en 10ms = 10°/s), por eso se
+        // recorta dos veces: la derivada a ±500°/s y el término D a ±15 %PWM.
+        float d_error = (control_error - prev_error) / dt_ctrl;
+        if (d_error >  500.0f) d_error =  500.0f;
+        if (d_error < -500.0f) d_error = -500.0f;
+        d_term = KD_value * d_error;
 
-                float reverse_vel = fmaxf(0.0f, velocity_est_f);
-                float reverse_target = 0.0f;
-                if (reverse_vel > LINE_REV_VEL_START) {
-                    reverse_target = LINE_REV_BOOST_MAX *
-                        clampf_local(
-                            (reverse_vel - LINE_REV_VEL_START) /
-                            (LINE_REV_VEL_FULL - LINE_REV_VEL_START),
-                            0.0f, 1.0f
-                        );
-                    if (stability_scale < 0.75f) stability_scale = 0.75f;
-                }
-
-                float reverse_delta = reverse_target - line_reverse_boost;
-                float reverse_step = (reverse_delta > 0.0f) ? LINE_REV_BOOST_UP : LINE_REV_BOOST_DOWN;
-                if (reverse_delta >  reverse_step) reverse_delta =  reverse_step;
-                if (reverse_delta < -reverse_step) reverse_delta = -reverse_step;
-                line_reverse_boost += reverse_delta;
-
-                if (line_angle_cmd < 0.0f) {
-                    // Freno activo: no aplicar boosts positivos ni vel_scale (que sería 0 y mataría el freno)
-                    base_setpoint_target = line_angle_cmd * stability_scale;
-                } else {
-                    float line_angle_with_boost = clampf_local(
-                        line_angle_cmd + line_enc_angle_corr + line_reverse_boost,
-                        0.0f, LINE_ANGLE + LINE_ENC_CORR_MAX + LINE_REV_BOOST_MAX
-                    );
-                    base_setpoint_target = line_angle_with_boost * vel_scale * stability_scale;
-                }
-            } else if (line_state == LINE_STATE_OBJ_ESPERA_REVERSA) {
-                // Hold pre-reversa: balance estatico con freno de encoders para suavizar transicion.
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_OBJ_RETROCESO) {
-                // Reversa siguiendo linea: PI de velocidad pide inclinacion hacia atras.
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim + line_obj_reverse_angle_cmd;
-                brake_setpoint_target = 0.0f;
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_OBJ_FRENO_REVERSA) {
-                // Frenado post-reversa + hold de distancia por ADC6/ADC8: la reversa
-                // cortó en OBJ_REV_CLEAR_ADC; acá se sostiene esa distancia mientras
-                // dura el STOP. Antes era bang-bang puro con ±2.75° fijos: se pasaba
-                // hacia atrás/adelante y nunca lograba quedarse estable. Ahora la
-                // corrección es proporcional y suave, con una zona fina muerta en el
-                // centro para que pueda asentarse y cumplir la ventana de estabilidad.
-                float front_min = fminf((float)adcAvg[5], (float)adcAvg[7]);
-                float hold_center = OBJ_REV_CLEAR_ADC + 0.5f * OBJ_REV_HOLD_BAND;
-                float hold_err    = hold_center - front_min;  // >0 = quedó cerca → retroceder
-                float hold_abs    = fabsf(hold_err);
-
-                // Término D del hold (2026-07-10): inclinación en contra del
-                // movimiento con la velocidad RÁPIDA de encoders. Es lo que
-                // frena la inercia ANTES de pasarse (en ambos sentidos: yendo
-                // atrás tras el corte de la reversa, y volviendo hacia adelante
-                // no se estrella contra la pared). Ver OBJ_REV_HOLD_KV.
-                // velocity_est_f > 0 = reversa → damp positivo = inclina adelante.
-                float hold_damp = clampf_local(
-                    OBJ_REV_HOLD_KV * apply_deadbandf(velocity_est_f, OBJ_REV_HOLD_VEL_DB),
-                    -OBJ_REV_HOLD_DAMP_MAX, OBJ_REV_HOLD_DAMP_MAX);
-
-                if (hold_abs > OBJ_REV_HOLD_FINE_BAND) {
-                    float hold_mag = clampf_local(
-                        (hold_abs - OBJ_REV_HOLD_FINE_BAND) / OBJ_REV_HOLD_ERR_FOR_MAX,
-                        0.0f, 1.0f);
-                    float hold_angle = OBJ_REV_HOLD_ANGLE_MIN +
-                        (OBJ_REV_HOLD_ANGLE_MAX - OBJ_REV_HOLD_ANGLE_MIN) * hold_mag;
-                    base_setpoint_target = SETPOINT_ANGLE + setpoint_trim +
-                        ((hold_err > 0.0f) ? -hold_angle : hold_angle) + hold_damp;
-                    // Anti-stall (ver AntiStall_Tick): desde 2026-07-14 el STOP es la
-                    // entrada al detectar objeto y este hold cubre TODA la reversa
-                    // hasta la banda (antes eso lo hacía el feedforward de 3.5° de
-                    // OBJ_RETROCESO). Si la fricción puede con ANGLE_MAX (1.6°), sin
-                    // esto quedaría clavado cerca del objeto hasta el timeout de 10s
-                    // y giraría demasiado cerca. Empuja en el sentido de la corrección.
-                    base_setpoint_target += ((hold_err > 0.0f) ? -1.0f : 1.0f) *
-                        AntiStall_Tick(9, 1, ANTISTALL_MAX_REV);
-                    brake_setpoint_target = 0.0f;
-                } else {
-                    // Dentro de la zona fina: solo el damping (el freno general
-                    // de ComputeBrakeSetpointTarget ahora usa la velocidad LENTA
-                    // —anti-bamboleo en parado— y acá llegaba ~0.5s tarde, justo
-                    // cuando la inercia post-reversa es máxima).
-                    base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim + hold_damp;
-                    brake_setpoint_target = 0.0f;
-                }
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_LOST_FWD) {
-                // Avance post-180°: PI de velocidad (ver LOST_FWD_* arriba), con deadband
-                // (BRAKE_VEL_DEADBAND) y anti-windup igual que el PI de línea normal.
-                {
-                    float lfwd_vel_raw = fmaxf(0.0f, -velocity_est_f);
-                    float lfwd_vel     = apply_deadbandf(lfwd_vel_raw, BRAKE_VEL_DEADBAND);
-                    float vel_error    = LOST_FWD_SPEED_TARGET - lfwd_vel;
-                    float kp           = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;
-                    if (!late_cycle) {
-                        if (vel_error > 0.0f) {
-                            lost_fwd_vel_integral += vel_error * dt_ctrl;
-                            lost_fwd_vel_integral = clampf_local(
-                                lost_fwd_vel_integral, 0.0f, LOST_FWD_VEL_I_MAX);
-                        } else {
-                            lost_fwd_vel_integral *= 0.80f;
-                        }
-                    }
-                    base_setpoint_target = clampf_local(
-                        kp * vel_error + LOST_FWD_KI * lost_fwd_vel_integral,
-                        -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
-
-                    // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
-                    base_setpoint_target += AntiStall_Tick(1,
-                        base_setpoint_target > 0.0f, ANTISTALL_MAX_FWD);
-                }
-                brake_setpoint_target = 0.0f;
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_LOST_BRAKE) {
-                // Frenado previo al giro 180°: upright con freno de encoders MÁS INTENSO
-                // que el freno estándar de balance (LOST_BRAKE_BOOST), para no alejarse
-                // tanto de donde se perdió la línea antes de empezar a buscar. No se
-                // sube el freno estándar de ComputeBrakeSetpointTarget en general porque
-                // eso reintroduciría la oscilación en balance común (ver fix anterior).
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_target = clampf_local(
-                    ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY) * LOST_BRAKE_BOOST,
-                    -BRAKE_TILT_MAX, BRAKE_TILT_MAX);
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_LOST_SETTLE) {
-                // Estabilización post-180°: upright con freno de encoders, sin avance
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_EDGE_WAIT) {
-                // Frenado previo al giro (perdida por un extremo), mismo boost que LOST_BRAKE.
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_target = clampf_local(
-                    ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY) * LOST_BRAKE_BOOST,
-                    -BRAKE_TILT_MAX, BRAKE_TILT_MAX);
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_EDGE_SETTLE) {
-                // Estabilización post-90°: upright con freno de encoders, sin avance
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_EDGE_FWD) {
-                // Avance post-giro: mismo control PI que LOST_FWD, mismo deadband,
-                // mismo integral compartido (los dos estados son mutuamente excluyentes).
-                {
-                    float efwd_vel_raw = fmaxf(0.0f, -velocity_est_f);
-                    float efwd_vel     = apply_deadbandf(efwd_vel_raw, BRAKE_VEL_DEADBAND);
-                    float vel_error    = LOST_FWD_SPEED_TARGET - efwd_vel;
-                    float kp           = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;
-                    if (!late_cycle) {
-                        if (vel_error > 0.0f) {
-                            lost_fwd_vel_integral += vel_error * dt_ctrl;
-                            lost_fwd_vel_integral = clampf_local(
-                                lost_fwd_vel_integral, 0.0f, LOST_FWD_VEL_I_MAX);
-                        } else {
-                            lost_fwd_vel_integral *= 0.80f;
-                        }
-                    }
-                    base_setpoint_target = clampf_local(
-                        kp * vel_error + LOST_FWD_KI * lost_fwd_vel_integral,
-                        -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
-                    // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
-                    base_setpoint_target += AntiStall_Tick(2,
-                        base_setpoint_target > 0.0f, ANTISTALL_MAX_FWD);
-                }
-                brake_setpoint_target = 0.0f;
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_GIVEN_UP) {
-                // Reposo total: ni el giro de 180 ni el de 90 encontraron la línea.
-                // Upright con freno de encoders, sin ningún intento de búsqueda.
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_OBJ_GIRO_ESQUIVE ||
-                       line_state == LINE_STATE_LOST_ROTATE ||
-                       line_state == LINE_STATE_EDGE_ROTATE ||
-                       line_state == LINE_STATE_PERP_ROTATE) {
-                // Rotación: upright sin avance, sin freno de encoders
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_target = 0.0f;
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_OBJ_PAUSA_GIRO) {
-                // Hold post-rotación: upright con freno traslacional, yaw-lock en switch.
-                // 2026-07-14: + hold de POSICIÓN por encoders (ver OBJ_PAUSA_POS_*):
-                // counts netos positivos = avance (ver signo de vel_enc) → inclina
-                // hacia atrás para volver al punto donde terminó el giro, y viceversa.
-                // Gate con obj_hold_start_ms != 0: el ancla se estampa en el case del
-                // estado (que corre después en el ciclo) — el primer ciclo no corrige.
-                float pausa_corr = 0.0f;
-                if (obj_hold_start_ms != 0) {
-                    __disable_irq();
-                    int32_t pdr = encoder_right - obj_pausa_r0;
-                    int32_t pdl = encoder_left  - obj_pausa_l0;
-                    __enable_irq();
-                    float pausa_drift = (float)(pdr + pdl) * 0.5f;
-                    if (fabsf(pausa_drift) > OBJ_PAUSA_POS_DB_COUNTS) {
-                        pausa_corr = clampf_local(-OBJ_PAUSA_POS_KP * pausa_drift,
-                                                  -OBJ_PAUSA_POS_MAX, OBJ_PAUSA_POS_MAX);
-                    }
-                }
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim + pausa_corr;
-                brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_OBJ_BUSCAR_PARED) {
-                // PI de velocidad (mismo patrón que OBJ_WALL_FWD, target más cauteloso)
-                // en vez de ángulo fijo, que se aceleraba sin límite buscando la pared.
-                {
-                    float wa_vel_raw = fmaxf(0.0f, -velocity_est_f);
-                    float wa_vel     = apply_deadbandf(wa_vel_raw, BRAKE_VEL_DEADBAND);
-                    float vel_error  = OBJ_WALL_APPROACH_SPEED_TARGET - wa_vel;
-                    float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;
-                    if (!late_cycle) {
-                        if (vel_error > 0.0f) {
-                            obj_wall_vel_integral += vel_error * dt_ctrl;
-                            obj_wall_vel_integral = clampf_local(
-                                obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);
-                        } else {
-                            obj_wall_vel_integral *= 0.80f;
-                        }
-                    }
-                    base_setpoint_target = clampf_local(
-                        kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,
-                        -OBJ_WALL_BRAKE_ANGLE, OBJ_WALL_APPROACH_ANGLE_MAX);
-                    // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
-                    base_setpoint_target += AntiStall_Tick(3,
-                        base_setpoint_target > 0.0f, ANTISTALL_MAX_FWD);
-                }
-                brake_setpoint_target = 0.0f;
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_OBJ_BORDEAR_PARED) {
-                // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás, misma
-                // corrección que la reversa pareja (ver switch más abajo). Si todavía hay
-                // velocidad residual de avance, frena primero (upright + freno de encoders)
-                // en vez de arrancar la reversa de golpe con inercia hacia adelante.
-                if (obj_wall_rev_latch) {   // reversa por counts, ver latch (2026-07-10)
-                    obj_wall_vel_integral = 0.0f;
-                    if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
-                        base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                        brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
-                    } else {
-                        // Anti-stall: mas inclinación si no arranca (tag 5 compartido).
-                        base_setpoint_target  = -OBJ_WALL_REVERSE_ANGLE -
-                            AntiStall_Tick(5, 1, ANTISTALL_MAX_REV);
-                        brake_setpoint_target = 0.0f;
-                    }
-                } else {
-                    // PI de velocidad (mismo patrón que LOST_FWD/EDGE_FWD): regula la
-                    // velocidad de crucero con precisión en vez de ángulo fijo + freno
-                    // bang-bang, que aceleraba a fondo hasta cruzar el umbral y frenaba de golpe.
-                    float wf_vel_raw = fmaxf(0.0f, -velocity_est_f);
-                    float wf_vel     = apply_deadbandf(wf_vel_raw, BRAKE_VEL_DEADBAND);
-                    float vel_error  = OBJ_WALL_SPEED_TARGET - wf_vel;
-                    float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;
-                    if (!late_cycle) {
-                        if (vel_error > 0.0f) {
-                            obj_wall_vel_integral += vel_error * dt_ctrl;
-                            obj_wall_vel_integral = clampf_local(
-                                obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);
-                        } else {
-                            obj_wall_vel_integral *= 0.80f;
-                        }
-                    }
-                    base_setpoint_target = clampf_local(
-                        kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,
-                        -OBJ_WALL_BRAKE_ANGLE, OBJ_WALL_FWD_ANGLE);
-                    // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
-                    base_setpoint_target += AntiStall_Tick(4,
-                        base_setpoint_target > 0.0f, ANTISTALL_MAX_FWD);
-                    brake_setpoint_target = 0.0f;
-                }
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_OBJ_PARED_LIBRE) {
-                // Mismo esquema que OBJ_WALL_FWD (reversa si demasiado cerca, si no PI de
-                // velocidad avanzando) -- ver comentarios ahí arriba.
-                if (obj_wall_rev_latch) {   // reversa por counts, ver latch (2026-07-10)
-                    obj_wall_vel_integral = 0.0f;
-                    if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
-                        base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                        brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
-                    } else {
-                        // Anti-stall: mas inclinación si no arranca (tag 5 compartido).
-                        base_setpoint_target  = -OBJ_WALL_REVERSE_ANGLE -
-                            AntiStall_Tick(5, 1, ANTISTALL_MAX_REV);
-                        brake_setpoint_target = 0.0f;
-                    }
-                } else {
-                    float wf_vel_raw = fmaxf(0.0f, -velocity_est_f);
-                    float wf_vel     = apply_deadbandf(wf_vel_raw, BRAKE_VEL_DEADBAND);
-                    float vel_error  = OBJ_WALL_SPEED_TARGET - wf_vel;
-                    float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;
-                    if (!late_cycle) {
-                        if (vel_error > 0.0f) {
-                            obj_wall_vel_integral += vel_error * dt_ctrl;
-                            obj_wall_vel_integral = clampf_local(
-                                obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);
-                        } else {
-                            obj_wall_vel_integral *= 0.80f;
-                        }
-                    }
-                    base_setpoint_target = clampf_local(
-                        kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,
-                        -OBJ_WALL_BRAKE_ANGLE, OBJ_WALL_FWD_ANGLE);
-                    // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
-                    base_setpoint_target += AntiStall_Tick(6,
-                        base_setpoint_target > 0.0f, ANTISTALL_MAX_FWD);
-                    brake_setpoint_target = 0.0f;
-                }
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else if (line_state == LINE_STATE_OBJ_GIRO_PARED) {
-                // Wall-following girando: upright puro, motores controlados por line_pivot_active.
-                // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás (reversa pareja),
-                // con la misma espera de estabilidad que en OBJ_WALL_FWD antes de arrancar.
-                if (obj_wall_rev_latch) {   // reversa por counts, ver latch (2026-07-10)
-                    if (fabsf(apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND)) > OBJ_WALL_REVERSE_SETTLE_VEL) {
-                        base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                        brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
-                    } else {
-                        // Anti-stall: mas inclinación si no arranca (tag 5 compartido).
-                        base_setpoint_target  = -OBJ_WALL_REVERSE_ANGLE -
-                            AntiStall_Tick(5, 1, ANTISTALL_MAX_REV);
-                        brake_setpoint_target = 0.0f;
-                    }
-                } else {
-                    base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                    brake_setpoint_target = 0.0f;
-                }
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            } else {
-                // Línea perdida (LOST/SEARCHING): upright puro.
-                // El robot pasa por LOST un solo ciclo antes de ir a LOST_ROTATE.
-                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_target = 0.0f;
-                line_enc_angle_corr   = 0.0f;
-                line_reverse_boost    = 0.0f;
-            }
-
-            // Limitador global de velocidad: frena en CUALQUIER sub-estado si se supera el target.
-            // Solo actúa en estados de avance (brake_setpoint_target==0 y base>0) que no tienen
-            // su propio control de frenado; excluye rotaciones y LINE_STATE_FOLLOWING (que ya
-            // regula su propia velocidad con el PI de línea).
-            if (brake_setpoint_target == 0.0f &&
-                base_setpoint_target  >  0.0f &&
-                line_state != LINE_STATE_FOLLOWING &&
-                line_state != LINE_STATE_LOST_ROTATE &&
-                line_state != LINE_STATE_OBJ_GIRO_ESQUIVE  &&
-                line_state != LINE_STATE_EDGE_ROTATE &&
-                line_state != LINE_STATE_PERP_ROTATE &&
-                line_state != LINE_STATE_OBJ_GIRO_PARED &&
-                line_state != LINE_STATE_OBJ_BORDEAR_PARED &&
-                line_state != LINE_STATE_OBJ_PARED_LIBRE &&
-                line_state != LINE_STATE_OBJ_BUSCAR_PARED) {
-                float global_fwd_vel = fmaxf(0.0f, -velocity_est_f);
-                if (global_fwd_vel > LINE_SPEED_TARGET * 0.90f) {
-                    float overspeed_brake = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
-                    if (overspeed_brake < base_setpoint_target)
-                        base_setpoint_target = overspeed_brake;
-                }
-            }
-
-            line_angle_ramped = base_setpoint_target; // mantener variable para telemetría
-        } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
-            // Control manual normal (joystick/comandos WiFi-USB). El banco de pruebas
-            // del giro de 90° que vivía acá (activado con el joystick en reposo) se
-            // eliminó a pedido del usuario: MANUAL ahora es exclusivamente para mover
-            // el robot con comandos, sin ningún ciclo automático. También se entra
-            // acá con manual_line_override=1 (LINE_FOLLOWING sin ver la línea +
-            // comando activo) — mismo control, reutilizado tal cual.
-            if (HAL_GetTick() - manual_cmd_last_ms > 60) {
-                manual_setpoint_cmd *= 0.96f;
-                manual_steering_cmd *= 0.90f;
-                if (fabsf(manual_setpoint_cmd) < 0.01f) manual_setpoint_cmd = 0.0f;
-                if (fabsf(manual_steering_cmd) < 0.01f) manual_steering_cmd = 0.0f;
-            }
-
-            // Control de velocidad adelante/atrás por PI (mismo patrón que el
-            // seguidor de línea: LINE_VEL_KP/LINE_VEL_KP_BRAKE/LINE_VEL_KI) en vez
-            // del mapeo directo a un ángulo fijo de antes (4°, casi nunca alcanzaba
-            // a vencer la fricción estática — "no logra avanzar ni retroceder").
-            // manual_setpoint_cmd es ahora la velocidad deseada en m/s con signo
-            // (+ adelante, − atrás), seteada por MOVE_FORWARD/BACKWARD en UNER.c
-            // (antes mandaban ±4.0f como grados; ahora mandan ±1.0f como m/s).
-            const float MANUAL_SPEED_MAX    = 1.0f;   // m/s, tope de velocidad
-            const float MANUAL_ANGLE_MAX    = 6.0f;   // °, tope de inclinación de avance
-            const float MANUAL_VEL_KP       = 6.0f;   // ganancia P acelerando
-            const float MANUAL_VEL_KP_BRAKE = 10.0f;  // ganancia P frenando/revirtiendo
-            const float MANUAL_VEL_KI       = 2.0f;
-            const float MANUAL_VEL_I_MAX    = 2.0f;
-
-            float manual_desired_vel = clampf_local(manual_setpoint_cmd, -MANUAL_SPEED_MAX, MANUAL_SPEED_MAX);
-            float manual_actual_vel  = -velocity_est_f; // + adelante, misma convención que el resto del archivo
-            float manual_vel_error   = manual_desired_vel - manual_actual_vel;
-
-            // "Acelerando" = el error empuja en el mismo sentido que la velocidad
-            // deseada: P floja + acumula integral. Si no (frenando o revirtiendo),
-            // P más fuerte y la integral decae — igual que en el seguidor de línea.
-            uint8_t manual_accelerating = (manual_desired_vel >= 0.0f) ? (manual_vel_error >= 0.0f)
-                                                                        : (manual_vel_error <= 0.0f);
-            float manual_vel_kp_eff;
-            if (manual_accelerating) {
-                manual_vel_integral += manual_vel_error * DT_CTRL_FIXED;
-                manual_vel_integral  = clampf_local(manual_vel_integral, -MANUAL_VEL_I_MAX, MANUAL_VEL_I_MAX);
-                manual_vel_kp_eff = MANUAL_VEL_KP;
-            } else {
-                manual_vel_integral *= 0.80f;
-                manual_vel_kp_eff = MANUAL_VEL_KP_BRAKE;
-            }
-
-            float manual_angle_cmd = clampf_local(
-                manual_vel_kp_eff * manual_vel_error + MANUAL_VEL_KI * manual_vel_integral,
-                -MANUAL_ANGLE_MAX, MANUAL_ANGLE_MAX
-            );
-
-            // Anti-stall (ver AntiStall_Tick): con comando activo y el robot sin
-            // moverse, boost en el sentido comandado (el clamp global de 6.0 manda).
-            if (fabsf(manual_setpoint_cmd) > 0.01f && manual_angle_cmd != 0.0f) {
-                float man_boost = AntiStall_Tick(8, 1, ANTISTALL_MAX_MAN);
-                manual_angle_cmd += (manual_angle_cmd > 0.0f) ? man_boost : -man_boost;
-            }
-            manual_setpoint_ramped = manual_angle_cmd; // telemetría/consistencia con el resto del archivo
-            base_setpoint_target   = SETPOINT_ANGLE + setpoint_trim + manual_angle_cmd;
-            // ComputeBrakeSetpointTarget devuelve 0 directo si el estado es
-            // LINE_FOLLOWING (ver la función) — acá "robot_state" sigue siendo
-            // LINE_FOLLOWING durante manual_line_override, así que hay que forzar
-            // MANUAL_CONTROL explícitamente para que SÍ aplique el freno traslacional.
-            brake_setpoint_target = ComputeBrakeSetpointTarget(
-                manual_line_override ? ROBOT_STATE_MANUAL_CONTROL : robot_state
-            );
-        } else if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
-            base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
-        } else if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
-            // BALANCE_ONLY: tilt setpoint against velocity to brake post-push drift
-            base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-            brake_setpoint_target = ComputeBrakeSetpointTarget(robot_state);
-        } else {
-            base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
-        }
-
-        // Clamp global de setpoint; OBJ_REVERSE tiene excepción propia (9.0) para permitir
-        // más inclinación hacia atrás que el límite general de 5.0. MANUAL_CONTROL
-        // también necesita su propia excepción (6.0, ver MANUAL_ANGLE_MAX arriba) —
-        // sin esto, este clamp recortaba en silencio el nuevo tope a 5.0 sin que el
-        // usuario se enterara (mismo patrón de bug ya visto antes con OBJ_REVERSE).
-        float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f
-                        : (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) ? 6.0f
-                        : (line_state == LINE_STATE_OBJ_RETROCESO)         ? 9.0f
-                        : 5.0f;
-        base_setpoint_target = clampf_local(base_setpoint_target,
-                                            -sp_limit - brake_setpoint_target,
-                                             sp_limit - brake_setpoint_target);
-
-        dynamic_setpoint = base_setpoint_target + brake_setpoint_target;
-        if (dynamic_setpoint >  sp_limit) dynamic_setpoint =  sp_limit;
-        if (dynamic_setpoint < -sp_limit) dynamic_setpoint = -sp_limit;
+        if (d_term >  15.0f) d_term =  15.0f;
+        if (d_term < -15.0f) d_term = -15.0f;
 
         {
-            static float prev_setpoint_trim = 0.0f;
-            float trim_delta = setpoint_trim - prev_setpoint_trim;
-            const float TRIM_STEP = 0.008f;
-            if (trim_delta >  TRIM_STEP) trim_delta =  TRIM_STEP;
-            if (trim_delta < -TRIM_STEP) trim_delta = -TRIM_STEP;
-            if (trim_delta != 0.0f) {
-                prev_setpoint_trim += trim_delta;
-                base_setpoint_f += trim_delta;
-            }
-        }
+            float abs_error = fabsf(error);
+            float abs_gyro  = fabsf(gyro_f);
+            float balance_pi_scale = 1.0f;
+            float balance_d_scale  = 1.0f;
 
-        {
-            float sp_step_max;
-
-            if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
-                sp_step_max = 0.1f;
-            } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
-                       line_state == LINE_STATE_OBJ_RETROCESO) {
-                // Rampa rápida para el empujón inicial de la reversa (vencer fricción estática)
-                sp_step_max = 0.6f;
-            } else if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-                sp_step_max = 0.15f;
-            } else {
-                sp_step_max = 0.1f;
-            }
-
-            float sp_delta = base_setpoint_target - base_setpoint_f;
-
-            if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;
-            if (sp_delta < -sp_step_max) sp_delta = -sp_step_max;
-
-            base_setpoint_f += sp_delta;
-        }
-
-        {
-            float brake_step_max = (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override)
-                                 ? BRAKE_TILT_STEP_MAN
-                                 : BRAKE_TILT_STEP_BAL;
-
-            float brake_delta = brake_setpoint_target - brake_setpoint_f;
-            if (brake_delta >  brake_step_max) brake_delta =  brake_step_max;
-            if (brake_delta < -brake_step_max) brake_delta = -brake_step_max;
-
-            brake_setpoint_f += brake_delta;
-        }
-
-        // Término de posición: integra velocidad para corregir deriva lenta
-        dynamic_setpoint_f = base_setpoint_f + brake_setpoint_f;
-        dynamic_setpoint_f = clampf_local(dynamic_setpoint_f, -sp_limit, sp_limit);
-        // En modo línea: FOLLOWING frena hasta -3.0°; OBJ_REVERSE permite inclinar más hacia atrás.
-        if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-            float line_negative_limit = (line_state == LINE_STATE_OBJ_RETROCESO)
-                                      ? LINE_OBJ_REV_TILT_MAX
-                                      : 3.0f;
-            if (dynamic_setpoint_f < -line_negative_limit)
-                dynamic_setpoint_f = -line_negative_limit;
-        }
-        brake_setpoint_f   = dynamic_setpoint_f - base_setpoint_f;
-
-        // -------------------------------------------------------
-        // FALL DETECTION
-        // -------------------------------------------------------
-        float abs_roll_filt = fabsf(filtered_roll_deg);
-        float abs_roll_raw  = fabsf(accel_ang_deg);
-
-        uint8_t upright_now     = (abs_roll_raw < RECOVER_ANGLE);
-        uint8_t upside_down_now = (abs_roll_raw > UPSIDE_DOWN_ANGLE);
-
-        static uint8_t dead_zone_count = 0;
-
-        if (abs_roll_raw >= FALL_ANGLE) {
-            if (dead_zone_count < 10) dead_zone_count++;
-        } else {
-            dead_zone_count = 0;
-        }
-
-        uint8_t in_dead_zone = (dead_zone_count >= 10);
-
-        if (abs_roll_filt > FALL_ANGLE) {
-            if (fall_count < 5) fall_count++;
-        } else {
-            fall_count = 0;
-        }
-        uint8_t fall_by_angle = (fall_count >= 3);
-
-        if (upright_now) {
-            if (upright_count < 20) upright_count++;
-        } else {
-            upright_count = 0;
-        }
-        uint8_t recover_by_angle = (upright_count >= 5);
-
-        if (upside_down_now) {
-            if (upside_down_count < 20) upside_down_count++;
-        } else {
-            upside_down_count = 0;
-        }
-        uint8_t fall_upside_down = (upside_down_count >= 5);
-
-        if (!f_fallen) {
-            if (fall_by_angle || fall_upside_down || in_dead_zone) {
-                f_fallen = 1;
-                integral            = 0.0f;
-                balance_hold_active = 0;
-                velocity_est        = 0.0f;
-                velocity_est_f      = 0.0f;
-                velocity_est_slow_f = 0.0f;
-                vel_from_accel      = 0.0f;
-                line_integral       = 0.0f;
-                line_error_prev     = 0.0f;
-                line_error_f_d      = 0.0f;
-                steering_adjustment = 0.0f;
-                gyro_f              = 0.0f;
-                motorRightVelocity  = 0;
-                motorLeftVelocity   = 0;
-                dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
-                dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
-                base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_f    = 0.0f;
-                pwm_sat_prev        = 0.0f;
-                obj_rev_initialized = 0;
-                obj_rev_steer_f     = 0.0f;
-                lost_fwd_vel_integral = 0.0f;
-                obj_wall_vel_integral = 0.0f;
-                manual_vel_integral   = 0.0f;
-                manual_straight_steer_f = 0.0f;
-                obj_rot_initialized = 0;
-                obj_rot_start_ms    = 0;
-                obj_rot_phase       = 0;
-                obj_rot_heading     = 0.0f;
-                obj_rot_phase1_ms   = 0;
-                obj_brake_start_ms   = 0;
-                obj_pre_rotate_ms    = 0;
-                obj_rev_band_enter_ms = 0;
-                obj_hold_start_ms    = 0;
-                obj_arc_steer_int    = 0.0f;
-                obj_wall_approach_start_ms = 0;
-                obj_wall_fwd_start_ms      = 0;
-                obj_wall_lost_ms           = 0;
-                obj_wall_seq_start_ms      = 0;
-                obj_wall_clear_initialized = 0;
-                lrot_brake_start_ms        = 0;
-                lrot_settle_start_ms       = 0;
-                edge_wait_start_ms         = 0;
-                line_quiet_cycles          = 0;
-                lost_ret_ov_active         = 0;
-                // Si se cayó durante la evasión (LINE_STATE_OBJ_*, últimos del enum, de ahí
-                // el ">="), abandona la evasión y vuelve a FOLLOWING en vez de retomarla.
-                if (line_state >= LINE_STATE_OBJ_ESPERA_REVERSA) {
-                    line_state                 = LINE_STATE_FOLLOWING;
-                    line_seen_since_entry      = 0;
-                    line_was_centered_on_lost  = 1;
-                    last_detected_edge_only    = 0;
-                    obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
-                }
-            }
-        } else {
-            if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
-                f_fallen = 0;
-                accel_roll_f      = accel_ang_deg;
-                filtered_roll_deg = accel_ang_deg;
-                integral                  = 0.0f;
-                balance_hold_active       = 0;
-                velocity_est              = 0.0f;
-                velocity_est_f            = 0.0f;
-                velocity_est_slow_f       = 0.0f;
-                vel_from_accel            = 0.0f;
-                line_integral             = 0.0f;
-                line_error_prev           = 0.0f;
-                line_error_f_d            = 0.0f;
-                steering_adjustment       = 0.0f;
-                dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
-                dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
-                base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_f    = 0.0f;
-                upright_count       = 0;
-                upside_down_count   = 0;
-                fall_count          = 0;
-                dead_zone_count     = 0;
-                pwm_sat_prev        = 0.0f;
-                prev_error          = 0.0f;
-            } else {
-                motorRightVelocity = 0;
-                motorLeftVelocity  = 0;
-                gyro_f = 0.0f;
-                filtered_roll_deg = accel_ang_deg;
-                integral           = 0.0f;
-				velocity_est       = 0.0f;
-				velocity_est_f     = 0.0f;
-				velocity_est_slow_f = 0.0f;
-				vel_from_accel     = 0.0f;
-                dynamic_setpoint   = SETPOINT_ANGLE + setpoint_trim;
-                dynamic_setpoint_f = SETPOINT_ANGLE + setpoint_trim;
-                base_setpoint_f    = SETPOINT_ANGLE + setpoint_trim;
-                brake_setpoint_f   = 0.0f;
-				steering_adjustment = 0.0f;
-            }
-        }
-
-        // -------------------------------------------------------
-        // PID
-        // -------------------------------------------------------
-        float error   = dynamic_setpoint_f - filtered_roll_deg;
-        float control_error = error;
-        float p_term  = 0.0f;
-        float i_term  = 0.0f;
-        float d_term  = 0.0f;
-        float output  = 0.0f;
-        float pwm_cmd = 0.0f;
-        float pwm_sat = 0.0f;
-        uint8_t sat_flag = 0;
-
-        float log_p_line = 0.0f;
-        float log_i_line = 0.0f;
-        float log_d_line = 0.0f;
-
-        if (!f_fallen) {
-            p_term = KP_value * control_error;
-            i_term = KI_value * integral;
-
-            float d_error = (control_error - prev_error) / dt_ctrl;
-            if (d_error >  500.0f) d_error =  500.0f;
-            if (d_error < -500.0f) d_error = -500.0f;
-            d_term = KD_value * d_error;
-
-            if (d_term >  15.0f) d_term =  15.0f;
-            if (d_term < -15.0f) d_term = -15.0f;
-
-            {
-                float abs_error = fabsf(error);
-                float abs_gyro  = fabsf(gyro_f);
-                float balance_pi_scale = 1.0f;
-                float balance_d_scale  = 1.0f;
-
-                // Excluye también LOST_FWD/EDGE_FWD/OBJ_RETROCESO/OBJ_BUSCAR_PARED: sin
-                // esto, el hold se activa con error chico y silencia el PID justo cuando
-                // debe empujar. OBJ_BUSCAR_PARED (avance post-giro de 90° buscando la
-                // pared) se agregó porque "casi no avanza" — mismo patrón de bug.
-                // MANUAL_CONTROL nunca había tenido esta exclusión: con un comando de
-                // adelante/atrás activo, apenas la inclinación real se acercaba al
-                // setpoint (error chico) el hold entraba y ponía balance_pi_scale=0,
-                // matando la autoridad del PID justo cuando tenía que sostener el
-                // avance — la causa real de "el comando llega pero no logra avanzar
-                // ni retroceder". Solo se excluye mientras hay un comando activo
-                // (manual_setpoint_cmd != 0); con el robot realmente idle en MANUAL,
-                // el hold sigue sosteniendo el balance estático como antes.
-                if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
-                    (line_detected ||
-                     line_state == LINE_STATE_LOST_FWD ||
-                     line_state == LINE_STATE_EDGE_FWD ||
-                     line_state == LINE_STATE_OBJ_RETROCESO ||
-                     // STOP post-reversa: el hold de distancia corrige con solo ±2° —
-                     // si el hold de balance silencia el PID ahí, la corrección no mueve.
-                     line_state == LINE_STATE_OBJ_FRENO_REVERSA ||
-                     line_state == LINE_STATE_OBJ_BUSCAR_PARED ||
-                     // Estados de pared: la reversa pareja arranca desde parado con
-                     // solo 3° — si el hold silencia el PID ahí, el robot queda quieto
-                     // (mismo patrón de bug ya arreglado en RETROCESO/BUSCAR_PARED).
-                     line_state == LINE_STATE_OBJ_BORDEAR_PARED ||
-                     line_state == LINE_STATE_OBJ_PARED_LIBRE ||
-                     line_state == LINE_STATE_OBJ_GIRO_PARED))
-                    balance_hold_active = 0;
-                else if ((robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) &&
-                         fabsf(manual_setpoint_cmd) > 0.01f)
-                    balance_hold_active = 0;
-                else if (!balance_hold_active) {
-                    if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
-                        abs_gyro  <= BALANCE_HOLD_ENTER_GYRO_DPS)
-                        balance_hold_active = 1;
-                } else {
-                    if (abs_error >= BALANCE_HOLD_EXIT_ANGLE_DEG ||
-                        abs_gyro  >= BALANCE_HOLD_EXIT_GYRO_DPS)
-                        balance_hold_active = 0;
-                }
-
-                {
-                    float x = abs_error / SOFT_ZONE_ANGLE_DEG;
-                    if (x > 1.0f) x = 1.0f;
-                    float soft_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;
-
-                    if (balance_hold_active) {
-                        // Hold: silencia P/I (sin chatter por offset residual de
-                        // angulo) pero deja el D VIVO — parado de verdad D~0 igual
-                        // (gyro en cero), y apenas el robot empieza a caerse el D
-                        // frena la caida ANTES de que el error cruce el umbral de
-                        // salida del hold. Con D tambien apagado (version previa,
-                        // hasta 2026-07-10) el hold era "motores muertos hasta que
-                        // la caida ya tomo impulso" -> bamboleo permanente.
-                        balance_pi_scale = 0.0f;
-                        balance_d_scale  = soft_scale;
-                        integral *= 0.98f;
-                    } else {
-                        balance_pi_scale = soft_scale;
-                        balance_d_scale  = soft_scale;
-                    }
-                }
-
-                p_term *= balance_pi_scale;
-                d_term *= balance_d_scale;
-            }
-
-            output = p_term + i_term + d_term;
-
-            prev_error = control_error;
-            pwm_cmd = output;
-            pwm_sat = pwm_cmd;
-
-            if (pwm_sat >  50.0f) { pwm_sat =  50.0f; sat_flag = 1; }
-            if (pwm_sat < -50.0f) { pwm_sat = -50.0f; sat_flag = 1; }
-
+            // Excluye también LOST_FWD/EDGE_FWD/OBJ_BUSCAR_PARED: sin
+            // esto, el hold se activa con error chico y silencia el PID justo cuando
+            // debe empujar. OBJ_BUSCAR_PARED (avance post-giro de 90° buscando la
+            // pared) se agregó porque "casi no avanza" — mismo patrón de bug.
+            // MANUAL_CONTROL nunca había tenido esta exclusión: con un comando de
+            // adelante/atrás activo, apenas la inclinación real se acercaba al
+            // setpoint (error chico) el hold entraba y ponía balance_pi_scale=0,
+            // matando la autoridad del PID justo cuando tenía que sostener el
+            // avance — la causa real de "el comando llega pero no logra avanzar
+            // ni retroceder". Solo se excluye mientras hay un comando activo
+            // (manual_setpoint_cmd != 0); con el robot realmente idle en MANUAL,
+            // el hold sigue sosteniendo el balance estático como antes.
             if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
-                line_state == LINE_STATE_FOLLOWING && !manual_line_override) {
-                if (pwm_sat >  40.0f) pwm_sat =  40.0f;
-                if (pwm_sat < -40.0f) pwm_sat = -40.0f;
-            }
-
-            if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
-                if (pwm_sat >  55.0f) pwm_sat =  55.0f;
-                if (pwm_sat < -55.0f) pwm_sat = -55.0f;
-            }
-
-            float pwm_limit;
-            if (robot_state == ROBOT_STATE_LINE_FOLLOWING && !manual_line_override) {
-                pwm_limit = 40.0f;
+                (line_detected ||
+                 line_state == LINE_STATE_LOST_FWD ||
+                 line_state == LINE_STATE_EDGE_FWD ||
+                 // STOP post-reversa: el hold de distancia corrige con solo ±2° —
+                 // si el hold de balance silencia el PID ahí, la corrección no mueve.
+                 line_state == LINE_STATE_OBJ_FRENO_REVERSA ||
+                 line_state == LINE_STATE_OBJ_BUSCAR_PARED ||
+                 // Estados de pared: la reversa pareja arranca desde parado con
+                 // solo 3° — si el hold silencia el PID ahí, el robot queda quieto
+                 // (mismo patrón de bug ya arreglado en RETROCESO/BUSCAR_PARED).
+                 line_state == LINE_STATE_OBJ_BORDEAR_PARED ||
+                 line_state == LINE_STATE_OBJ_PARED_LIBRE ||
+                 line_state == LINE_STATE_OBJ_GIRO_PARED))
+                balance_hold_active = 0;
+            else if ((robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) &&
+                     fabsf(manual_setpoint_cmd) > 0.01f)
+                balance_hold_active = 0;
+            else if (!balance_hold_active) {
+                if (abs_error <= BALANCE_HOLD_ENTER_ANGLE_DEG &&
+                    abs_gyro  <= BALANCE_HOLD_ENTER_GYRO_DPS)
+                    balance_hold_active = 1;
             } else {
-                pwm_limit = 100.0f;
+                if (abs_error >= BALANCE_HOLD_EXIT_ANGLE_DEG ||
+                    abs_gyro  >= BALANCE_HOLD_EXIT_GYRO_DPS)
+                    balance_hold_active = 0;
             }
 
             {
-                float pwm_step_max;
+                // Soft zone: interpolación lineal de la ganancia efectiva.
+                // x = |error|/1.5° (recortado a 1) es "qué tan lejos del
+                // equilibrio estoy" en escala 0..1; soft_scale recorre la
+                // recta de 0.35 (error 0) a 1.0 (error ≥ 1.5°). Cerca del
+                // equilibrio el PID trabaja al 35% para no vibrar por ruido
+                // de sensor; lejos recupera autoridad completa.
+                float x = abs_error / SOFT_ZONE_ANGLE_DEG;
+                if (x > 1.0f) x = 1.0f;
+                float soft_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;
 
-                if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
-                    pwm_step_max = 8.0f;
+                if (balance_hold_active) {
+                    // Hold: silencia P/I (sin chatter por offset residual de
+                    // angulo) pero deja el D VIVO — parado de verdad D~0 igual
+                    // (gyro en cero), y apenas el robot empieza a caerse el D
+                    // frena la caida ANTES de que el error cruce el umbral de
+                    // salida del hold. Con D tambien apagado (version previa,
+                    // hasta 2026-07-10) el hold era "motores muertos hasta que
+                    // la caida ya tomo impulso" -> bamboleo permanente.
+                    balance_pi_scale = 0.0f;
+                    balance_d_scale  = soft_scale;
+                    integral *= 0.98f;
                 } else {
-                    pwm_step_max = 8.0f;
+                    balance_pi_scale = soft_scale;
+                    balance_d_scale  = soft_scale;
                 }
-
-                float pwm_delta = pwm_sat - pwm_sat_prev;
-                if (pwm_delta >  pwm_step_max) pwm_delta =  pwm_step_max;
-                if (pwm_delta < -pwm_step_max) pwm_delta = -pwm_step_max;
-
-                pwm_sat = pwm_sat_prev + pwm_delta;
-                pwm_sat_prev = pwm_sat;
             }
 
-            if (!late_cycle) {
-                if (fabsf(pwm_sat) <= pwm_limit) {
-                    integral += control_error * dt_ctrl;
-                } else {
-                    if (pwm_cmd >  pwm_limit && control_error < 0) integral += control_error * dt_ctrl;
-                    else if (pwm_cmd < -pwm_limit && control_error > 0) integral += control_error * dt_ctrl;
-                }
-            }
+            p_term *= balance_pi_scale;
+            d_term *= balance_d_scale;
+        }
 
-            sat_flag = (fabsf(pwm_sat) >= pwm_limit) ? 1 : 0;
+        output = p_term + i_term + d_term;
 
-            if (integral >  I_MAX) integral =  I_MAX;
-            if (integral < -I_MAX) integral = -I_MAX;
+        prev_error = control_error;
+        pwm_cmd = output;
+        pwm_sat = pwm_cmd;
+
+        if (pwm_sat >  50.0f) { pwm_sat =  50.0f; sat_flag = 1; }
+        if (pwm_sat < -50.0f) { pwm_sat = -50.0f; sat_flag = 1; }
+
+        if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
+            line_state == LINE_STATE_FOLLOWING && !manual_line_override) {
+            if (pwm_sat >  40.0f) pwm_sat =  40.0f;
+            if (pwm_sat < -40.0f) pwm_sat = -40.0f;
+        }
+
+        if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
+            if (pwm_sat >  55.0f) pwm_sat =  55.0f;
+            if (pwm_sat < -55.0f) pwm_sat = -55.0f;
+        }
+
+        float pwm_limit;
+        if (robot_state == ROBOT_STATE_LINE_FOLLOWING && !manual_line_override) {
+            pwm_limit = 40.0f;
+        } else {
+            pwm_limit = 100.0f;
+        }
+
+        {
+            // Limitador de slew-rate: el PWM no puede cambiar más de 8
+            // unidades por ciclo (8%/10ms = 800%/s, alcanza el tope ±50 en
+            // ~60ms). Recorta el ESCALÓN, no el valor: suaviza golpes
+            // mecánicos y picos de corriente sin limitar la autoridad final.
+            float pwm_step_max;
 
             if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
-                if (integral >  8.0f) integral =  8.0f;
-                if (integral < -8.0f) integral = -8.0f;
+                pwm_step_max = 8.0f;
+            } else {
+                pwm_step_max = 8.0f;
             }
 
-            if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-                if (integral >  8.0f) integral =  8.0f;
-                if (integral < -8.0f) integral = -8.0f;
-            }
-
-            if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
-                if (integral >  15.0f) integral =  15.0f;
-                if (integral < -15.0f) integral = -15.0f;
-            }
-
-            if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
-                if (integral >  8.0f) integral =  8.0f;
-                if (integral < -8.0f) integral = -8.0f;
-            }
-
-            if (robot_state == ROBOT_STATE_LINE_FOLLOWING && !manual_line_override) {
-                uint8_t line_pivot_active = 0;
-
-                switch (line_state) {
-                    case LINE_STATE_FOLLOWING:
-                    {
-                        if (line_detected) {
-                            line_seen_since_entry = 1;
-                            line_lost_ms = HAL_GetTick();
-
-                            // Snapshot de pose para el retorno por odometría: si más
-                            // adelante se pierde la línea, este es el punto al que volver.
-                            line_loss_x_m        = odom_x_m;
-                            line_loss_y_m        = odom_y_m;
-                            line_loss_pose_valid = 1;
-
-                            float p_line = KP_LINE * line_error;
-
-                            if (!late_cycle) {
-                                line_integral += line_error * dt_ctrl;
-                            }
-
-                            if (line_integral >  5.0f) line_integral =  5.0f;
-                            if (line_integral < -5.0f) line_integral = -5.0f;
-
-                            float i_line = KI_LINE * line_integral;
-
-                            line_error_f_d += 0.4f * (line_error - line_error_f_d);
-
-                            float d_line = 0.0f;
-                            if (!late_cycle) {
-                                float line_delta = line_error_f_d - line_error_prev;
-                                if (line_delta >  0.3f) line_delta =  0.3f;
-                                if (line_delta < -0.3f) line_delta = -0.3f;
-                                d_line = KD_LINE * (line_delta / dt_ctrl);
-                            }
-                            line_error_prev = line_error_f_d;
-
-                            float steering_cmd = p_line + i_line + d_line;
-
-                            // Steering directo: proporcional al error de línea sin inner PI.
-                            // El inner PI de encoders generaba problemas si el signo de
-                            // diff_actual no coincidía con la convención esperada.
-                            steering_adjustment = clampf_local(steering_cmd, -20.0f, 20.0f);
-
-                            log_p_line = p_line;
-                            log_i_line = i_line;
-                            log_d_line = d_line;
-
-                        } else {
-                            if (!line_seen_since_entry) {
-                                // Todavía no adquirió la línea desde que se activó el modo:
-                                // mejor quedarse estable que disparar una búsqueda ciega.
-                                line_lost_ms = HAL_GetTick();
-                                line_integral = 0.0f;
-                                steering_adjustment = 0.0f;
-                                break;
-                            }
-                            uint32_t ms_sin_linea = HAL_GetTick() - line_lost_ms;
-
-                            // Sin línea: conservar steering_adjustment (último valor conocido)
-                            // para que el robot siga corrigiendo hacia la línea.
-
-                            // 150ms (1000→300→150): frenar apenas se confirma la pérdida
-                            // para no alejarse del punto y llegar al giro de 180° con la
-                            // menor velocidad posible. Sigue filtrando parpadeos de sensor
-                            // (un flicker real dura pocos ciclos de 10ms).
-                            if (ms_sin_linea > 150) {
-                                line_search_dir      = last_line_dir;
-                                line_integral        = 0.0f;
-                                steering_adjustment  = 0.0f;
-                                // Snapshot: ¿el último sensor con señal fue un extremo sin
-                                // soporte del medio, o vino acompañado/era del medio?
-                                line_was_centered_on_lost = !last_detected_edge_only;
-                                last_detected_edge_only   = 0;
-                                // Centrado → secuencia de giro 180° (LOST/LOST_BRAKE/LOST_ROTATE).
-                                // Por un extremo (curva) → secuencia de giro 90° hacia ese lado
-                                // (EDGE_WAIT/EDGE_ROTATE/EDGE_FWD).
-                                line_state = line_was_centered_on_lost
-                                           ? LINE_STATE_LOST
-                                           : LINE_STATE_EDGE_WAIT;
-                                lrot_brake_start_ms = 0;
-                            }
-                        }
-
-                        if (steering_adjustment >  20.0f) steering_adjustment =  20.0f;
-                        if (steering_adjustment < -20.0f) steering_adjustment = -20.0f;
-                        break;
-                    }
-
-                    case LINE_STATE_LOST:
-                    case LINE_STATE_SEARCHING:
-                        // Sin línea: frenar primero, luego girar 180°.
-                        if (line_detected) {
-                            line_seen_since_entry = 1;
-                            line_integral       = 0.0f;
-                            line_error_prev     = 0.0f;
-                            line_lost_ms        = HAL_GetTick();
-                            line_steer_fb_int   = 0.0f;
-                            line_state          = LINE_STATE_FOLLOWING;
-                        } else {
-                            line_state          = LINE_STATE_LOST_BRAKE;
-                            lrot_brake_start_ms = 0;
-                        }
-                        steering_adjustment = 0.0f;
-                        break;
-
-                    case LINE_STATE_LOST_BRAKE:
-                    {
-                        // Frena hasta velocidad baja SOSTENIDA (o timeout) antes del giro 180°.
-                        // 2026-07-05: se compara la velocidad CRUDA sostenida N ciclos, no la
-                        // deadbandeada — restar el deadband (0.35) corría el umbral efectivo a
-                        // ~0.5 m/s real y el robot arrancaba el pivot rodando rápido → caída.
-                        // Exigirla baja 15 ciclos seguidos filtra los picos de cuantización
-                        // (un pico aislado resetea el contador un instante, un robot rodando
-                        // nunca la mantiene baja 150ms).
-                        const uint32_t LBRAKE_TIMEOUT      = 2500U;   // colchón, no corte normal
-                        const float    LBRAKE_VEL_THR      = 0.25f;   // m/s crudos
-                        const uint8_t  LBRAKE_QUIET_CYCLES = 15U;     // 150ms sostenidos
-
-                        if (lrot_brake_start_ms == 0) {
-                            lrot_brake_start_ms = HAL_GetTick();
-                            line_quiet_cycles   = 0;
-                        }
-
-                        if (line_detected) {
-                            line_integral        = 0.0f;
-                            line_error_prev      = 0.0f;
-                            line_lost_ms         = HAL_GetTick();
-                            line_steer_fb_int    = 0.0f;
-                            line_state           = LINE_STATE_FOLLOWING;
-                            lrot_brake_start_ms  = 0;
-                            break;
-                        }
-
-                        if (fabsf(velocity_est_f) < LBRAKE_VEL_THR) {
-                            if (line_quiet_cycles < 255) line_quiet_cycles++;
-                        } else {
-                            line_quiet_cycles = 0;
-                        }
-
-                        uint32_t elapsed = HAL_GetTick() - lrot_brake_start_ms;
-                        if (line_quiet_cycles >= LBRAKE_QUIET_CYCLES ||
-                            elapsed >= LBRAKE_TIMEOUT) {
-                            // Solo se llega acá cuando se perdió centrado (ver la rama de
-                            // salida de LINE_STATE_FOLLOWING); el caso "por los extremos" va
-                            // directo a LINE_STATE_EDGE_WAIT y nunca pasa por este estado.
-                            line_state          = LINE_STATE_LOST_ROTATE;
-                            obj_rot_initialized = 0;
-                            obj_rot_phase       = 0;
-                            obj_rot_heading     = 0.0f;
-                            obj_rot_phase1_ms   = 0;
-                            obj_rot_start_ms    = 0;
-                            lrot_brake_start_ms = 0;
-                        }
-                        steering_adjustment = 0.0f;
-                        break;
-                    }
-
-                    case LINE_STATE_LOST_ROTATE:
-                    {
-                        // Giro 180° derecha para buscar la línea perdida.
-                        // Misma lógica gz+encoder que OBJ_ROTATE y MANUAL, escalada a 180°.
-                        const float  LROT_ENC_TARGET   = 960.0f;  // antes 880 — quedaba corto (~165° reales), reescalado 880*(180/165)
-                        const float  LROT_PIVOT        = 24.0f;  // antes 14→20→24: arranques dispares por pwm_sat residual compitiendo con el pivot
-                        const float  LROT_BRAKE        = 10.0f;  // antes 16 — torque fijo sin medir velocidad remanente, a veces pasaba de frenada y desestabilizaba
-                        const float  LROT_SLOWDOWN_DEG = 55.0f;
-                        const float  LROT_ABS_TARGET   = 180.0f;
-                        // P0_MAX/P1_MAX son colchón de seguridad (peor caso ~2.3s), no el corte normal
-                        const uint32_t LROT_P0_MAX     = 1500U;
-                        const uint32_t LROT_P1_MAX     = 800U;
-                        const float  LROT_ENC_FRAC     = 0.60f;  // frena al 60% del recorrido
-
-                        if (!obj_rot_initialized) {
-                            __disable_irq();
-                            obj_rot_r0 = encoder_right;
-                            obj_rot_l0 = encoder_left;
-                            __enable_irq();
-                            obj_rot_initialized = 1;
-                            obj_rot_start_ms    = HAL_GetTick();
-                            obj_rot_phase       = 0;
-                            obj_rot_heading     = 0.0f;
-                            obj_rot_phase1_ms   = 0;
-                        }
-
-                        // El giro no sale anticipadamente al ver línea a mitad de camino (podría
-                        // ser una detección espuria); siempre completa por encoder.
-                        float lrot_gz = (float)gz / 100.0f;
-                        obj_rot_heading += lrot_gz * DT_CTRL_FIXED;
-
-                        __disable_irq();
-                        int32_t lrot_dr = encoder_right - obj_rot_r0;
-                        int32_t lrot_dl = encoder_left  - obj_rot_l0;
-                        __enable_irq();
-                        float lrot_counts    = (fabsf((float)lrot_dr) + fabsf((float)lrot_dl)) * 0.5f;
-                        float lrot_enc_deg   = lrot_counts * (LROT_ABS_TARGET / LROT_ENC_TARGET);
-                        float lrot_abs_hdg   = fmaxf(fabsf(obj_rot_heading), lrot_enc_deg);
-                        float lrot_enc_thr   = LROT_ENC_TARGET * LROT_ENC_FRAC;
-
-                        // 2026-07-05: con gz/100 (resolución nueva, 31% más alta que /131) el
-                        // gyro dentro del fmaxf hace pensar que ya se completó el 70% del giro
-                        // antes de que el encoder lo confirme físicamente — entra temprano a la
-                        // fase de terminación (mucho más débil) y el resto del giro se arrastra
-                        // lento y a pulsos. Fix mínimo: la transición de fase se decide SOLO por
-                        // encoder (la fuente que no cambió de escala); el gyro (lrot_abs_hdg)
-                        // queda únicamente para la red de seguridad de sobregiro más abajo.
-                        if (obj_rot_phase == 0) {
-                            uint32_t elapsed = HAL_GetTick() - obj_rot_start_ms;
-                            if (lrot_counts  >= lrot_enc_thr ||
-                                elapsed      >= LROT_P0_MAX) {
-                                obj_rot_phase     = 1;
-                                obj_rot_phase1_ms = HAL_GetTick();
-                            } else {
-                                // Rampa de frenado interna también solo por encoder (mismo
-                                // motivo que la transición de fase, ver comentario arriba) —
-                                // con el gyro inflado, "remaining" se achicaba antes de tiempo
-                                // y bajaba el pivot (ya de por sí solo 14 PWM) durante buena
-                                // parte del giro, no solo cerca del final.
-                                float remaining = LROT_ABS_TARGET - lrot_enc_deg;
-                                float slowdown  = (remaining < LROT_SLOWDOWN_DEG)
-                                                ? (remaining / LROT_SLOWDOWN_DEG) : 1.0f;
-                                float pivot = LROT_PIVOT * fmaxf(slowdown, 0.0f);
-                                line_pivot_active  = 1;
-                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
-                            }
-                        }
-
-                        if (obj_rot_phase == 1) {
-                            uint32_t p1e      = HAL_GetTick() - obj_rot_phase1_ms;
-                            int enc_done      = (lrot_counts >= LROT_ENC_TARGET);
-                            // El freno arranca antes de llegar al 100% (antes esperaba a
-                            // enc_done exacto = actuaba de golpe justo al final, rompiendo el
-                            // equilibrio). Ahora entra al 85% del recorrido; el corte final
-                            // (enc_done + duración) no cambia, así que no acorta el giro.
-                            int enc_near_done = (lrot_counts >= LROT_ENC_TARGET * 0.85f);
-                            int overshoot     = (lrot_abs_hdg > LROT_ABS_TARGET * 1.2f);
-                            // Freno fuerte a torque fijo por tiempo corto y acotado, sin
-                            // buscar una velocidad de frenado exacta.
-                            const uint32_t LROT_BRAKE_DURATION = 250U;  // antes 400 — frenaba bien y luego "volvía" un poco (sobrefrenaba en reversa el tiempo que le quedaba)
-                            if ((enc_done && p1e >= LROT_BRAKE_DURATION) || p1e >= LROT_P1_MAX || overshoot) {
-                                // Bypass de LOST_SETTLE: arranca a avanzar sin esperar. Si ya
-                                // quedó sobre la línea, directo a FOLLOWING.
-                                if (line_detected) {
-                                    line_seen_since_entry = 1;
-                                    line_integral         = 0.0f;
-                                    line_error_prev       = 0.0f;
-                                    line_lost_ms          = HAL_GetTick();
-                                    line_state            = LINE_STATE_FOLLOWING;
-                                } else {
-                                    line_state          = LINE_STATE_LOST_FWD;
-                                    line_lost_ms        = HAL_GetTick();
-                                    lost_fwd_vel_integral = 0.0f;
-                                }
-                                obj_rot_initialized = 0;
-                                obj_rot_phase       = 0;
-                                obj_rot_heading     = 0.0f;
-                                steering_adjustment = 0.0f;
-                            } else if (!enc_near_done) {
-                                // Encoder aún no llegó al 85%: seguir pivoteando suave
-                                float remaining = LROT_ENC_TARGET - lrot_counts;
-                                float ramp = fminf(remaining / (LROT_ENC_TARGET * 0.15f), 1.0f);
-                                float pivot = LROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
-                                line_pivot_active  = 1;
-                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
-                            } else {
-                                // Encoder OK: freno fuerte a torque fijo (sin escalar), 400ms
-                                // como mucho (ver LROT_BRAKE_DURATION arriba).
-                                line_pivot_active  = 1;
-                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - LROT_BRAKE), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + LROT_BRAKE), -60.0f, 60.0f);
-                            }
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_LOST_SETTLE:
-                    {
-                        // Post-180°: pausa de estabilización fuerte (upright + freno de
-                        // encoders) antes de arrancar a avanzar. Sale por tiempo mínimo
-                        // cumplido Y velocidad/inclinación estabilizadas. El timeout es
-                        // solo un colchón de seguridad (3s, no un corte normal) — antes
-                        // (1200ms) cortaba antes de frenar de verdad y el robot arrancaba
-                        // a avanzar con velocidad residual del giro.
-                        const uint32_t LSETTLE_MIN_MS   = 400U;
-                        const uint32_t LSETTLE_TIMEOUT  = 3000U;
-                        const float    LSETTLE_VEL_THR  = 0.25f;   // m/s crudos (ver comentario abajo)
-                        const float    LSETTLE_TILT_THR = 3.0f;    // grados respecto al setpoint
-
-                        if (lrot_settle_start_ms == 0) lrot_settle_start_ms = HAL_GetTick();
-                        steering_adjustment = 0.0f;
-
-                        if (line_detected) {
-                            line_seen_since_entry = 1;
-                            line_integral         = 0.0f;
-                            line_error_prev       = 0.0f;
-                            line_lost_ms          = HAL_GetTick();
-                            line_state            = LINE_STATE_FOLLOWING;
-                            lrot_settle_start_ms  = 0;
-                            break;
-                        }
-
-                        uint32_t elapsed  = HAL_GetTick() - lrot_settle_start_ms;
-                        float tilt_err    = fabsf(filtered_roll_deg - dynamic_setpoint_f);
-                        // velocidad cruda con umbral 0.25 (deadbandeada con 0.10 equivalía a
-                        // ~0.45 m/s reales — demasiado permisivo para "estabilizado")
-                        int settled       = (elapsed >= LSETTLE_MIN_MS) &&
-                                            (fabsf(velocity_est_f) < LSETTLE_VEL_THR) &&
-                                            (tilt_err < LSETTLE_TILT_THR);
-
-                        if (settled || elapsed >= LSETTLE_TIMEOUT) {
-                            line_state           = LINE_STATE_LOST_FWD;
-                            line_lost_ms         = HAL_GetTick();
-                            lrot_settle_start_ms = 0;
-                            lost_fwd_vel_integral = 0.0f;
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_LOST_FWD:
-                    {
-                        // Post-180°: RETORNO POR ODOMETRÍA — en vez de avanzar a ciegas,
-                        // navega hacia la pose donde se vio la línea por última vez
-                        // (line_loss_x/y_m): steering P sobre el error de rumbo entre el
-                        // bearing al objetivo y theta odométrico. La velocidad la sigue
-                        // regulando el PI del bloque de setpoints (LOST_FWD_*).
-                        // Salidas: línea detectada → FOLLOWING; punto alcanzado sin línea
-                        // → GIVEN_UP; timeout como colchón de seguridad (10s, subido de
-                        // 5s a pedido del usuario para dar más tiempo de búsqueda).
-                        const uint32_t LOST_FWD_TIMEOUT = 10000U;
-                        if (line_detected) {
-                            line_seen_since_entry = 1;
-                            line_integral     = 0.0f;
-                            line_error_prev   = 0.0f;
-                            line_lost_ms      = HAL_GetTick();
-                            line_state        = LINE_STATE_FOLLOWING;
-                            steering_adjustment = 0.0f;
-                            lost_ret_ov_active  = 0;
-                        } else if ((HAL_GetTick() - line_lost_ms) > LOST_FWD_TIMEOUT) {
-                            line_state = LINE_STATE_GIVEN_UP;
-                            steering_adjustment = 0.0f;
-                            lost_ret_ov_active  = 0;
-                        } else if (line_loss_pose_valid) {
-                            float ret_dx   = line_loss_x_m - odom_x_m;
-                            float ret_dy   = line_loss_y_m - odom_y_m;
-                            float ret_dist = sqrtf(ret_dx * ret_dx + ret_dy * ret_dy);
-                            float ret_bearing = atan2f(ret_dy, ret_dx) * (180.0f / M_PI);
-                            float ret_herr    = ret_bearing - odom_theta_deg;
-                            if      (ret_herr >  180.0f) ret_herr -= 360.0f;
-                            else if (ret_herr < -180.0f) ret_herr += 360.0f;
-
-                            // Punto alcanzado (o pasado de costado): NO rendirse ahí
-                            // mismo — sobrepasar en línea recta para que los sensores
-                            // crucen la cinta (ver LOST_RETURN_OVERSHOOT_M).
-                            if (!lost_ret_ov_active &&
-                                (ret_dist < LOST_RETURN_REACHED_M ||
-                                 (ret_dist < LOST_RETURN_PASS_WIN_M &&
-                                  fabsf(ret_herr) > 120.0f))) {
-                                lost_ret_ov_active = 1;
-                                lost_ret_ov_x      = odom_x_m;
-                                lost_ret_ov_y      = odom_y_m;
-                            }
-
-                            if (lost_ret_ov_active) {
-                                float ov_dx = odom_x_m - lost_ret_ov_x;
-                                float ov_dy = odom_y_m - lost_ret_ov_y;
-                                if (sqrtf(ov_dx * ov_dx + ov_dy * ov_dy) >=
-                                    LOST_RETURN_OVERSHOOT_M) {
-                                    // Sobrepaso agotado sin línea: reposo (GIVEN_UP
-                                    // retoma solo si la línea vuelve a aparecer).
-                                    line_state = LINE_STATE_GIVEN_UP;
-                                    lost_ret_ov_active = 0;
-                                }
-                                // Derecho, sin navegación: el yaw-assist por gyro
-                                // (steering==0) mantiene el rumbo.
-                                steering_adjustment = 0.0f;
-                            } else {
-                                // Signo: steering positivo genera gz negativo (misma
-                                // convención que el amortiguador gz*0.3), y theta integra
-                                // ODOM_THETA_SIGN*gz — de ahí el -ODOM_THETA_SIGN.
-                                steering_adjustment = clampf_local(
-                                    -ODOM_THETA_SIGN * LOST_RETURN_STEER_KP * ret_herr,
-                                    -LOST_RETURN_STEER_MAX, LOST_RETURN_STEER_MAX);
-                            }
-                        } else {
-                            // Sin snapshot válido (recién entrado al modo): avance recto
-                            // con el comportamiento anterior (yaw-assist por gyro).
-                            steering_adjustment = 0.0f;
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_EDGE_WAIT:
-                    {
-                        // Perdida por un extremo (curva): frena hasta velocidad baja (o
-                        // timeout) antes del giro de 90°. La entrada a este estado ya
-                        // ocurrió >=1s después de perder la línea (ver salida de FOLLOWING),
-                        // así que solo falta esperar a que el robot esté quieto.
-                        // Mismo gate de quietud sostenida que LOST_BRAKE (ver comentario ahí).
-                        const uint32_t EWAIT_TIMEOUT       = 2500U;
-                        const float    EWAIT_VEL_THR       = 0.25f;  // m/s crudos
-                        const uint8_t  EWAIT_QUIET_CYCLES  = 15U;    // 150ms sostenidos
-
-                        if (edge_wait_start_ms == 0) {
-                            edge_wait_start_ms = HAL_GetTick();
-                            line_quiet_cycles  = 0;
-                        }
-                        steering_adjustment = 0.0f;
-
-                        if (fabsf(velocity_est_f) < EWAIT_VEL_THR) {
-                            if (line_quiet_cycles < 255) line_quiet_cycles++;
-                        } else {
-                            line_quiet_cycles = 0;
-                        }
-
-                        uint32_t elapsed = HAL_GetTick() - edge_wait_start_ms;
-                        if (line_quiet_cycles >= EWAIT_QUIET_CYCLES ||
-                            elapsed >= EWAIT_TIMEOUT) {
-                            line_state          = LINE_STATE_EDGE_ROTATE;
-                            obj_rot_initialized = 0;
-                            obj_rot_phase       = 0;
-                            obj_rot_heading     = 0.0f;
-                            obj_rot_phase1_ms   = 0;
-                            obj_rot_start_ms    = 0;
-                            edge_wait_start_ms  = 0;
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_EDGE_ROTATE:
-                    {
-                        // Gira 60° (antes 90°, a pedido del usuario) hacia el lado donde se
-                        // vio la línea por última vez (line_search_dir: +1=izquierda,
-                        // -1=derecha, convención "izq=positivo"). Misma lógica gz+encoder
-                        // que LOST_ROTATE. No sale anticipadamente si ve la línea (igual
-                        // que LOST_ROTATE) — siempre completa el giro por encoder.
-                        // Bajado de 60° a 45° (2026-07-01). EROT_ENC_TARGET y
-                        // EROT_SLOWDOWN_DEG escalados en proporción 45/90 respecto a los
-                        // valores base de 90° (440 y 55).
-                        const float  EROT_ENC_TARGET   = 220.0f;
-                        const float  EROT_PIVOT        = 14.0f;
-                        const float  EROT_BRAKE        = 16.0f;  // ver comentario en LOST_ROTATE (2026-07-01)
-                        const float  EROT_SLOWDOWN_DEG = 28.0f;
-                        const float  EROT_ABS_TARGET   = 45.0f;
-                        const uint32_t EROT_P0_MAX     = 1000U;  // ver comentario en LOST_ROTATE (2026-07-01)
-                        const uint32_t EROT_P1_MAX     = 800U;
-                        const float  EROT_ENC_FRAC     = 0.60f;
-                        // dir: +1 = pivotea derecha (convención de OBJ_ROTATE/LOST_ROTATE),
-                        // -1 = pivotea izquierda (como OBJ_WALL_TURN). 2026-07-01: signo
-                        // invertido tras comprobar en el robot que giraba al lado contrario
-                        // del esperado — con esto, line_search_dir>0 (izq) -> dir=+1 (derecha).
-                        const float  EROT_DIR          = line_search_dir;
-
-                        if (!obj_rot_initialized) {
-                            __disable_irq();
-                            obj_rot_r0 = encoder_right;
-                            obj_rot_l0 = encoder_left;
-                            __enable_irq();
-                            obj_rot_initialized = 1;
-                            obj_rot_start_ms    = HAL_GetTick();
-                            obj_rot_phase       = 0;
-                            obj_rot_heading     = 0.0f;
-                            obj_rot_phase1_ms   = 0;
-                        }
-
-                        float erot_gz = (float)gz / 100.0f;
-                        obj_rot_heading += erot_gz * DT_CTRL_FIXED;
-
-                        __disable_irq();
-                        int32_t erot_dr = encoder_right - obj_rot_r0;
-                        int32_t erot_dl = encoder_left  - obj_rot_l0;
-                        __enable_irq();
-                        float erot_counts  = (fabsf((float)erot_dr) + fabsf((float)erot_dl)) * 0.5f;
-                        float erot_enc_deg = erot_counts * (EROT_ABS_TARGET / EROT_ENC_TARGET);
-                        float erot_abs_hdg = fmaxf(fabsf(obj_rot_heading), erot_enc_deg);
-                        float erot_enc_thr = EROT_ENC_TARGET * EROT_ENC_FRAC;
-
-                        if (obj_rot_phase == 0) {
-                            uint32_t elapsed = HAL_GetTick() - obj_rot_start_ms;
-                            if (erot_abs_hdg >= EROT_ABS_TARGET * 0.70f ||
-                                erot_counts  >= erot_enc_thr ||
-                                elapsed      >= EROT_P0_MAX) {
-                                obj_rot_phase     = 1;
-                                obj_rot_phase1_ms = HAL_GetTick();
-                            } else {
-                                float remaining = EROT_ABS_TARGET - erot_abs_hdg;
-                                float slowdown  = (remaining < EROT_SLOWDOWN_DEG)
-                                                ? (remaining / EROT_SLOWDOWN_DEG) : 1.0f;
-                                float pivot = EROT_DIR * EROT_PIVOT * fmaxf(slowdown, 0.0f);
-                                line_pivot_active  = 1;
-                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
-                            }
-                        }
-
-                        if (obj_rot_phase == 1) {
-                            uint32_t p1e  = HAL_GetTick() - obj_rot_phase1_ms;
-                            int enc_done  = (erot_counts >= EROT_ENC_TARGET);
-                            int overshoot = (erot_abs_hdg > EROT_ABS_TARGET * 1.2f);
-                            // Ver comentario equivalente en LOST_ROTATE (2026-07-01): freno
-                            // fuerte a torque fijo por un tiempo corto y acotado, sin buscar
-                            // una velocidad "exacta".
-                            const uint32_t EROT_BRAKE_DURATION = 400U;
-                            if ((enc_done && p1e >= EROT_BRAKE_DURATION) || p1e >= EROT_P1_MAX || overshoot) {
-                                // Si ya quedó justo sobre la línea al terminar el giro, no hace
-                                // falta avanzar nada: directo a FOLLOWING (2026-07-01).
-                                if (line_detected) {
-                                    line_seen_since_entry = 1;
-                                    line_integral         = 0.0f;
-                                    line_error_prev       = 0.0f;
-                                    line_lost_ms          = HAL_GetTick();
-                                    line_state            = LINE_STATE_FOLLOWING;
-                                    lrot_settle_start_ms  = 0;
-                                } else {
-                                    // Giro terminado: pausa de estabilización antes de avanzar
-                                    line_state          = LINE_STATE_EDGE_SETTLE;
-                                    lrot_settle_start_ms = 0;
-                                }
-                                obj_rot_initialized = 0;
-                                obj_rot_phase       = 0;
-                                obj_rot_heading     = 0.0f;
-                                steering_adjustment = 0.0f;
-                            } else if (!enc_done) {
-                                float remaining = EROT_ENC_TARGET - erot_counts;
-                                float ramp = fminf(remaining / (EROT_ENC_TARGET * 0.15f), 1.0f);
-                                float pivot = EROT_DIR * EROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
-                                line_pivot_active  = 1;
-                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
-                            } else {
-                                // Freno fuerte a torque fijo (sin escalar), acotado por
-                                // EROT_BRAKE_DURATION arriba.
-                                float pivot = EROT_DIR * EROT_BRAKE;
-                                line_pivot_active  = 1;
-                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
-                            }
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_PERP_ROTATE:
-                    {
-                        // Cruce perpendicular detectado (los 4 ADC en negro sin manipular
-                        // el robot): gira 90° fijo y vuelve directo a FOLLOWING, sin pasar
-                        // por ningún estado de avance — se asume que quedó sobre la línea.
-                        // Sin información de hacia qué lado está la línea (los 4 sensores
-                        // vieron lo mismo), la dirección sigue a `obj_esquive_dir`
-                        // (2026-07-14): reencontrando la línea después de bordear el
-                        // obstáculo, girar hacia el MISMO lado del esquive aleja del
-                        // objeto — girar al contrario lo devolvía directo al obstáculo.
-                        // Sin esquive previo obj_esquive_dir vale +1 (se rearma al entrar
-                        // al modo línea), así que el caso normal conserva la convención
-                        // histórica de girar a la derecha. Mismo esquema de freno fijo
-                        // corto que LOST_ROTATE/EDGE_ROTATE (2026-07-01): no sale
-                        // anticipadamente ante ninguna condición, siempre completa el
-                        // giro por encoder y luego un freno fijo breve.
-                        const float  PROT_ENC_TARGET  = 440.0f; // calibración base de 90°
-                        const float  PROT_PIVOT       = 14.0f;
-                        const float  PROT_BRAKE       = 16.0f;
-                        const float  PROT_OBJ_BRAKE   = 8.0f;  // contrafreno suave solo para el giro final de esquive
-                        const float  PROT_SLOWDOWN_DEG = 55.0f;
-                        const float  PROT_ABS_TARGET  = 90.0f;
-                        const uint32_t PROT_P0_MAX    = 1500U;
-                        const uint32_t PROT_P1_MAX    = 800U;
-                        const uint32_t PROT_BRAKE_DURATION = 400U;
-                        const uint32_t PROT_OBJ_BRAKE_RAMP_MS = 200U;
-                        const uint32_t PROT_OBJ_BRAKE_DURATION = 300U;
-                        const float  PROT_ENC_FRAC    = 0.60f;
-                        const float  PROT_DIR         = (float)obj_esquive_dir; // sentido del último esquive (+1 derecha por defecto)
-
-                        if (!obj_rot_initialized) {
-                            __disable_irq();
-                            obj_rot_r0 = encoder_right;
-                            obj_rot_l0 = encoder_left;
-                            __enable_irq();
-                            obj_rot_initialized = 1;
-                            obj_rot_start_ms    = HAL_GetTick();
-                            obj_rot_phase       = 0;
-                            obj_rot_heading     = 0.0f;
-                            obj_rot_phase1_ms   = 0;
-                            perp_obj_brake_start_ms = 0;
-                        }
-
-                        float prot_gz = (float)gz / 100.0f;
-                        obj_rot_heading += prot_gz * DT_CTRL_FIXED;
-
-                        __disable_irq();
-                        int32_t prot_dr = encoder_right - obj_rot_r0;
-                        int32_t prot_dl = encoder_left  - obj_rot_l0;
-                        __enable_irq();
-                        float prot_counts  = (fabsf((float)prot_dr) + fabsf((float)prot_dl)) * 0.5f;
-                        float prot_enc_deg = prot_counts * (PROT_ABS_TARGET / PROT_ENC_TARGET);
-                        float prot_abs_hdg = fmaxf(fabsf(obj_rot_heading), prot_enc_deg);
-                        float prot_enc_thr = PROT_ENC_TARGET * PROT_ENC_FRAC;
-
-                        if (obj_rot_phase == 0) {
-                            uint32_t elapsed = HAL_GetTick() - obj_rot_start_ms;
-                            if (prot_abs_hdg >= PROT_ABS_TARGET * 0.70f ||
-                                prot_counts  >= prot_enc_thr ||
-                                elapsed      >= PROT_P0_MAX) {
-                                obj_rot_phase     = 1;
-                                obj_rot_phase1_ms = HAL_GetTick();
-                            } else {
-                                float remaining = PROT_ABS_TARGET - prot_abs_hdg;
-                                float slowdown  = (remaining < PROT_SLOWDOWN_DEG)
-                                                ? (remaining / PROT_SLOWDOWN_DEG) : 1.0f;
-                                float pivot = PROT_DIR * PROT_PIVOT * fmaxf(slowdown, 0.0f);
-                                line_pivot_active  = 1;
-                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
-                            }
-                        }
-
-                        if (obj_rot_phase == 1) {
-                            uint32_t p1e      = HAL_GetTick() - obj_rot_phase1_ms;
-                            int enc_done      = (prot_counts >= PROT_ENC_TARGET);
-                            int overshoot     = (prot_abs_hdg > PROT_ABS_TARGET * 1.2f);
-                            uint32_t obj_brake_elapsed = 0;
-                            if (enc_done && perp_from_obj_avoidance) {
-                                if (perp_obj_brake_start_ms == 0)
-                                    perp_obj_brake_start_ms = HAL_GetTick();
-                                obj_brake_elapsed = HAL_GetTick() - perp_obj_brake_start_ms;
-                            }
-                            int brake_done = perp_from_obj_avoidance
-                                ? (enc_done && obj_brake_elapsed >= PROT_OBJ_BRAKE_DURATION)
-                                : (enc_done && p1e >= PROT_BRAKE_DURATION);
-                            int phase_timeout = perp_from_obj_avoidance
-                                ? (!enc_done && p1e >= PROT_P1_MAX)
-                                : (p1e >= PROT_P1_MAX);
-                            if (brake_done || phase_timeout || overshoot) {
-                                // 2026-07-14: antes retomaba FOLLOWING directo — llegando
-                                // del esquive con velocidad, arrancaba lanzado y se
-                                // Sin pausa posterior: el giro final lento ya entrega
-                                // el robot directamente al seguidor de línea.
-                                line_state = LINE_STATE_FOLLOWING;
-                                perp_from_obj_avoidance = 0;
-                                perp_obj_brake_start_ms = 0;
-                                line_seen_since_entry = 1;
-                                line_integral       = 0.0f;
-                                line_error_prev     = 0.0f;
-                                line_lost_ms        = HAL_GetTick();
-                                obj_rot_initialized = 0;
-                                obj_rot_phase       = 0;
-                                obj_rot_heading     = 0.0f;
-                                steering_adjustment = 0.0f;
-                                // Sin este reset, si los sensores siguen en negro después del
-                                // giro (no habia linea real), el timer ya vencido re-dispara
-                                // otro PERP_ROTATE apenas vuelva a FOLLOWING -> giro en círculos.
-                                all_black_start_ms  = 0;
-                            } else if (!enc_done) {
-                                perp_obj_brake_start_ms = 0;
-                                float remaining = PROT_ENC_TARGET - prot_counts;
-                                float ramp = fminf(remaining / (PROT_ENC_TARGET * 0.15f), 1.0f);
-                                float pivot = PROT_DIR * PROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
-                                line_pivot_active  = 1;
-                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
-                            } else {
-                                float brake_power = PROT_BRAKE;
-                                if (perp_from_obj_avoidance) {
-                                    float brake_ramp = fminf(
-                                        (float)obj_brake_elapsed / (float)PROT_OBJ_BRAKE_RAMP_MS,
-                                        1.0f);
-                                    brake_power = PROT_OBJ_BRAKE * brake_ramp;
-                                }
-                                float pivot = PROT_DIR * brake_power;
-                                line_pivot_active  = 1;
-                                motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
-                            }
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_EDGE_SETTLE:
-                    {
-                        // Post-90°: pausa de estabilización idéntica a LOST_SETTLE (mismo
-                        // fix 2026-07-01: timeout es colchón de seguridad, no corte normal).
-                        const uint32_t ESETTLE_MIN_MS   = 400U;
-                        const uint32_t ESETTLE_TIMEOUT  = 3000U;
-                        const float    ESETTLE_VEL_THR  = 0.25f;  // m/s crudos
-                        const float    ESETTLE_TILT_THR = 3.0f;
-
-                        if (lrot_settle_start_ms == 0) lrot_settle_start_ms = HAL_GetTick();
-                        steering_adjustment = 0.0f;
-
-                        if (line_detected) {
-                            line_seen_since_entry = 1;
-                            line_integral         = 0.0f;
-                            line_error_prev       = 0.0f;
-                            line_lost_ms          = HAL_GetTick();
-                            line_state            = LINE_STATE_FOLLOWING;
-                            lrot_settle_start_ms  = 0;
-                            break;
-                        }
-
-                        uint32_t elapsed  = HAL_GetTick() - lrot_settle_start_ms;
-                        float tilt_err    = fabsf(filtered_roll_deg - dynamic_setpoint_f);
-                        // ídem LOST_SETTLE: cruda con umbral 0.25
-                        int settled       = (elapsed >= ESETTLE_MIN_MS) &&
-                                            (fabsf(velocity_est_f) < ESETTLE_VEL_THR) &&
-                                            (tilt_err < ESETTLE_TILT_THR);
-
-                        if (settled || elapsed >= ESETTLE_TIMEOUT) {
-                            line_state           = LINE_STATE_EDGE_FWD;
-                            line_lost_ms         = HAL_GetTick();
-                            lrot_settle_start_ms = 0;
-                            lost_fwd_vel_integral = 0.0f;
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_EDGE_FWD:
-                    {
-                        // Post-45°: RETORNO POR ODOMETRÍA, mismo mecanismo que LOST_FWD
-                        // (ver ahí) — navega hacia la pose donde se vio la línea por última
-                        // vez (line_loss_x/y_m, snapshot compartido, se graba sin importar
-                        // si la pérdida fue centrada o por el extremo). 10s de timeout como
-                        // colchón de seguridad → reposo total (GIVEN_UP).
-                        const uint32_t EDGE_FWD_TIMEOUT = 10000U;
-                        if (line_detected) {
-                            line_seen_since_entry = 1;
-                            line_integral     = 0.0f;
-                            line_error_prev   = 0.0f;
-                            line_lost_ms      = HAL_GetTick();
-                            line_state        = LINE_STATE_FOLLOWING;
-                            steering_adjustment = 0.0f;
-                            lost_ret_ov_active  = 0;
-                        } else if ((HAL_GetTick() - line_lost_ms) > EDGE_FWD_TIMEOUT) {
-                            // (ídem LOST_FWD: f_fallen acá era inalcanzable)
-                            line_state = LINE_STATE_GIVEN_UP;
-                            steering_adjustment = 0.0f;
-                            lost_ret_ov_active  = 0;
-                        } else if (line_loss_pose_valid) {
-                            float ret_dx   = line_loss_x_m - odom_x_m;
-                            float ret_dy   = line_loss_y_m - odom_y_m;
-                            float ret_dist = sqrtf(ret_dx * ret_dx + ret_dy * ret_dy);
-                            float ret_bearing = atan2f(ret_dy, ret_dx) * (180.0f / M_PI);
-                            float ret_herr    = ret_bearing - odom_theta_deg;
-                            if      (ret_herr >  180.0f) ret_herr -= 360.0f;
-                            else if (ret_herr < -180.0f) ret_herr += 360.0f;
-
-                            // Mismo sobrepaso que LOST_FWD (ver ahí).
-                            if (!lost_ret_ov_active &&
-                                (ret_dist < LOST_RETURN_REACHED_M ||
-                                 (ret_dist < LOST_RETURN_PASS_WIN_M &&
-                                  fabsf(ret_herr) > 120.0f))) {
-                                lost_ret_ov_active = 1;
-                                lost_ret_ov_x      = odom_x_m;
-                                lost_ret_ov_y      = odom_y_m;
-                            }
-
-                            if (lost_ret_ov_active) {
-                                float ov_dx = odom_x_m - lost_ret_ov_x;
-                                float ov_dy = odom_y_m - lost_ret_ov_y;
-                                if (sqrtf(ov_dx * ov_dx + ov_dy * ov_dy) >=
-                                    LOST_RETURN_OVERSHOOT_M) {
-                                    line_state = LINE_STATE_GIVEN_UP;
-                                    lost_ret_ov_active = 0;
-                                }
-                                steering_adjustment = 0.0f;
-                            } else {
-                                steering_adjustment = clampf_local(
-                                    -ODOM_THETA_SIGN * LOST_RETURN_STEER_KP * ret_herr,
-                                    -LOST_RETURN_STEER_MAX, LOST_RETURN_STEER_MAX);
-                            }
-                        } else {
-                            // Sin snapshot válido (recién entrado al modo): avance recto
-                            // con el comportamiento anterior (yaw-assist por gyro).
-                            steering_adjustment = 0.0f;
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_GIVEN_UP:
-                        // Reposo total: ni el giro de 180° ni el de 90° encontraron la línea.
-                        // No hay timeout ni reintento — se queda balanceado en el lugar hasta
-                        // que se detecte la línea de nuevo (el usuario la repone a mano).
-                        steering_adjustment = 0.0f;
-                        if (line_detected) {
-                            line_seen_since_entry = 1;
-                            line_integral       = 0.0f;
-                            line_error_prev     = 0.0f;
-                            line_lost_ms        = HAL_GetTick();
-                            line_state          = LINE_STATE_FOLLOWING;
-                        }
-                        break;
-
-                    case LINE_STATE_OBJ_ESPERA_REVERSA:
-                    {
-                        steering_adjustment = 0.0f;
-                        line_integral       = 0.0f;
-                        line_error_prev     = 0.0f;
-                        line_error_f_d      = 0.0f;
-
-                        // Sale por tiempo mínimo Y velocidad/inclinación estabilizadas
-                        // (mismo patrón que LOST_SETTLE); el timeout es solo un colchón
-                        // de seguridad por si nunca llega a asentarse del todo.
-                        // IMPORTANTE: velocity_est_f crudo tiene un piso de ruido de
-                        // cuantización de ~0.32-0.63 m/s (ver BRAKE_VEL_DEADBAND) aun con
-                        // el robot totalmente quieto -- comparar directo contra un umbral
-                        // de 0.10 nunca daba "quieto" de verdad y siempre caía al timeout.
-                        // Se filtra con el mismo deadband que usa el resto del código.
-                        uint32_t elapsed  = HAL_GetTick() - obj_pre_rev_start_ms;
-                        float settle_vel  = apply_deadbandf(velocity_est_f, BRAKE_VEL_DEADBAND);
-                        float tilt_err    = fabsf(filtered_roll_deg - dynamic_setpoint_f);
-                        int settled       = (elapsed >= OBJ_PRE_REVERSE_HOLD_MS) &&
-                                            (fabsf(settle_vel) < OBJ_PRE_REVERSE_VEL_THR) &&
-                                            (tilt_err < OBJ_PRE_REVERSE_TILT_THR);
-
-                        if (settled || elapsed >= OBJ_PRE_REVERSE_TIMEOUT) {
-                            line_state          = LINE_STATE_OBJ_RETROCESO;
-                            obj_pre_rev_start_ms = 0;
-                            obj_rev_initialized = 0;
-                            obj_rev_steer_f     = 0.0f;
-                            obj_rot_initialized = 0;
-                            obj_rot_phase       = 0;
-                            obj_rot_heading     = 0.0f;
-                            obj_rot_phase1_ms   = 0;
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_OBJ_RETROCESO:
-                    {
-                        // Corte por distancia frontal: retrocede hasta que ADC6 Y ADC8
-                        // (adcAvg[5]/adcAvg[7], los que miran adelante) lean lejos
-                        // (≥ OBJ_REV_CLEAR_ADC) — así la distancia final al objeto es
-                        // siempre la misma, sin importar dónde se lo detectó. Los counts
-                        // de encoder quedan solo como tope de seguridad (antes eran el
-                        // corte principal: 120 counts fijos ≈ 10 cm, distancia variable).
-                        if (!obj_rev_initialized) {
-                            __disable_irq();
-                            obj_rev_r0 = encoder_right;
-                            obj_rev_l0 = encoder_left;
-                            __enable_irq();
-                            obj_rev_initialized  = 1;
-                            obj_rev_clear_cnt    = 0;
-                            obj_rev_last_counts  = 0;
-                            obj_rev_last_move_ms = HAL_GetTick();
-                        }
-
-                        __disable_irq();
-                        int32_t rev_dr = encoder_right - obj_rev_r0;
-                        int32_t rev_dl = encoder_left  - obj_rev_l0;
-                        __enable_irq();
-
-                        int32_t rev_counts = (abs(rev_dr) + abs(rev_dl)) / 2;
-
-                        uint8_t rev_clear = ((float)adcAvg[5] >= OBJ_REV_CLEAR_ADC &&
-                                             (float)adcAvg[7] >= OBJ_REV_CLEAR_ADC);
-                        if (rev_clear) {
-                            if (obj_rev_clear_cnt < OBJ_REV_CLEAR_CNT) obj_rev_clear_cnt++;
-                        } else {
-                            obj_rev_clear_cnt = 0;
-                        }
-
-                        if (obj_rev_clear_cnt >= OBJ_REV_CLEAR_CNT ||
-                            rev_counts >= OBJ_REV_MAX_COUNTS) {
-                            line_state          = LINE_STATE_OBJ_FRENO_REVERSA;
-                            obj_rev_initialized = 0;
-                            obj_rev_steer_f     = 0.0f;
-                            obj_rot_initialized = 0;
-                            obj_rot_phase       = 0;
-                            obj_rot_heading     = 0.0f;
-                            obj_rot_phase1_ms   = 0;
-                            obj_brake_start_ms  = 0;
-                            obj_rev_band_enter_ms = 0;
-                            steering_adjustment = 0.0f;
-                            line_integral       = 0.0f;
-                            line_error_prev     = 0.0f;
-                            line_error_f_d      = 0.0f;
-                        } else {
-                            // 2026-07-10 (fix zigzag): la reversa va SIEMPRE recta por
-                            // encoders. Antes, con línea visible (lo normal — el objeto
-                            // está sobre la línea) corregía con el PID de línea invertido
-                            // (gain 0.70, hasta ±16 PWM): marcha atrás ese lazo es
-                            // inestable y producía el zigzag reportado. Y el P "recto"
-                            // viejo usaba la diferencia de velocidad instantánea,
-                            // cuantizada en saltos de 3.57 rps (1 count/ciclo) — puro
-                            // ruido a esta velocidad. Ahora: P sobre la diferencia
-                            // ACUMULADA de counts desde el inicio de la reversa
-                            // (rev_dr - rev_dl ∝ desvío de rumbo, suave) — mantiene el
-                            // rumbo inicial durante toda la reversa.
-                            // Solo mientras retrocede de verdad: parado (freno
-                            // activo, llegada al corte) el target va a 0 por el
-                            // slew — si no, el P de rumbo pivotea izq/der con el
-                            // robot quieto. El gate es por actividad de encoders,
-                            // no por velocity_est_f (ver nota en REV_STRAIGHT_ACT_MS).
-                            if (rev_counts != obj_rev_last_counts) {
-                                obj_rev_last_counts  = rev_counts;
-                                obj_rev_last_move_ms = HAL_GetTick();
-                            }
-                            float corr_target = 0.0f;
-                            if ((HAL_GetTick() - obj_rev_last_move_ms) < REV_STRAIGHT_ACT_MS) {
-                                corr_target = clampf_local(
-                                    REV_STRAIGHT_KC * (float)(rev_dr - rev_dl),
-                                    -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
-                                );
-                            }
-                            float corr_delta = corr_target - obj_rev_steer_f;
-                            if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
-                            if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
-                            obj_rev_steer_f += corr_delta;
-                            steering_adjustment = obj_rev_steer_f;
-                        }
-                        // Setpoint de reversa calculado por PI en la seccion de setpoints.
-                        break;
-                    }
-
-                    case LINE_STATE_OBJ_FRENO_REVERSA:
-                    {
-                        // Fase 1: espera a que la velocidad caiga. Fase 2: wait antes de rotar.
-                        // Además, el giro exige distancia ESTABLE: A6 y A8 dentro de la banda
-                        // 3600..3900 durante OBJ_REV_STABLE_MS continuos — mientras el hold de
-                        // distancia (ver setpoints) esté corrigiendo, el giro espera. Colchón:
-                        // si en OBJ_REV_STOP_TIMEOUT_MS total nunca se estabilizó, gira igual.
-                        const float    BRAKE_VEL_THR  = 0.05f;
-                        const uint32_t BRAKE_TIMEOUT  = 1500U;
-                        const uint32_t PRE_ROTATE_MS  = 3000U;
-                        if (obj_brake_start_ms == 0) {
-                            obj_brake_start_ms = HAL_GetTick();
-                            // Rumbo recto (2026-07-14): desde que el STOP es la entrada
-                            // al detectar objeto, su hold hace también la reversa hasta
-                            // la banda de A6/A8 — y salía chueca (reportado) porque no
-                            // tenía ninguna corrección de rumbo. Se porta el mismo P
-                            // sobre diferencia ACUMULADA de counts que tenía
-                            // OBJ_RETROCESO (ver REV_STRAIGHT_*): ancla el rumbo de
-                            // entrada y lo mantiene durante toda la fase, en ambos
-                            // sentidos de corrección del hold.
-                            __disable_irq();
-                            obj_rev_r0 = encoder_right;
-                            obj_rev_l0 = encoder_left;
-                            __enable_irq();
-                            obj_rev_steer_f      = 0.0f;
-                            obj_rev_last_counts  = 0;
-                            obj_rev_last_move_ms = HAL_GetTick();
-                        }
-
-                        {
-                            __disable_irq();
-                            int32_t rev_dr = encoder_right - obj_rev_r0;
-                            int32_t rev_dl = encoder_left  - obj_rev_l0;
-                            __enable_irq();
-                            int32_t rev_counts = (abs(rev_dr) + abs(rev_dl)) / 2;
-                            if (rev_counts != obj_rev_last_counts) {
-                                obj_rev_last_counts  = rev_counts;
-                                obj_rev_last_move_ms = HAL_GetTick();
-                            }
-                            // Solo corrige mientras hay movimiento real (gate por
-                            // actividad de encoders, igual que en OBJ_RETROCESO);
-                            // quieto, el target decae a 0 por el slew (anti-pivoteo).
-                            float corr_target = 0.0f;
-                            if ((HAL_GetTick() - obj_rev_last_move_ms) < REV_STRAIGHT_ACT_MS) {
-                                corr_target = clampf_local(
-                                    REV_STRAIGHT_KC * (float)(rev_dr - rev_dl),
-                                    -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX);
-                            }
-                            float corr_delta = corr_target - obj_rev_steer_f;
-                            if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
-                            if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
-                            obj_rev_steer_f += corr_delta;
-                            steering_adjustment = obj_rev_steer_f;
-                        }
-
-                        // Fase 1: frenar hasta quieto o timeout (cruda: la deadbandeada con
-                        // umbral 0.05 equivalía a ~0.40 m/s reales)
-                        if (obj_pre_rotate_ms == 0) {
-                            if (fabsf(velocity_est_f) < BRAKE_VEL_THR + 0.10f ||
-                                (HAL_GetTick() - obj_brake_start_ms) > BRAKE_TIMEOUT) {
-                                obj_pre_rotate_ms = HAL_GetTick();  // arranca fase 2
-                            }
-                        }
-
-                        // Tracking de estabilidad de distancia: dentro de banda arranca/sigue
-                        // el timer; fuera de banda se resetea (los 2s deben ser CONTINUOS).
-                        {
-                            float front_min = fminf((float)adcAvg[5], (float)adcAvg[7]);
-                            uint8_t in_band = (front_min >= OBJ_REV_CLEAR_ADC &&
-                                               front_min <= OBJ_REV_CLEAR_ADC + OBJ_REV_HOLD_BAND);
-                            if (!in_band)                          obj_rev_band_enter_ms = 0;
-                            else if (obj_rev_band_enter_ms == 0)   obj_rev_band_enter_ms = HAL_GetTick();
-                        }
-                        uint8_t dist_stable = (obj_rev_band_enter_ms != 0 &&
-                                               (HAL_GetTick() - obj_rev_band_enter_ms) >= OBJ_REV_STABLE_MS);
-
-                        // Fase 2: wait quieto + distancia estable 2s (o timeout total) antes de girar
-                        if (obj_pre_rotate_ms != 0 &&
-                            (HAL_GetTick() - obj_pre_rotate_ms) >= PRE_ROTATE_MS &&
-                            (dist_stable ||
-                             (HAL_GetTick() - obj_brake_start_ms) >= OBJ_REV_STOP_TIMEOUT_MS)) {
-                            line_state          = LINE_STATE_OBJ_GIRO_ESQUIVE;
-                            obj_rot_initialized = 0;
-                            obj_rot_phase       = 0;
-                            obj_rot_heading     = 0.0f;
-                            obj_rot_phase1_ms   = 0;
-                            steering_adjustment = 0.0f;
-                            obj_brake_start_ms  = 0;
-                            obj_pre_rotate_ms   = 0;
-                            obj_rev_band_enter_ms = 0;
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_OBJ_GIRO_ESQUIVE:
-                    {
-                        // Giro 90° para esquivar objeto: MISMA lógica y constantes
-                        // que el banco de pruebas de 90° en MANUAL, ya validado (pivot fijo
-                        // con slowdown por encoder, freno arrancando al 85% del recorrido,
-                        // continuidad del freno al terminar). Sentido según obj_esquive_dir
-                        // (2026-07-13): +1 derecha (histórico), -1 izquierda (espejado).
-                        const float  LINE_ROT_ENC_TARGET   = 372.0f;  // recortado más: 460→394→372 (seguía quedando grande)
-                        const float  LINE_ROT_PIVOT        = 24.0f;
-                        const float  LINE_ROT_BRAKE         = 10.0f;
-                        const float  LINE_ROT_SLOWDOWN_DEG = 28.0f;
-                        const float  LINE_ROT_ABS_TARGET   = 90.0f;
-                        const uint32_t LINE_ROT_P0_MAX     = 1500U;
-                        const uint32_t LINE_ROT_P1_MAX     = 800U;
-                        const float  LINE_ROT_ENC_FRAC     = 0.60f;
-                        const uint32_t LINE_ROT_BRAKE_DURATION = 250U;
-
-                        if (!obj_rot_initialized) {
-                            __disable_irq();
-                            obj_rot_r0 = encoder_right;
-                            obj_rot_l0 = encoder_left;
-                            __enable_irq();
-                            obj_rot_initialized = 1;
-                            obj_rot_start_ms    = HAL_GetTick();
-                            obj_rot_phase       = 0;
-                            obj_rot_heading     = 0.0f;
-                            obj_rot_phase1_ms   = 0;
-                        }
-
-                        float obj_gz_dps = (float)gz / 100.0f;
-                        obj_rot_heading += obj_gz_dps * DT_CTRL_FIXED;
-
-                        // Espeja pivot y freno según el sentido del esquive; el heading
-                        // se compara siempre en valor absoluto, no necesita signo.
-                        float rot_dir = (float)obj_esquive_dir;
-
-                        __disable_irq();
-                        int32_t dr = encoder_right - obj_rot_r0;
-                        int32_t dl = encoder_left  - obj_rot_l0;
-                        __enable_irq();
-                        float rot_counts   = (fabsf((float)dr) + fabsf((float)dl)) * 0.5f;
-                        float enc_heading_deg = rot_counts * (LINE_ROT_ABS_TARGET / LINE_ROT_ENC_TARGET);
-                        // Transición de fase solo por encoder (ver LOST_ROTATE); abs_heading
-                        // (con gyro) queda solo para el overshoot.
-                        float abs_heading   = fmaxf(fabsf(obj_rot_heading), enc_heading_deg);
-                        float enc_phase0_thr = LINE_ROT_ENC_TARGET * LINE_ROT_ENC_FRAC;
-
-                        if (obj_rot_phase == 0) {
-                            uint32_t elapsed = HAL_GetTick() - obj_rot_start_ms;
-                            if (rot_counts >= enc_phase0_thr ||
-                                elapsed    >= LINE_ROT_P0_MAX) {
-                                obj_rot_phase     = 1;
-                                obj_rot_phase1_ms = HAL_GetTick();
-                            } else {
-                                // Rampa de frenado interna también solo por encoder.
-                                float remaining = LINE_ROT_ABS_TARGET - enc_heading_deg;
-                                float slowdown  = (remaining < LINE_ROT_SLOWDOWN_DEG)
-                                                ? (remaining / LINE_ROT_SLOWDOWN_DEG)
-                                                : 1.0f;
-                                float pivot = LINE_ROT_PIVOT * fmaxf(slowdown, 0.0f) * rot_dir;
-                                line_pivot_active = 1;
-                                motorRightVelocity = (int16_t)clampf_local(
-                                    -(pwm_sat + pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(
-                                    -(pwm_sat - pivot), -60.0f, 60.0f);
-                            }
-                        }
-
-                        if (obj_rot_phase == 1) {
-                            uint32_t p1_elapsed = HAL_GetTick() - obj_rot_phase1_ms;
-                            int enc_done      = (rot_counts >= LINE_ROT_ENC_TARGET);
-                            // Freno arranca al 85% del recorrido, no recién al 100% (ver
-                            // LOST_ROTATE) — el corte final sigue dependiendo de enc_done.
-                            int enc_near_done = (rot_counts >= LINE_ROT_ENC_TARGET * 0.85f);
-                            int overshoot     = (abs_heading > LINE_ROT_ABS_TARGET * 1.2f);
-                            if ((enc_done && p1_elapsed >= LINE_ROT_BRAKE_DURATION) ||
-                                p1_elapsed >= LINE_ROT_P1_MAX || overshoot) {
-                                // Verificación por el lateral activo (2026-07-10): buena
-                                // detención = la pared quedó a la vista (< 3200). Si no
-                                // bajó de ahí, el giro quedó corto → fase 2 de ajuste fino
-                                // (sigue pivotando despacio hasta verla). El overshoot NO
-                                // entra al ajuste: girar más solo lo empeoraría.
-                                if ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_ROT_ADC_GOOD ||
-                                    overshoot) {
-                                    line_state          = LINE_STATE_OBJ_PAUSA_GIRO;
-                                    obj_rot_initialized = 0;
-                                    obj_rot_phase       = 0;
-                                    obj_rot_heading     = 0.0f;
-                                    obj_rot_start_ms    = 0;
-                                } else {
-                                    obj_rot_phase        = 2;
-                                    obj_rot_p2_c0        = rot_counts;
-                                    obj_rot_p2_ms        = HAL_GetTick();
-                                    obj_rot_adc_good_cnt = 0;
-                                }
-                                // Seguir aplicando el mismo freno diferencial un ciclo más al
-                                // terminar (ver fix en banco MANUAL) — soltarlo de golpe a 0
-                                // daba un empujón justo en la transición.
-                                line_pivot_active = 1;
-                                motorRightVelocity = (int16_t)clampf_local(
-                                    -(pwm_sat - LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(
-                                    -(pwm_sat + LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
-                            } else if (!enc_near_done) {
-                                float remaining = LINE_ROT_ENC_TARGET - rot_counts;
-                                float ramp = fminf(remaining / (LINE_ROT_ENC_TARGET * 0.15f), 1.0f);
-                                float pivot = LINE_ROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f) * rot_dir;
-                                line_pivot_active = 1;
-                                motorRightVelocity = (int16_t)clampf_local(
-                                    -(pwm_sat + pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(
-                                    -(pwm_sat - pivot), -60.0f, 60.0f);
-                            } else {
-                                line_pivot_active = 1;
-                                motorRightVelocity = (int16_t)clampf_local(
-                                    -(pwm_sat - LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(
-                                    -(pwm_sat + LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
-                            }
-                        } else if (obj_rot_phase == 2) {
-                            // Ajuste fino por el lateral activo (ADC7 girando a derecha,
-                            // ADC5 a izquierda; 2026-07-10): los 90° por encoders
-                            // terminaron pero la pared no quedó a la vista lateral
-                            // (≥ 3200) — le falta un poco más. Pivot suave en el mismo
-                            // sentido del giro hasta que el lateral baje de
-                            // OBJ_ROT_ADC_GOOD durante GOOD_CYC ciclos seguidos, con
-                            // tope de counts extra y timeout (por si la pared quedó
-                            // fuera de alcance).
-                            uint8_t rot_adc_good =
-                                ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_ROT_ADC_GOOD);
-                            if (rot_adc_good) {
-                                if (obj_rot_adc_good_cnt < 255) obj_rot_adc_good_cnt++;
-                            } else {
-                                obj_rot_adc_good_cnt = 0;
-                            }
-                            float extra_counts = rot_counts - obj_rot_p2_c0;
-
-                            if (obj_rot_adc_good_cnt >= OBJ_ROT_ADC_GOOD_CYC ||
-                                extra_counts >= OBJ_ROT_ADC_EXTRA_MAX ||
-                                (HAL_GetTick() - obj_rot_p2_ms) > OBJ_ROT_ADC_EXTRA_MS) {
-                                obj_rot_initialized = 0;
-                                obj_rot_phase       = 0;
-                                obj_rot_heading     = 0.0f;
-                                obj_rot_start_ms    = 0;
-                                // 2026-07-14: SIEMPRE sigue a PAUSA_GIRO, aunque el lateral
-                                // no haya visto la pared. El aborto a LOST_FWD que había acá
-                                // (2026-07-10, "detección fantasma") volvía a la línea al
-                                // instante — reportado en el esquive a IZQUIERDA: "si ve la
-                                // línea durante el giro se sale del modo esquive" y el robot
-                                // regresaba directo al obstáculo. Con la entrada por la fase
-                                // STOP (hold de distancia contra A6/A8 durante segundos) el
-                                // objeto está confirmado de sobra: fantasma es casi imposible.
-                                // Si la pared realmente no aparece bordeando, el timeout de
-                                // pared perdida (5s → reposo) ya cubre ese caso sin volver
-                                // hacia el obstáculo.
-                                line_state = LINE_STATE_OBJ_PAUSA_GIRO;
-                                // Mismo freno de continuidad que la salida de fase 1.
-                                line_pivot_active = 1;
-                                motorRightVelocity = (int16_t)clampf_local(
-                                    -(pwm_sat - LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(
-                                    -(pwm_sat + LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
-                            } else {
-                                float pivot = LINE_ROT_PIVOT * 0.5f * rot_dir;   // suave: es un retoque
-                                line_pivot_active = 1;
-                                motorRightVelocity = (int16_t)clampf_local(
-                                    -(pwm_sat + pivot), -60.0f, 60.0f);
-                                motorLeftVelocity  = (int16_t)clampf_local(
-                                    -(pwm_sat - pivot), -60.0f, 60.0f);
-                            }
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_OBJ_PAUSA_GIRO:
-                    {
-                        // Balance estático 2s, luego pasa directo a OBJ_BORDEAR_PARED
-                        // (se prueba saltear OBJ_BUSCAR_PARED, ver Registro de Cambios 2026-07-05).
-                        steering_adjustment = 0.0f;
-                        if (obj_hold_start_ms == 0) {
-                            obj_hold_start_ms = HAL_GetTick();
-                            // Ancla del hold de posición (ver setpoint de PAUSA_GIRO).
-                            __disable_irq();
-                            obj_pausa_r0 = encoder_right;
-                            obj_pausa_l0 = encoder_left;
-                            __enable_irq();
-                        }
-                        if (f_fallen) {
-                            line_state        = LINE_STATE_FOLLOWING;
-                            line_integral     = 0.0f;
-                            line_error_prev   = 0.0f;
-                            line_error_f_d    = 0.0f;
-                            line_lost_ms      = HAL_GetTick();
-                            obj_hold_start_ms = 0;
-                            obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
-                        } else if ((HAL_GetTick() - obj_hold_start_ms) >= OBJ_HOLD_DURATION_MS) {
-                            line_state                 = LINE_STATE_OBJ_BORDEAR_PARED;
-                            obj_hold_start_ms          = 0;
-                            obj_wall_fwd_start_ms      = HAL_GetTick();
-                            obj_wall_seq_start_ms      = HAL_GetTick();
-                            obj_wall_vel_integral      = 0.0f;
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_OBJ_ARC:
-                        // (no usado — reservado)
-                        line_state = LINE_STATE_OBJ_BORDEAR_PARED;
-                        break;
-
-                    case LINE_STATE_OBJ_BUSCAR_PARED:
-                    {
-                        // Avanza despacio (PI de velocidad) hasta que el lateral activo detecta la pared.
-                        // Timeout OBJ_WALL_APPROACH_TIMEOUT → vuelve a FOLLOWING si no encuentra pared.
-                        uint8_t wall_found = ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD);
-                        if (f_fallen) {
-                            line_state                 = LINE_STATE_FOLLOWING;
-                            obj_wall_approach_start_ms = 0;
-                            obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
-                        } else if (wall_found) {
-                            line_state                 = LINE_STATE_OBJ_BORDEAR_PARED;
-                            obj_wall_approach_start_ms = 0;
-                            obj_wall_fwd_start_ms      = HAL_GetTick();
-                            obj_wall_seq_start_ms      = HAL_GetTick();
-                            obj_wall_vel_integral      = 0.0f;
-                        } else if ((HAL_GetTick() - obj_wall_approach_start_ms) >= OBJ_WALL_APPROACH_TIMEOUT) {
-                            line_state                 = LINE_STATE_OBJ_BORDEAR_PARED;
-                            obj_wall_approach_start_ms = 0;
-                            obj_wall_fwd_start_ms      = HAL_GetTick();
-                            obj_wall_seq_start_ms      = HAL_GetTick();
-                            obj_wall_vel_integral      = 0.0f;
-                        }
-                        // Mientras avanza: steering neutro, setpoint manejado por bloque de setpoints.
-                        steering_adjustment = 0.0f;
-                        break;
-                    }
-
-                    case LINE_STATE_OBJ_BORDEAR_PARED:
-                    {
-                        // Wall-following: avanza mientras el lateral activo ve el objeto.
-                        // Si pierde el objeto → pivot hacia la pared. Si ve línea (tras 3s) → FOLLOWING.
-                        // Lateral < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
-                        // TOO_CLOSE_THOLD → pivot alejándose de la pared.
-                        if (obj_wall_fwd_start_ms == 0)
-                            obj_wall_fwd_start_ms = HAL_GetTick();
-                        // Ignora línea solo los primeros OBJ_WALL_LINE_IGNORE_MS desde que
-                        // se entró a la secuencia de wall-following (obj_wall_seq_start_ms,
-                        // fijo, no se resetea al ciclar FWD/CLEAR/TURN) -- antes se usaba
-                        // obj_wall_fwd_start_ms, que se reseteaba cada vez que se volvía a
-                        // este estado desde GIRO_PARED, dejando la línea ignorada indefinidamente
-                        // mientras el robot oscilaba entre bordear/girar buscando la pared.
-                        uint8_t line_ignore   = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
-                        float wall_adc        = (float)adcAvg[OBJ_WALL_ADC_IDX];
-                        uint8_t wall_visible  = (wall_adc < OBJ_WALL_THRESHOLD);
-                        uint8_t wall_reverse  = obj_wall_rev_latch;   // por counts (2026-07-10)
-                        uint8_t too_close     = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
-                        if (ObjWall_LineConfirmed(line_detected, line_ignore)) {
-                            line_seen_since_entry = 1;
-                            obj_wall_line_confirm_cnt = 0;
-                            obj_final_turn_pending_ms = HAL_GetTick();
-                            line_state          = LINE_STATE_FOLLOWING;
-                            line_integral       = 0.0f;
-                            line_error_prev     = 0.0f;
-                            line_error_f_d      = 0.0f;
-                            line_lost_ms        = HAL_GetTick();
-                            steering_adjustment = 0.0f;
-                            obj_wall_fwd_start_ms = 0;
-                            obj_wall_seq_start_ms = 0;
-                            obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
-                        } else if (wall_reverse) {
-                            // Demasiado cerca: reversa pareja (mismo P que LINE_STATE_OBJ_RETROCESO,
-                            // ver REV_STRAIGHT_KP/MAX/SLEW). line_pivot_active queda en 0: el
-                            // formato compartido de motores aplica half_steer=steering_adjustment*0.5.
-                            float rate_diff = speed_right_rps_s - speed_left_rps_s;
-                            float corr_target = clampf_local(
-                                REV_STRAIGHT_KP * rate_diff,
-                                -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
-                            );
-                            float corr_delta = corr_target - obj_rev_steer_f;
-                            if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
-                            if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
-                            obj_rev_steer_f += corr_delta;
-                            steering_adjustment = obj_rev_steer_f;
-                        } else if (too_close) {
-                            // Demasiado cerca: pivot alejándose de la pared (según sentido)
-                            line_pivot_active  = 1;
-                            motorRightVelocity = (int16_t)clampf_local(
-                                -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
-                            motorLeftVelocity  = (int16_t)clampf_local(
-                                -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
-                        } else if (!wall_visible) {
-                            // Perdió la pared: en vez de girar ya mismo, avanza un poco más
-                            // (OBJ_WALL_CLEAR_COUNTS) para no quedar pivoteando pegado a la
-                            // esquina/pared.
-                            line_state                 = LINE_STATE_OBJ_PARED_LIBRE;
-                            steering_adjustment        = 0.0f;
-                            obj_wall_fwd_start_ms      = 0;
-                            obj_wall_clear_initialized = 0;
-                            obj_wall_lost_ms           = HAL_GetTick();  // arranca la ventana de 2s de ignorar línea en WALL_CLEAR/WALL_TURN
-                        } else {
-                            // Avanza hacia adelante con ángulo fijo; yaw-lock se aplica al calcular motores.
-                            steering_adjustment = 0.0f;
-                            obj_rev_steer_f      = 0.0f;
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_OBJ_PARED_LIBRE:
-                    {
-                        // Avanza OBJ_WALL_CLEAR_COUNTS counts de encoder más después de perder
-                        // la pared en WALL_FWD, antes de girar -- para no quedar pivoteando
-                        // pegado a la esquina/pared. Misma reversa/pivot de seguridad que
-                        // WALL_FWD si en el medio se acerca demasiado.
-                        if (!obj_wall_clear_initialized) {
-                            __disable_irq();
-                            obj_wall_clear_r0 = encoder_right;
-                            obj_wall_clear_l0 = encoder_left;
-                            __enable_irq();
-                            obj_wall_clear_initialized = 1;
-                        }
-                        __disable_irq();
-                        int32_t clear_dr = encoder_right - obj_wall_clear_r0;
-                        int32_t clear_dl = encoder_left  - obj_wall_clear_l0;
-                        __enable_irq();
-                        int32_t clear_counts = (abs(clear_dr) + abs(clear_dl)) / 2;
-
-                        float wall_adc       = (float)adcAvg[OBJ_WALL_ADC_IDX];
-                        uint8_t wall_reverse = obj_wall_rev_latch;   // por counts (2026-07-10)
-                        uint8_t too_close    = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
-                        // Misma ventana que BORDEAR_PARED, medida desde la entrada a TODA
-                        // la secuencia (obj_wall_seq_start_ms) — ver fix 2026-07-05.
-                        uint8_t line_ignore2 = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
-
-                        if (ObjWall_LineConfirmed(line_detected, line_ignore2)) {
-                            line_seen_since_entry = 1;
-                            obj_wall_line_confirm_cnt = 0;
-                            obj_final_turn_pending_ms = HAL_GetTick();
-                            line_state          = LINE_STATE_FOLLOWING;
-                            line_integral       = 0.0f;
-                            line_error_prev     = 0.0f;
-                            line_error_f_d      = 0.0f;
-                            line_lost_ms        = HAL_GetTick();
-                            steering_adjustment = 0.0f;
-                            obj_wall_clear_initialized = 0;
-                            obj_wall_seq_start_ms = 0;
-                            obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
-                        } else if (wall_reverse) {
-                            float rate_diff = speed_right_rps_s - speed_left_rps_s;
-                            float corr_target = clampf_local(
-                                REV_STRAIGHT_KP * rate_diff,
-                                -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
-                            );
-                            float corr_delta = corr_target - obj_rev_steer_f;
-                            if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
-                            if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
-                            obj_rev_steer_f += corr_delta;
-                            steering_adjustment = obj_rev_steer_f;
-                        } else if (too_close) {
-                            line_pivot_active  = 1;
-                            motorRightVelocity = (int16_t)clampf_local(
-                                -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
-                            motorLeftVelocity  = (int16_t)clampf_local(
-                                -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
-                        } else if (clear_counts >= OBJ_WALL_CLEAR_COUNTS) {
-                            line_state                 = LINE_STATE_OBJ_GIRO_PARED;
-                            steering_adjustment        = 0.0f;
-                            obj_wall_clear_initialized = 0;
-                        } else {
-                            steering_adjustment = 0.0f;
-                            obj_rev_steer_f      = 0.0f;
-                        }
-                        break;
-                    }
-
-                    case LINE_STATE_OBJ_GIRO_PARED:
-                    {
-                        // Pivot hacia la pared hasta re-verla en el lateral activo o detectar línea.
-                        // Lateral < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
-                        // TOO_CLOSE_THOLD → pivot alejándose en cambio.
-                        float wall_adc       = (float)adcAvg[OBJ_WALL_ADC_IDX];
-                        uint8_t wall_visible = (wall_adc < OBJ_WALL_THRESHOLD);
-                        uint8_t wall_reverse = obj_wall_rev_latch;   // por counts (2026-07-10)
-                        uint8_t too_close    = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
-                        // Misma ventana que BORDEAR_PARED/PARED_LIBRE, medida desde la
-                        // entrada a toda la secuencia (obj_wall_seq_start_ms).
-                        uint8_t line_ignore2 = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
-                        if (ObjWall_LineConfirmed(line_detected, line_ignore2)) {
-                            line_seen_since_entry = 1;
-                            obj_wall_line_confirm_cnt = 0;
-                            obj_final_turn_pending_ms = HAL_GetTick();
-                            line_state          = LINE_STATE_FOLLOWING;
-                            line_integral       = 0.0f;
-                            line_error_prev     = 0.0f;
-                            line_error_f_d      = 0.0f;
-                            line_lost_ms        = HAL_GetTick();
-                            steering_adjustment = 0.0f;
-                            line_pivot_active   = 0;
-                            obj_wall_seq_start_ms = 0;
-                            obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
-                        } else if (wall_reverse) {
-                            // Demasiado cerca: reversa pareja (mismo P que LINE_STATE_OBJ_RETROCESO,
-                            // ver REV_STRAIGHT_KP/MAX/SLEW). line_pivot_active queda en 0.
-                            float rate_diff = speed_right_rps_s - speed_left_rps_s;
-                            float corr_target = clampf_local(
-                                REV_STRAIGHT_KP * rate_diff,
-                                -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
-                            );
-                            float corr_delta = corr_target - obj_rev_steer_f;
-                            if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
-                            if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
-                            obj_rev_steer_f += corr_delta;
-                            steering_adjustment = obj_rev_steer_f;
-                        } else if (too_close) {
-                            // Demasiado cerca: pivot alejándose de la pared (según sentido)
-                            line_pivot_active  = 1;
-                            motorRightVelocity = (int16_t)clampf_local(
-                                -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
-                            motorLeftVelocity  = (int16_t)clampf_local(
-                                -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
-                        } else if (wall_visible) {
-                            line_state            = LINE_STATE_OBJ_BORDEAR_PARED;
-                            line_pivot_active     = 0;
-                            obj_wall_fwd_start_ms = HAL_GetTick();
-                            obj_wall_vel_integral = 0.0f;
-                        } else {
-                            // Pivot hacia el lado de la pared (opuesto al giro de esquive):
-                            // izquierda si se esquivó a derecha, y viceversa.
-                            line_pivot_active  = 1;
-                            motorRightVelocity = (int16_t)clampf_local(
-                                -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
-                            motorLeftVelocity  = (int16_t)clampf_local(
-                                -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
-                        }
-                        break;
-                    }
-                }
-
-                // Cuando sigue línea: limitar integral para evitar deriva.
-                // Cuando pierde línea (LOST/SEARCHING): permitir hasta ±8 como
-                // BALANCE_ONLY para que el motor izquierdo tenga suficiente salida.
-                if (line_state == LINE_STATE_FOLLOWING) {
-                    if (integral >  2.0f) integral =  2.0f;
-                    if (integral < -2.0f) integral = -2.0f;
-                }
-
-                if (!line_pivot_active) {
-                    float half_steer = steering_adjustment * 0.5f;
-
-                    // En LOST/SEARCHING/OBJ_HOLD/LOST_FWD/EDGE_FWD/WALL_FWD/WALL_CLEAR (solo
-                    // cuando avanzan derecho, steering_adjustment==0): corrección yaw igual
-                    // que BALANCE_ONLY. Cuando esos mismos estados están corrigiendo una
-                    // reversa (steering_adjustment != 0, ver los cases), se respeta esa
-                    // corrección en vez de pisarla con el término de gyro -- antes este
-                    // override se aplicaba siempre que el line_state coincidiera, sin
-                    // importar si había una corrección real activa, y la anulaba en
-                    // silencio. OBJ_ROTATE usa steering_adjustment directo (ver el case).
-                    if (steering_adjustment == 0.0f &&
-                        (line_state == LINE_STATE_LOST     ||
-                         line_state == LINE_STATE_SEARCHING ||
-                         line_state == LINE_STATE_OBJ_ESPERA_REVERSA ||
-                         line_state == LINE_STATE_OBJ_PAUSA_GIRO ||
-                         line_state == LINE_STATE_OBJ_BUSCAR_PARED ||
-                         line_state == LINE_STATE_OBJ_BORDEAR_PARED ||
-                         line_state == LINE_STATE_OBJ_PARED_LIBRE ||
-                         line_state == LINE_STATE_LOST_FWD ||
-                         line_state == LINE_STATE_EDGE_FWD)) {
-                        // 0.23 = 0.3*(100/131): misma restauración de ganancia efectiva
-                        // que la corrección de yaw de balance común (ver ahí). gz crudo
-                        // con zona muerta (sin filtro — ver GZ_YAW_ASSIST_DB).
-                        half_steer = apply_deadbandf((float)gz / 100.0f, GZ_YAW_ASSIST_DB) * 0.23f;
-                    }
-
-                    float mR = pwm_sat - half_steer;
-                    float mL = pwm_sat + half_steer;
-
-                    if (mR >  40.0f) mR =  40.0f;
-                    if (mR < -40.0f) mR = -40.0f;
-                    if (mL >  40.0f) mL =  40.0f;
-                    if (mL < -40.0f) mL = -40.0f;
-
-                    motorRightVelocity = -(int16_t)lroundf(mL);
-                    motorLeftVelocity  = -(int16_t)lroundf(mR);
-                }
-
-            } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
-                line_integral       = 0.0f;
-                line_error_prev     = 0.0f;
-                line_state          = LINE_STATE_FOLLOWING;
-
-                // Control manual normal (comandos por WiFi/USB). El banco de pruebas
-                // del giro de 90° que se activaba con el joystick/comandos en reposo
-                // se eliminó a pedido del usuario: MANUAL ahora solo mueve el robot en
-                // respuesta a comandos, sin ningún ciclo automático de rotación. También
-                // se entra acá con manual_line_override=1 (LINE_FOLLOWING sin ver la
-                // línea + comando activo) — mismo control, reutilizado tal cual; el
-                // `line_state = LINE_STATE_FOLLOWING` de arriba mantiene la máquina de
-                // estados del seguidor limpia mientras dura el override.
-                uint8_t manual_turning = fabsf(manual_steering_cmd) > 0.5f;
-
-                if (manual_turning) {
-                    // Giro: rampa suave hacia manual_steering_cmd. Bajado a 1/4 de la
-                    // rampa anterior (0.25→0.0625/ciclo) porque, aun con la magnitud del
-                    // comando también reducida a 1/4 (±60→±15 en MOVE_LEFT/RIGHT,
-                    // UNER.c), el giro seguía sintiéndose demasiado fuerte — "siempre
-                    // movimientos suaves".
-                    const float STEER_RATE = 0.0625f;
-                    float steer_delta = manual_steering_cmd - steering_adjustment;
-                    if (steer_delta >  STEER_RATE) steer_delta =  STEER_RATE;
-                    if (steer_delta < -STEER_RATE) steer_delta = -STEER_RATE;
-                    steering_adjustment += steer_delta;
-                    manual_straight_steer_f = steering_adjustment; // sincronizado para la transición a "sin giro"
-                } else {
-                    // Sin giro comandado: corrección de rumbo recto para que
-                    // adelante/atrás no se curve por asimetría mecánica entre ruedas —
-                    // mismo algoritmo P sobre diferencia de velocidad de ruedas ya
-                    // usado y calibrado en la reversa recta de OBJ_REVERSE/wall-following
-                    // (ver REV_STRAIGHT_KP/MAX/SLEW), reutilizado tal cual.
-                    float rate_diff = speed_right_rps_s - speed_left_rps_s;
-                    float corr_target = clampf_local(
-                        REV_STRAIGHT_KP * rate_diff,
-                        -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
-                    );
-                    float corr_delta = corr_target - manual_straight_steer_f;
-                    if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
-                    if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
-                    manual_straight_steer_f += corr_delta;
-                    steering_adjustment = manual_straight_steer_f;
-                }
-
-                static float prev_steering_cmd = 0.0f;
-                if ((manual_steering_cmd > 0.5f && prev_steering_cmd < -0.5f) ||
-                    (manual_steering_cmd < -0.5f && prev_steering_cmd > 0.5f)) {
-                    integral = 0.0f;
-                }
-                prev_steering_cmd = manual_steering_cmd;
-
-                float mR = pwm_sat - steering_adjustment;
-                float mL = pwm_sat + steering_adjustment;
-                if (mR >  100.0f) mR =  100.0f;
-                if (mR < -100.0f) mR = -100.0f;
-                if (mL >  100.0f) mL =  100.0f;
-                if (mL < -100.0f) mL = -100.0f;
-
-                motorRightVelocity = -(int16_t)lroundf(mL);
-                motorLeftVelocity  = -(int16_t)lroundf(mR);
-
-            } else if (robot_state != ROBOT_STATE_MOTOR_TEST) {
-                line_integral       = 0.0f;
-                line_error_prev     = 0.0f;
-                steering_adjustment = 0.0f;
-                line_state          = LINE_STATE_FOLLOWING;
-
-                // steer_pid_enabled=0: corrección open-loop por giroscopio Z (comportamiento original)
-                // steer_pid_enabled=1: corrección de lazo cerrado por encoders
-                // Ganancia 0.23 = 0.3*(100/131): restaura la ganancia EFECTIVA que estaba
-                // calibrada antes del fix de escala del gyro (2026-07-04). gz crudo con
-                // zona muerta (sin filtro por software — ver GZ_YAW_ASSIST_DB): giros
-                // chicos por ruido no generan corrección ni disparan la compensación
-                // de deadband de motor.
-                float correction = steer_pid_enabled
-                                 ? steer_correction
-                                 : (-apply_deadbandf((float)gz / 100.0f, GZ_YAW_ASSIST_DB) * 0.23f);
-
-                float mR = pwm_sat + correction;
-                float mL = pwm_sat - correction;
-
-                if (mR >  100.0f) mR =  100.0f;
-                if (mR < -100.0f) mR = -100.0f;
-                if (mL >  100.0f) mL =  100.0f;
-                if (mL < -100.0f) mL = -100.0f;
-
-                motorRightVelocity = -(int16_t)lroundf(mL);
-                motorLeftVelocity  = -(int16_t)lroundf(mR);
-            }
-            // ROBOT_STATE_MOTOR_TEST: SETMOTORSPEED controla directamente
+            float pwm_delta = pwm_sat - pwm_sat_prev;
+            if (pwm_delta >  pwm_step_max) pwm_delta =  pwm_step_max;
+            if (pwm_delta < -pwm_step_max) pwm_delta = -pwm_step_max;
+
+            pwm_sat = pwm_sat_prev + pwm_delta;
+            pwm_sat_prev = pwm_sat;
         }
 
-        roll_deg = filtered_roll_deg;
-
-        // -------------------------------------------------------
-        // LOG MINIMO EN 2ms
-        // -------------------------------------------------------
-        log_counter++;
-
-        if (f_send_wifi_log && (log_counter % LOG_WIFI_DECIM == 0)) {
-            WifiLogData_t wlog;
-            wlog.t_ms       = HAL_GetTick();
-            wlog.roll_filt  = filtered_roll_deg;
-            wlog.output     = output;
-            wlog.p_term     = p_term;
-            wlog.i_term     = i_term;
-            wlog.d_term     = d_term;
-            wlog.mR         = motorRightVelocity;
-            wlog.mL         = motorLeftVelocity;
-            wlog.dyn_sp     = dynamic_setpoint_f;
-            wlog.dt_ctrl_us = (uint32_t)(dt_ctrl * 1000000.0f);
-
-            wlog.line_error          = line_error;
-            wlog.p_line              = log_p_line;
-            wlog.i_line              = log_i_line;
-            wlog.d_line              = log_d_line;
-            wlog.steering_adjustment = steering_adjustment;
-            wlog.adc1                = adcAvg[0];
-            wlog.adc2                = adcAvg[1];
-            wlog.adc3                = adcAvg[2];
-            wlog.adc4                = adcAvg[3];
-
-            UNER_SendWifiLogData(&wlog);
-        }
-
-        // Push de odometría/línea por WiFi para graficar (mapa XY, franja de línea) en
-        // Qt: independiente de ACTIVATE_WIFI_LOG, arranca solo con f_wifi_connected y a
-        // un ritmo bajo (WIFI_ODOM_PERIOD_MS) para no competir por ancho de banda/CPU
-        // con la telemetría de control ya existente.
-        if (f_wifi_connected && (uint32_t)(HAL_GetTick() - last_wifi_odom_ms) >= WIFI_ODOM_PERIOD_MS) {
-            last_wifi_odom_ms = HAL_GetTick();
-
-            WifiOdomData_t odata;
-            odata.seq           = wifi_odom_seq++;
-            odata.t_ms          = HAL_GetTick();
-            odata.x_m           = odom_x_m;
-            odata.y_m           = odom_y_m;
-            odata.theta_deg     = odom_theta_deg;
-            odata.line_error    = line_error_disp;
-            odata.line_detected = line_detected_disp;
-            odata.robot_state   = robot_state;
-            odata.line_state    = (uint8_t)line_state;
-            odata.adc5          = adcAvg[4];  // sensores de objeto: menos = más cerca,
-            odata.adc6          = adcAvg[5];  // ~4095 = nada adelante — para graficar
-            odata.adc7          = adcAvg[6];  // la barrera/cuerpo frente al robot en Qt
-            odata.adc8          = adcAvg[7];
-            odata.roll_deg      = filtered_roll_deg;  // balanceo → Vista 3D de Qt
-            odata.lat_deg       = lat_tilt_f;          // banking lateral → Vista 3D de Qt
-
-            UNER_SendWifiOdomData(&odata);
-        }
-
-        if (f_send_csv_log && !log_header_sent) {
-            USB_DebugStr("t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,dyn_sp,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n");
-            log_header_sent = 1;
-        }
-
-        if (f_send_csv_log && (log_counter % LOG_DECIM == 0)) {
-            char buf[128];
-
-            int roll_i   = (int)(filtered_roll_deg * 1000.0f);
-            int p_i      = (int)(p_term * 1000.0f);
-            int i_i      = (int)(i_term * 1000.0f);
-            int d_i      = (int)(d_term * 1000.0f);
-            int sp_i     = (int)(dynamic_setpoint_f * 1000.0f);
-            int error_i  = (int)(error * 1000.0f);
-            int gyrof_i  = (int)(gyro_f * 1000.0f);
-            int accel_i  = (int)(accel_ang_deg * 1000.0f);
-            int accelf_i = (int)(accel_roll_f * 1000.0f);
-            int output_i = (int)(output * 1000.0f);
-            int pwmcmd_i = (int)(pwm_cmd * 100.0f);
-            int pwmsat_i = (int)(pwm_sat * 100.0f);
-            int pitch_i  = (int)(pitch_deg * 1000.0f);
-
-            int ax_i = (int)ax;
-            int ay_i = (int)ay;
-            int az_i = (int)az;
-            int gx_i = (int)gx;
-            int gy_i = (int)gy;
-            int gz_i = (int)gz;
-
-            int len = snprintf(buf, sizeof(buf),
-                "%lu,%lu,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
-                HAL_GetTick(),                 // t_ms
-                (uint32_t)(dt_real * 1000000.0f), // dt_us
-                (uint32_t)(dt_ctrl * 1000000.0f), // dt_ctrl_us
-                accel_i,                       // accel_roll x1000
-                accelf_i,                      // accel_roll_f x1000
-                (int)(gyro_rate_dps * 1000.0f),// gyro_y x1000
-                gyrof_i,                       // gyro_f x1000
-                roll_i,                        // roll_filt x1000
-                sp_i,                          // dyn_sp x1000
-                error_i,                       // error x1000
-                p_i,                           // p x1000
-                i_i,                           // i x1000
-                d_i,                           // d x1000
-                output_i,                      // output x1000
-                pwmcmd_i,                      // pwm_cmd x100
-                pwmsat_i,                      // pwm_sat x100
-                sat_flag,                      // sat
-                motorRightVelocity,            // mR
-                motorLeftVelocity,             // mL
-                pitch_i,                       // pitch x1000
-                ax_i, ay_i, az_i,              // accel raw
-                gx_i, gy_i, gz_i               // gyro raw
-            );
-
-            if (len > 0) {
-                USB_DebugSend((uint8_t*)buf, (uint16_t)len);
+        // Acumulación de la integral (∫e·dt ≈ Σ e_k·dt) con anti-windup por
+        // integración condicional: si el PWM ya está saturado, seguir
+        // acumulando no empuja más fuerte (el motor no da más) — solo infla
+        // 'integral', y al volver el error esa carga acumulada tarda en
+        // descargarse y produce un sobrepaso enorme. Regla: saturado, solo
+        // se integra si el error tiene el signo CONTRARIO al comando (o sea,
+        // si integrar ayuda a salir de la saturación, no a hundirse más).
+        if (!late_cycle) {
+            if (fabsf(pwm_sat) <= pwm_limit) {
+                integral += control_error * dt_ctrl;
+            } else {
+                if (pwm_cmd >  pwm_limit && control_error < 0) integral += control_error * dt_ctrl;
+                else if (pwm_cmd < -pwm_limit && control_error > 0) integral += control_error * dt_ctrl;
             }
         }
 
+        sat_flag = (fabsf(pwm_sat) >= pwm_limit) ? 1 : 0;
 
+        if (integral >  I_MAX) integral =  I_MAX;
+        if (integral < -I_MAX) integral = -I_MAX;
 
+        if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
+            if (integral >  8.0f) integral =  8.0f;
+            if (integral < -8.0f) integral = -8.0f;
+        }
+
+        if (robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+            if (integral >  8.0f) integral =  8.0f;
+            if (integral < -8.0f) integral = -8.0f;
+        }
+
+        if (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) {
+            if (integral >  15.0f) integral =  15.0f;
+            if (integral < -15.0f) integral = -15.0f;
+        }
+
+        if (robot_state == ROBOT_STATE_MANUAL_CONTROL) {
+            if (integral >  8.0f) integral =  8.0f;
+            if (integral < -8.0f) integral = -8.0f;
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  Handlers por sub-estado del seguidor de línea (etapa 15, modo LINEA).
+//  Cada función es el cuerpo del case correspondiente del switch de
+//  Ctrl_MotoresLinea (más abajo): decide steering_adjustment y, si toma
+//  control directo de las ruedas (pivots/frenos), setea line_pivot_active.
+// ═════════════════════════════════════════════════════════════════════
+
+// FOLLOWING: PID de línea sobre el centroide → steering; si la línea
+// desaparece >150ms, decide a qué secuencia de búsqueda saltar.
+static void LineState_Following(void)
+{
+    if (line_detected) {
+        line_seen_since_entry = 1;
+        line_lost_ms = HAL_GetTick();
+
+        // Snapshot de pose para el retorno por odometría: si más
+        // adelante se pierde la línea, este es el punto al que volver.
+        line_loss_x_m        = odom_x_m;
+        line_loss_y_m        = odom_y_m;
+        line_loss_pose_valid = 1;
+
+        // Segundo PID del sistema, mismo esquema que el de
+        // balance pero sobre OTRA variable: entrada = error
+        // de línea [-1..1] (centroide), salida = diferencia
+        // de PWM entre ruedas (steering, ±20). Kp=10 → con
+        // la línea a mitad de camino de un extremo (e=0.5)
+        // pide 5 de diferencial. Los dos PID no compiten:
+        // balance decide el PWM COMÚN, este el DIFERENCIAL.
+        float p_line = KP_LINE * line_error;
+
+        if (!late_cycle) {
+            line_integral += line_error * dt_ctrl;
+        }
+
+        if (line_integral >  5.0f) line_integral =  5.0f;
+        if (line_integral < -5.0f) line_integral = -5.0f;
+
+        float i_line = KI_LINE * line_integral;
+
+        // EMA (β=0.4, τ≈25ms) ANTES de derivar: la derivada
+        // amplifica ruido, así que se deriva la versión
+        // filtrada del error y no el error crudo.
+        line_error_f_d += 0.4f * (line_error - line_error_f_d);
+
+        float d_line = 0.0f;
+        if (!late_cycle) {
+            float line_delta = line_error_f_d - line_error_prev;
+            if (line_delta >  0.3f) line_delta =  0.3f;
+            if (line_delta < -0.3f) line_delta = -0.3f;
+            d_line = KD_LINE * (line_delta / dt_ctrl);
+        }
+        line_error_prev = line_error_f_d;
+
+        float steering_cmd = p_line + i_line + d_line;
+
+        // Steering directo: proporcional al error de línea sin inner PI.
+        // El inner PI de encoders generaba problemas si el signo de
+        // diff_actual no coincidía con la convención esperada.
+        steering_adjustment = clampf_local(steering_cmd, -20.0f, 20.0f);
+
+        log_p_line = p_line;
+        log_i_line = i_line;
+        log_d_line = d_line;
+
+    } else {
+        if (!line_seen_since_entry) {
+            // Todavía no adquirió la línea desde que se activó el modo:
+            // mejor quedarse estable que disparar una búsqueda ciega.
+            line_lost_ms = HAL_GetTick();
+            line_integral = 0.0f;
+            steering_adjustment = 0.0f;
+            return;
+        }
+        uint32_t ms_sin_linea = HAL_GetTick() - line_lost_ms;
+
+        // Sin línea: conservar steering_adjustment (último valor conocido)
+        // para que el robot siga corrigiendo hacia la línea.
+
+        // 150ms (1000→300→150): frenar apenas se confirma la pérdida
+        // para no alejarse del punto y llegar al giro de 180° con la
+        // menor velocidad posible. Sigue filtrando parpadeos de sensor
+        // (un flicker real dura pocos ciclos de 10ms).
+        if (ms_sin_linea > 150) {
+            line_search_dir      = last_line_dir;
+            line_integral        = 0.0f;
+            steering_adjustment  = 0.0f;
+            // Snapshot: ¿el último sensor con señal fue un extremo sin
+            // soporte del medio, o vino acompañado/era del medio?
+            line_was_centered_on_lost = !last_detected_edge_only;
+            last_detected_edge_only   = 0;
+            // Centrado → secuencia de giro 180° (LOST/LOST_BRAKE/LOST_ROTATE).
+            // Por un extremo (curva) → secuencia de giro 90° hacia ese lado
+            // (EDGE_WAIT/EDGE_ROTATE/EDGE_FWD).
+            line_state = line_was_centered_on_lost
+                       ? LINE_STATE_LOST
+                       : LINE_STATE_EDGE_WAIT;
+            lrot_brake_start_ms = 0;
+        }
+    }
+
+    if (steering_adjustment >  20.0f) steering_adjustment =  20.0f;
+    if (steering_adjustment < -20.0f) steering_adjustment = -20.0f;
+}
+
+// LOST/SEARCHING: sin línea, frenar primero y luego girar 180°.
+static void LineState_Lost(void)
+{
+    if (line_detected) {
+        line_seen_since_entry = 1;
+        line_integral       = 0.0f;
+        line_error_prev     = 0.0f;
+        line_lost_ms        = HAL_GetTick();
+        line_steer_fb_int   = 0.0f;
+        line_state          = LINE_STATE_FOLLOWING;
+    } else {
+        line_state          = LINE_STATE_LOST_BRAKE;
+        lrot_brake_start_ms = 0;
+    }
+    steering_adjustment = 0.0f;
+}
+
+// LOST_BRAKE: frena hasta velocidad baja sostenida (o timeout) antes del 180°.
+static void LineState_LostBrake(void)
+{
+    // Frena hasta velocidad baja SOSTENIDA (o timeout) antes del giro 180°.
+    // 2026-07-05: se compara la velocidad CRUDA sostenida N ciclos, no la
+    // deadbandeada — restar el deadband (0.35) corría el umbral efectivo a
+    // ~0.5 m/s real y el robot arrancaba el pivot rodando rápido → caída.
+    // Exigirla baja 15 ciclos seguidos filtra los picos de cuantización
+    // (un pico aislado resetea el contador un instante, un robot rodando
+    // nunca la mantiene baja 150ms).
+    const uint32_t LBRAKE_TIMEOUT      = 2500U;   // colchón, no corte normal
+    const float    LBRAKE_VEL_THR      = 0.25f;   // m/s crudos
+    const uint8_t  LBRAKE_QUIET_CYCLES = 15U;     // 150ms sostenidos
+
+    if (lrot_brake_start_ms == 0) {
+        lrot_brake_start_ms = HAL_GetTick();
+        line_quiet_cycles   = 0;
+    }
+
+    if (line_detected) {
+        line_integral        = 0.0f;
+        line_error_prev      = 0.0f;
+        line_lost_ms         = HAL_GetTick();
+        line_steer_fb_int    = 0.0f;
+        line_state           = LINE_STATE_FOLLOWING;
+        lrot_brake_start_ms  = 0;
+        return;
+    }
+
+    if (fabsf(velocity_est_f) < LBRAKE_VEL_THR) {
+        if (line_quiet_cycles < 255) line_quiet_cycles++;
+    } else {
+        line_quiet_cycles = 0;
+    }
+
+    uint32_t elapsed = HAL_GetTick() - lrot_brake_start_ms;
+    if (line_quiet_cycles >= LBRAKE_QUIET_CYCLES ||
+        elapsed >= LBRAKE_TIMEOUT) {
+        // Solo se llega acá cuando se perdió centrado (ver la rama de
+        // salida de LINE_STATE_FOLLOWING); el caso "por los extremos" va
+        // directo a LINE_STATE_EDGE_WAIT y nunca pasa por este estado.
+        line_state          = LINE_STATE_LOST_ROTATE;
+        obj_rot_initialized = 0;
+        obj_rot_phase       = 0;
+        obj_rot_heading     = 0.0f;
+        obj_rot_phase1_ms   = 0;
+        obj_rot_start_ms    = 0;
+        lrot_brake_start_ms = 0;
+    }
+    steering_adjustment = 0.0f;
+}
+
+// LOST_ROTATE: giro de 180° por encoders+gyro para buscar la línea perdida.
+static void LineState_LostRotate(void)
+{
+    // Giro 180° derecha para buscar la línea perdida.
+    // Misma lógica gz+encoder que OBJ_ROTATE y MANUAL, escalada a 180°.
+    const float  LROT_ENC_TARGET   = 960.0f;  // antes 880 — quedaba corto (~165° reales), reescalado 880*(180/165)
+    const float  LROT_PIVOT        = 24.0f;  // antes 14→20→24: arranques dispares por pwm_sat residual compitiendo con el pivot
+    const float  LROT_BRAKE        = 10.0f;  // antes 16 — torque fijo sin medir velocidad remanente, a veces pasaba de frenada y desestabilizaba
+    const float  LROT_SLOWDOWN_DEG = 55.0f;
+    const float  LROT_ABS_TARGET   = 180.0f;
+    // P0_MAX/P1_MAX son colchón de seguridad (peor caso ~2.3s), no el corte normal
+    const uint32_t LROT_P0_MAX     = 1500U;
+    const uint32_t LROT_P1_MAX     = 800U;
+    const float  LROT_ENC_FRAC     = 0.60f;  // frena al 60% del recorrido
+
+    if (!obj_rot_initialized) {
+        __disable_irq();
+        obj_rot_r0 = encoder_right;
+        obj_rot_l0 = encoder_left;
+        __enable_irq();
+        obj_rot_initialized = 1;
+        obj_rot_start_ms    = HAL_GetTick();
+        obj_rot_phase       = 0;
+        obj_rot_heading     = 0.0f;
+        obj_rot_phase1_ms   = 0;
+    }
+
+    // El giro no sale anticipadamente al ver línea a mitad de camino (podría
+    // ser una detección espuria); siempre completa por encoder.
+    float lrot_gz = (float)gz / 100.0f;
+    obj_rot_heading += lrot_gz * DT_CTRL_FIXED;
+
+    __disable_irq();
+    int32_t lrot_dr = encoder_right - obj_rot_r0;
+    int32_t lrot_dl = encoder_left  - obj_rot_l0;
+    __enable_irq();
+    float lrot_counts    = (fabsf((float)lrot_dr) + fabsf((float)lrot_dl)) * 0.5f;
+    float lrot_enc_deg   = lrot_counts * (LROT_ABS_TARGET / LROT_ENC_TARGET);
+    float lrot_abs_hdg   = fmaxf(fabsf(obj_rot_heading), lrot_enc_deg);
+    float lrot_enc_thr   = LROT_ENC_TARGET * LROT_ENC_FRAC;
+
+    // 2026-07-05: con gz/100 (resolución nueva, 31% más alta que /131) el
+    // gyro dentro del fmaxf hace pensar que ya se completó el 70% del giro
+    // antes de que el encoder lo confirme físicamente — entra temprano a la
+    // fase de terminación (mucho más débil) y el resto del giro se arrastra
+    // lento y a pulsos. Fix mínimo: la transición de fase se decide SOLO por
+    // encoder (la fuente que no cambió de escala); el gyro (lrot_abs_hdg)
+    // queda únicamente para la red de seguridad de sobregiro más abajo.
+    if (obj_rot_phase == 0) {
+        uint32_t elapsed = HAL_GetTick() - obj_rot_start_ms;
+        if (lrot_counts  >= lrot_enc_thr ||
+            elapsed      >= LROT_P0_MAX) {
+            obj_rot_phase     = 1;
+            obj_rot_phase1_ms = HAL_GetTick();
+        } else {
+            // Rampa de frenado interna también solo por encoder (mismo
+            // motivo que la transición de fase, ver comentario arriba) —
+            // con el gyro inflado, "remaining" se achicaba antes de tiempo
+            // y bajaba el pivot (ya de por sí solo 14 PWM) durante buena
+            // parte del giro, no solo cerca del final.
+            float remaining = LROT_ABS_TARGET - lrot_enc_deg;
+            float slowdown  = (remaining < LROT_SLOWDOWN_DEG)
+                            ? (remaining / LROT_SLOWDOWN_DEG) : 1.0f;
+            float pivot = LROT_PIVOT * fmaxf(slowdown, 0.0f);
+            line_pivot_active  = 1;
+            motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
+        }
+    }
+
+    if (obj_rot_phase == 1) {
+        uint32_t p1e      = HAL_GetTick() - obj_rot_phase1_ms;
+        int enc_done      = (lrot_counts >= LROT_ENC_TARGET);
+        // El freno arranca antes de llegar al 100% (antes esperaba a
+        // enc_done exacto = actuaba de golpe justo al final, rompiendo el
+        // equilibrio). Ahora entra al 85% del recorrido; el corte final
+        // (enc_done + duración) no cambia, así que no acorta el giro.
+        int enc_near_done = (lrot_counts >= LROT_ENC_TARGET * 0.85f);
+        int overshoot     = (lrot_abs_hdg > LROT_ABS_TARGET * 1.2f);
+        // Freno fuerte a torque fijo por tiempo corto y acotado, sin
+        // buscar una velocidad de frenado exacta.
+        const uint32_t LROT_BRAKE_DURATION = 250U;  // antes 400 — frenaba bien y luego "volvía" un poco (sobrefrenaba en reversa el tiempo que le quedaba)
+        if ((enc_done && p1e >= LROT_BRAKE_DURATION) || p1e >= LROT_P1_MAX || overshoot) {
+            // Bypass de LOST_SETTLE: arranca a avanzar sin esperar. Si ya
+            // quedó sobre la línea, directo a FOLLOWING.
+            if (line_detected) {
+                line_seen_since_entry = 1;
+                line_integral         = 0.0f;
+                line_error_prev       = 0.0f;
+                line_lost_ms          = HAL_GetTick();
+                line_state            = LINE_STATE_FOLLOWING;
+            } else {
+                line_state          = LINE_STATE_LOST_FWD;
+                line_lost_ms        = HAL_GetTick();
+                lost_fwd_vel_integral = 0.0f;
+            }
+            obj_rot_initialized = 0;
+            obj_rot_phase       = 0;
+            obj_rot_heading     = 0.0f;
+            steering_adjustment = 0.0f;
+        } else if (!enc_near_done) {
+            // Encoder aún no llegó al 85%: seguir pivoteando suave
+            float remaining = LROT_ENC_TARGET - lrot_counts;
+            float ramp = fminf(remaining / (LROT_ENC_TARGET * 0.15f), 1.0f);
+            float pivot = LROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
+            line_pivot_active  = 1;
+            motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
+        } else {
+            // Encoder OK: freno fuerte a torque fijo (sin escalar), 400ms
+            // como mucho (ver LROT_BRAKE_DURATION arriba).
+            line_pivot_active  = 1;
+            motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - LROT_BRAKE), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + LROT_BRAKE), -60.0f, 60.0f);
+        }
+    }
+}
+
+// LOST_SETTLE: pausa de estabilización post-180° antes de avanzar.
+static void LineState_LostSettle(void)
+{
+    // Post-180°: pausa de estabilización fuerte (upright + freno de
+    // encoders) antes de arrancar a avanzar. Sale por tiempo mínimo
+    // cumplido Y velocidad/inclinación estabilizadas. El timeout es
+    // solo un colchón de seguridad (3s, no un corte normal) — antes
+    // (1200ms) cortaba antes de frenar de verdad y el robot arrancaba
+    // a avanzar con velocidad residual del giro.
+    const uint32_t LSETTLE_MIN_MS   = 400U;
+    const uint32_t LSETTLE_TIMEOUT  = 3000U;
+    const float    LSETTLE_VEL_THR  = 0.25f;   // m/s crudos (ver comentario abajo)
+    const float    LSETTLE_TILT_THR = 3.0f;    // grados respecto al setpoint
+
+    if (lrot_settle_start_ms == 0) lrot_settle_start_ms = HAL_GetTick();
+    steering_adjustment = 0.0f;
+
+    if (line_detected) {
+        line_seen_since_entry = 1;
+        line_integral         = 0.0f;
+        line_error_prev       = 0.0f;
+        line_lost_ms          = HAL_GetTick();
+        line_state            = LINE_STATE_FOLLOWING;
+        lrot_settle_start_ms  = 0;
+        return;
+    }
+
+    uint32_t elapsed  = HAL_GetTick() - lrot_settle_start_ms;
+    float tilt_err    = fabsf(filtered_roll_deg - dynamic_setpoint_f);
+    // velocidad cruda con umbral 0.25 (deadbandeada con 0.10 equivalía a
+    // ~0.45 m/s reales — demasiado permisivo para "estabilizado")
+    int settled       = (elapsed >= LSETTLE_MIN_MS) &&
+                        (fabsf(velocity_est_f) < LSETTLE_VEL_THR) &&
+                        (tilt_err < LSETTLE_TILT_THR);
+
+    if (settled || elapsed >= LSETTLE_TIMEOUT) {
+        line_state           = LINE_STATE_LOST_FWD;
+        line_lost_ms         = HAL_GetTick();
+        lrot_settle_start_ms = 0;
+        lost_fwd_vel_integral = 0.0f;
+    }
+}
+
+// LOST_FWD: retorno por odometría al punto donde se perdió la línea.
+static void LineState_LostFwd(void)
+{
+    // Post-180°: RETORNO POR ODOMETRÍA — en vez de avanzar a ciegas,
+    // navega hacia la pose donde se vio la línea por última vez
+    // (line_loss_x/y_m): steering P sobre el error de rumbo entre el
+    // bearing al objetivo y theta odométrico. La velocidad la sigue
+    // regulando el PI del bloque de setpoints (LOST_FWD_*).
+    // Salidas: línea detectada → FOLLOWING; punto alcanzado sin línea
+    // → GIVEN_UP; timeout como colchón de seguridad (10s, subido de
+    // 5s a pedido del usuario para dar más tiempo de búsqueda).
+    const uint32_t LOST_FWD_TIMEOUT = 10000U;
+    if (line_detected) {
+        line_seen_since_entry = 1;
+        line_integral     = 0.0f;
+        line_error_prev   = 0.0f;
+        line_lost_ms      = HAL_GetTick();
+        line_state        = LINE_STATE_FOLLOWING;
+        steering_adjustment = 0.0f;
+        lost_ret_ov_active  = 0;
+    } else if ((HAL_GetTick() - line_lost_ms) > LOST_FWD_TIMEOUT) {
+        line_state = LINE_STATE_GIVEN_UP;
+        steering_adjustment = 0.0f;
+        lost_ret_ov_active  = 0;
+    } else if (line_loss_pose_valid) {
+        float ret_dx   = line_loss_x_m - odom_x_m;
+        float ret_dy   = line_loss_y_m - odom_y_m;
+        float ret_dist = sqrtf(ret_dx * ret_dx + ret_dy * ret_dy);
+        float ret_bearing = atan2f(ret_dy, ret_dx) * (180.0f / M_PI);
+        float ret_herr    = ret_bearing - odom_theta_deg;
+        if      (ret_herr >  180.0f) ret_herr -= 360.0f;
+        else if (ret_herr < -180.0f) ret_herr += 360.0f;
+
+        // Punto alcanzado (o pasado de costado): NO rendirse ahí
+        // mismo — sobrepasar en línea recta para que los sensores
+        // crucen la cinta (ver LOST_RETURN_OVERSHOOT_M).
+        if (!lost_ret_ov_active &&
+            (ret_dist < LOST_RETURN_REACHED_M ||
+             (ret_dist < LOST_RETURN_PASS_WIN_M &&
+              fabsf(ret_herr) > 120.0f))) {
+            lost_ret_ov_active = 1;
+            lost_ret_ov_x      = odom_x_m;
+            lost_ret_ov_y      = odom_y_m;
+        }
+
+        if (lost_ret_ov_active) {
+            float ov_dx = odom_x_m - lost_ret_ov_x;
+            float ov_dy = odom_y_m - lost_ret_ov_y;
+            if (sqrtf(ov_dx * ov_dx + ov_dy * ov_dy) >=
+                LOST_RETURN_OVERSHOOT_M) {
+                // Sobrepaso agotado sin línea: reposo (GIVEN_UP
+                // retoma solo si la línea vuelve a aparecer).
+                line_state = LINE_STATE_GIVEN_UP;
+                lost_ret_ov_active = 0;
+            }
+            // Derecho, sin navegación: el yaw-assist por gyro
+            // (steering==0) mantiene el rumbo.
+            steering_adjustment = 0.0f;
+        } else {
+            // Signo: steering positivo genera gz negativo (misma
+            // convención que el amortiguador gz*0.3), y theta integra
+            // ODOM_THETA_SIGN*gz — de ahí el -ODOM_THETA_SIGN.
+            steering_adjustment = clampf_local(
+                -ODOM_THETA_SIGN * LOST_RETURN_STEER_KP * ret_herr,
+                -LOST_RETURN_STEER_MAX, LOST_RETURN_STEER_MAX);
+        }
+    } else {
+        // Sin snapshot válido (recién entrado al modo): avance recto
+        // con el comportamiento anterior (yaw-assist por gyro).
+        steering_adjustment = 0.0f;
+    }
+}
+
+// EDGE_WAIT: perdida por un extremo (curva) — frena antes del giro de 45°.
+static void LineState_EdgeWait(void)
+{
+    // Perdida por un extremo (curva): frena hasta velocidad baja (o
+    // timeout) antes del giro de 90°. La entrada a este estado ya
+    // ocurrió >=1s después de perder la línea (ver salida de FOLLOWING),
+    // así que solo falta esperar a que el robot esté quieto.
+    // Mismo gate de quietud sostenida que LOST_BRAKE (ver comentario ahí).
+    const uint32_t EWAIT_TIMEOUT       = 2500U;
+    const float    EWAIT_VEL_THR       = 0.25f;  // m/s crudos
+    const uint8_t  EWAIT_QUIET_CYCLES  = 15U;    // 150ms sostenidos
+
+    if (edge_wait_start_ms == 0) {
+        edge_wait_start_ms = HAL_GetTick();
+        line_quiet_cycles  = 0;
+    }
+    steering_adjustment = 0.0f;
+
+    if (fabsf(velocity_est_f) < EWAIT_VEL_THR) {
+        if (line_quiet_cycles < 255) line_quiet_cycles++;
+    } else {
+        line_quiet_cycles = 0;
+    }
+
+    uint32_t elapsed = HAL_GetTick() - edge_wait_start_ms;
+    if (line_quiet_cycles >= EWAIT_QUIET_CYCLES ||
+        elapsed >= EWAIT_TIMEOUT) {
+        line_state          = LINE_STATE_EDGE_ROTATE;
+        obj_rot_initialized = 0;
+        obj_rot_phase       = 0;
+        obj_rot_heading     = 0.0f;
+        obj_rot_phase1_ms   = 0;
+        obj_rot_start_ms    = 0;
+        edge_wait_start_ms  = 0;
+    }
+}
+
+// EDGE_ROTATE: gira 45° hacia el lado por el que se fue la línea.
+static void LineState_EdgeRotate(void)
+{
+    // Gira 60° (antes 90°, a pedido del usuario) hacia el lado donde se
+    // vio la línea por última vez (line_search_dir: +1=izquierda,
+    // -1=derecha, convención "izq=positivo"). Misma lógica gz+encoder
+    // que LOST_ROTATE. No sale anticipadamente si ve la línea (igual
+    // que LOST_ROTATE) — siempre completa el giro por encoder.
+    // Bajado de 60° a 45° (2026-07-01). EROT_ENC_TARGET y
+    // EROT_SLOWDOWN_DEG escalados en proporción 45/90 respecto a los
+    // valores base de 90° (440 y 55).
+    const float  EROT_ENC_TARGET   = 220.0f;
+    const float  EROT_PIVOT        = 14.0f;
+    const float  EROT_BRAKE        = 16.0f;  // ver comentario en LOST_ROTATE (2026-07-01)
+    const float  EROT_SLOWDOWN_DEG = 28.0f;
+    const float  EROT_ABS_TARGET   = 45.0f;
+    const uint32_t EROT_P0_MAX     = 1000U;  // ver comentario en LOST_ROTATE (2026-07-01)
+    const uint32_t EROT_P1_MAX     = 800U;
+    const float  EROT_ENC_FRAC     = 0.60f;
+    // dir: +1 = pivotea derecha (convención de OBJ_ROTATE/LOST_ROTATE),
+    // -1 = pivotea izquierda (como OBJ_WALL_TURN). 2026-07-01: signo
+    // invertido tras comprobar en el robot que giraba al lado contrario
+    // del esperado — con esto, line_search_dir>0 (izq) -> dir=+1 (derecha).
+    const float  EROT_DIR          = line_search_dir;
+
+    if (!obj_rot_initialized) {
+        __disable_irq();
+        obj_rot_r0 = encoder_right;
+        obj_rot_l0 = encoder_left;
+        __enable_irq();
+        obj_rot_initialized = 1;
+        obj_rot_start_ms    = HAL_GetTick();
+        obj_rot_phase       = 0;
+        obj_rot_heading     = 0.0f;
+        obj_rot_phase1_ms   = 0;
+    }
+
+    float erot_gz = (float)gz / 100.0f;
+    obj_rot_heading += erot_gz * DT_CTRL_FIXED;
+
+    __disable_irq();
+    int32_t erot_dr = encoder_right - obj_rot_r0;
+    int32_t erot_dl = encoder_left  - obj_rot_l0;
+    __enable_irq();
+    float erot_counts  = (fabsf((float)erot_dr) + fabsf((float)erot_dl)) * 0.5f;
+    float erot_enc_deg = erot_counts * (EROT_ABS_TARGET / EROT_ENC_TARGET);
+    float erot_abs_hdg = fmaxf(fabsf(obj_rot_heading), erot_enc_deg);
+    float erot_enc_thr = EROT_ENC_TARGET * EROT_ENC_FRAC;
+
+    if (obj_rot_phase == 0) {
+        uint32_t elapsed = HAL_GetTick() - obj_rot_start_ms;
+        if (erot_abs_hdg >= EROT_ABS_TARGET * 0.70f ||
+            erot_counts  >= erot_enc_thr ||
+            elapsed      >= EROT_P0_MAX) {
+            obj_rot_phase     = 1;
+            obj_rot_phase1_ms = HAL_GetTick();
+        } else {
+            float remaining = EROT_ABS_TARGET - erot_abs_hdg;
+            float slowdown  = (remaining < EROT_SLOWDOWN_DEG)
+                            ? (remaining / EROT_SLOWDOWN_DEG) : 1.0f;
+            float pivot = EROT_DIR * EROT_PIVOT * fmaxf(slowdown, 0.0f);
+            line_pivot_active  = 1;
+            motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
+        }
+    }
+
+    if (obj_rot_phase == 1) {
+        uint32_t p1e  = HAL_GetTick() - obj_rot_phase1_ms;
+        int enc_done  = (erot_counts >= EROT_ENC_TARGET);
+        int overshoot = (erot_abs_hdg > EROT_ABS_TARGET * 1.2f);
+        // Ver comentario equivalente en LOST_ROTATE (2026-07-01): freno
+        // fuerte a torque fijo por un tiempo corto y acotado, sin buscar
+        // una velocidad "exacta".
+        const uint32_t EROT_BRAKE_DURATION = 400U;
+        if ((enc_done && p1e >= EROT_BRAKE_DURATION) || p1e >= EROT_P1_MAX || overshoot) {
+            // Si ya quedó justo sobre la línea al terminar el giro, no hace
+            // falta avanzar nada: directo a FOLLOWING (2026-07-01).
+            if (line_detected) {
+                line_seen_since_entry = 1;
+                line_integral         = 0.0f;
+                line_error_prev       = 0.0f;
+                line_lost_ms          = HAL_GetTick();
+                line_state            = LINE_STATE_FOLLOWING;
+                lrot_settle_start_ms  = 0;
+            } else {
+                // Giro terminado: pausa de estabilización antes de avanzar
+                line_state          = LINE_STATE_EDGE_SETTLE;
+                lrot_settle_start_ms = 0;
+            }
+            obj_rot_initialized = 0;
+            obj_rot_phase       = 0;
+            obj_rot_heading     = 0.0f;
+            steering_adjustment = 0.0f;
+        } else if (!enc_done) {
+            float remaining = EROT_ENC_TARGET - erot_counts;
+            float ramp = fminf(remaining / (EROT_ENC_TARGET * 0.15f), 1.0f);
+            float pivot = EROT_DIR * EROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
+            line_pivot_active  = 1;
+            motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
+        } else {
+            // Freno fuerte a torque fijo (sin escalar), acotado por
+            // EROT_BRAKE_DURATION arriba.
+            float pivot = EROT_DIR * EROT_BRAKE;
+            line_pivot_active  = 1;
+            motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
+        }
+    }
+}
+
+// PERP_ROTATE: cruce perpendicular (4 sensores en negro) — gira 90° hacia
+// el lado del último esquive y retoma FOLLOWING.
+static void LineState_PerpRotate(void)
+{
+    // Cruce perpendicular detectado (los 4 ADC en negro sin manipular
+    // el robot): gira 90° fijo y vuelve directo a FOLLOWING, sin pasar
+    // por ningún estado de avance — se asume que quedó sobre la línea.
+    // Sin información de hacia qué lado está la línea (los 4 sensores
+    // vieron lo mismo), la dirección sigue a `obj_esquive_dir`
+    // (2026-07-14): reencontrando la línea después de bordear el
+    // obstáculo, girar hacia el MISMO lado del esquive aleja del
+    // objeto — girar al contrario lo devolvía directo al obstáculo.
+    // Sin esquive previo obj_esquive_dir vale +1 (se rearma al entrar
+    // al modo línea), así que el caso normal conserva la convención
+    // histórica de girar a la derecha. Mismo esquema de freno fijo
+    // corto que LOST_ROTATE/EDGE_ROTATE (2026-07-01): no sale
+    // anticipadamente ante ninguna condición, siempre completa el
+    // giro por encoder y luego un freno fijo breve.
+    const float  PROT_ENC_TARGET  = 440.0f; // calibración base de 90°
+    const float  PROT_PIVOT       = 14.0f;
+    const float  PROT_BRAKE       = 16.0f;
+    const float  PROT_OBJ_BRAKE   = 8.0f;  // contrafreno suave solo para el giro final de esquive
+    const float  PROT_SLOWDOWN_DEG = 55.0f;
+    const float  PROT_ABS_TARGET  = 90.0f;
+    const uint32_t PROT_P0_MAX    = 1500U;
+    const uint32_t PROT_P1_MAX    = 800U;
+    const uint32_t PROT_BRAKE_DURATION = 400U;
+    const uint32_t PROT_OBJ_BRAKE_RAMP_MS = 200U;
+    const uint32_t PROT_OBJ_BRAKE_DURATION = 300U;
+    const float  PROT_ENC_FRAC    = 0.60f;
+    const float  PROT_DIR         = (float)obj_esquive_dir; // sentido del último esquive (+1 derecha por defecto)
+
+    if (!obj_rot_initialized) {
+        __disable_irq();
+        obj_rot_r0 = encoder_right;
+        obj_rot_l0 = encoder_left;
+        __enable_irq();
+        obj_rot_initialized = 1;
+        obj_rot_start_ms    = HAL_GetTick();
+        obj_rot_phase       = 0;
+        obj_rot_heading     = 0.0f;
+        obj_rot_phase1_ms   = 0;
+        perp_obj_brake_start_ms = 0;
+    }
+
+    float prot_gz = (float)gz / 100.0f;
+    obj_rot_heading += prot_gz * DT_CTRL_FIXED;
+
+    __disable_irq();
+    int32_t prot_dr = encoder_right - obj_rot_r0;
+    int32_t prot_dl = encoder_left  - obj_rot_l0;
+    __enable_irq();
+    float prot_counts  = (fabsf((float)prot_dr) + fabsf((float)prot_dl)) * 0.5f;
+    float prot_enc_deg = prot_counts * (PROT_ABS_TARGET / PROT_ENC_TARGET);
+    float prot_abs_hdg = fmaxf(fabsf(obj_rot_heading), prot_enc_deg);
+    float prot_enc_thr = PROT_ENC_TARGET * PROT_ENC_FRAC;
+
+    if (obj_rot_phase == 0) {
+        uint32_t elapsed = HAL_GetTick() - obj_rot_start_ms;
+        if (prot_abs_hdg >= PROT_ABS_TARGET * 0.70f ||
+            prot_counts  >= prot_enc_thr ||
+            elapsed      >= PROT_P0_MAX) {
+            obj_rot_phase     = 1;
+            obj_rot_phase1_ms = HAL_GetTick();
+        } else {
+            float remaining = PROT_ABS_TARGET - prot_abs_hdg;
+            float slowdown  = (remaining < PROT_SLOWDOWN_DEG)
+                            ? (remaining / PROT_SLOWDOWN_DEG) : 1.0f;
+            float pivot = PROT_DIR * PROT_PIVOT * fmaxf(slowdown, 0.0f);
+            line_pivot_active  = 1;
+            motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
+        }
+    }
+
+    if (obj_rot_phase == 1) {
+        uint32_t p1e      = HAL_GetTick() - obj_rot_phase1_ms;
+        int enc_done      = (prot_counts >= PROT_ENC_TARGET);
+        int overshoot     = (prot_abs_hdg > PROT_ABS_TARGET * 1.2f);
+        uint32_t obj_brake_elapsed = 0;
+        if (enc_done && perp_from_obj_avoidance) {
+            if (perp_obj_brake_start_ms == 0)
+                perp_obj_brake_start_ms = HAL_GetTick();
+            obj_brake_elapsed = HAL_GetTick() - perp_obj_brake_start_ms;
+        }
+        int brake_done = perp_from_obj_avoidance
+            ? (enc_done && obj_brake_elapsed >= PROT_OBJ_BRAKE_DURATION)
+            : (enc_done && p1e >= PROT_BRAKE_DURATION);
+        int phase_timeout = perp_from_obj_avoidance
+            ? (!enc_done && p1e >= PROT_P1_MAX)
+            : (p1e >= PROT_P1_MAX);
+        if (brake_done || phase_timeout || overshoot) {
+            // 2026-07-14: antes retomaba FOLLOWING directo — llegando
+            // del esquive con velocidad, arrancaba lanzado y se
+            // Sin pausa posterior: el giro final lento ya entrega
+            // el robot directamente al seguidor de línea.
+            line_state = LINE_STATE_FOLLOWING;
+            perp_from_obj_avoidance = 0;
+            perp_obj_brake_start_ms = 0;
+            line_seen_since_entry = 1;
+            line_integral       = 0.0f;
+            line_error_prev     = 0.0f;
+            line_lost_ms        = HAL_GetTick();
+            obj_rot_initialized = 0;
+            obj_rot_phase       = 0;
+            obj_rot_heading     = 0.0f;
+            steering_adjustment = 0.0f;
+            // Sin este reset, si los sensores siguen en negro después del
+            // giro (no habia linea real), el timer ya vencido re-dispara
+            // otro PERP_ROTATE apenas vuelva a FOLLOWING -> giro en círculos.
+            all_black_start_ms  = 0;
+        } else if (!enc_done) {
+            perp_obj_brake_start_ms = 0;
+            float remaining = PROT_ENC_TARGET - prot_counts;
+            float ramp = fminf(remaining / (PROT_ENC_TARGET * 0.15f), 1.0f);
+            float pivot = PROT_DIR * PROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
+            line_pivot_active  = 1;
+            motorRightVelocity = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
+        } else {
+            float brake_power = PROT_BRAKE;
+            if (perp_from_obj_avoidance) {
+                float brake_ramp = fminf(
+                    (float)obj_brake_elapsed / (float)PROT_OBJ_BRAKE_RAMP_MS,
+                    1.0f);
+                brake_power = PROT_OBJ_BRAKE * brake_ramp;
+            }
+            float pivot = PROT_DIR * brake_power;
+            line_pivot_active  = 1;
+            motorRightVelocity = (int16_t)clampf_local(-(pwm_sat - pivot), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(-(pwm_sat + pivot), -60.0f, 60.0f);
+        }
+    }
+}
+
+// EDGE_SETTLE: pausa de estabilización post-45° antes de avanzar.
+static void LineState_EdgeSettle(void)
+{
+    // Post-90°: pausa de estabilización idéntica a LOST_SETTLE (mismo
+    // fix 2026-07-01: timeout es colchón de seguridad, no corte normal).
+    const uint32_t ESETTLE_MIN_MS   = 400U;
+    const uint32_t ESETTLE_TIMEOUT  = 3000U;
+    const float    ESETTLE_VEL_THR  = 0.25f;  // m/s crudos
+    const float    ESETTLE_TILT_THR = 3.0f;
+
+    if (lrot_settle_start_ms == 0) lrot_settle_start_ms = HAL_GetTick();
+    steering_adjustment = 0.0f;
+
+    if (line_detected) {
+        line_seen_since_entry = 1;
+        line_integral         = 0.0f;
+        line_error_prev       = 0.0f;
+        line_lost_ms          = HAL_GetTick();
+        line_state            = LINE_STATE_FOLLOWING;
+        lrot_settle_start_ms  = 0;
+        return;
+    }
+
+    uint32_t elapsed  = HAL_GetTick() - lrot_settle_start_ms;
+    float tilt_err    = fabsf(filtered_roll_deg - dynamic_setpoint_f);
+    // ídem LOST_SETTLE: cruda con umbral 0.25
+    int settled       = (elapsed >= ESETTLE_MIN_MS) &&
+                        (fabsf(velocity_est_f) < ESETTLE_VEL_THR) &&
+                        (tilt_err < ESETTLE_TILT_THR);
+
+    if (settled || elapsed >= ESETTLE_TIMEOUT) {
+        line_state           = LINE_STATE_EDGE_FWD;
+        line_lost_ms         = HAL_GetTick();
+        lrot_settle_start_ms = 0;
+        lost_fwd_vel_integral = 0.0f;
+    }
+}
+
+// EDGE_FWD: retorno por odometría, mismo mecanismo que LOST_FWD.
+static void LineState_EdgeFwd(void)
+{
+    // Post-45°: RETORNO POR ODOMETRÍA, mismo mecanismo que LOST_FWD
+    // (ver ahí) — navega hacia la pose donde se vio la línea por última
+    // vez (line_loss_x/y_m, snapshot compartido, se graba sin importar
+    // si la pérdida fue centrada o por el extremo). 10s de timeout como
+    // colchón de seguridad → reposo total (GIVEN_UP).
+    const uint32_t EDGE_FWD_TIMEOUT = 10000U;
+    if (line_detected) {
+        line_seen_since_entry = 1;
+        line_integral     = 0.0f;
+        line_error_prev   = 0.0f;
+        line_lost_ms      = HAL_GetTick();
+        line_state        = LINE_STATE_FOLLOWING;
+        steering_adjustment = 0.0f;
+        lost_ret_ov_active  = 0;
+    } else if ((HAL_GetTick() - line_lost_ms) > EDGE_FWD_TIMEOUT) {
+        // (ídem LOST_FWD: f_fallen acá era inalcanzable)
+        line_state = LINE_STATE_GIVEN_UP;
+        steering_adjustment = 0.0f;
+        lost_ret_ov_active  = 0;
+    } else if (line_loss_pose_valid) {
+        float ret_dx   = line_loss_x_m - odom_x_m;
+        float ret_dy   = line_loss_y_m - odom_y_m;
+        float ret_dist = sqrtf(ret_dx * ret_dx + ret_dy * ret_dy);
+        float ret_bearing = atan2f(ret_dy, ret_dx) * (180.0f / M_PI);
+        float ret_herr    = ret_bearing - odom_theta_deg;
+        if      (ret_herr >  180.0f) ret_herr -= 360.0f;
+        else if (ret_herr < -180.0f) ret_herr += 360.0f;
+
+        // Mismo sobrepaso que LOST_FWD (ver ahí).
+        if (!lost_ret_ov_active &&
+            (ret_dist < LOST_RETURN_REACHED_M ||
+             (ret_dist < LOST_RETURN_PASS_WIN_M &&
+              fabsf(ret_herr) > 120.0f))) {
+            lost_ret_ov_active = 1;
+            lost_ret_ov_x      = odom_x_m;
+            lost_ret_ov_y      = odom_y_m;
+        }
+
+        if (lost_ret_ov_active) {
+            float ov_dx = odom_x_m - lost_ret_ov_x;
+            float ov_dy = odom_y_m - lost_ret_ov_y;
+            if (sqrtf(ov_dx * ov_dx + ov_dy * ov_dy) >=
+                LOST_RETURN_OVERSHOOT_M) {
+                line_state = LINE_STATE_GIVEN_UP;
+                lost_ret_ov_active = 0;
+            }
+            steering_adjustment = 0.0f;
+        } else {
+            steering_adjustment = clampf_local(
+                -ODOM_THETA_SIGN * LOST_RETURN_STEER_KP * ret_herr,
+                -LOST_RETURN_STEER_MAX, LOST_RETURN_STEER_MAX);
+        }
+    } else {
+        // Sin snapshot válido (recién entrado al modo): avance recto
+        // con el comportamiento anterior (yaw-assist por gyro).
+        steering_adjustment = 0.0f;
+    }
+}
+
+// GIVEN_UP: reposo total balanceado hasta que la línea vuelva a aparecer.
+static void LineState_GivenUp(void)
+{
+    steering_adjustment = 0.0f;
+    if (line_detected) {
+        line_seen_since_entry = 1;
+        line_integral       = 0.0f;
+        line_error_prev     = 0.0f;
+        line_lost_ms        = HAL_GetTick();
+        line_state          = LINE_STATE_FOLLOWING;
+    }
+}
+
+// OBJ_FRENO_REVERSA ("STOP"): entrada directa al detectar objeto — frena la
+// inercia, mantiene la distancia (hold de A6/A8) y espera estabilidad → giro.
+static void LineState_ObjFrenoReversa(void)
+{
+    // Fase 1: espera a que la velocidad caiga. Fase 2: wait antes de rotar.
+    // Además, el giro exige distancia ESTABLE: A6 y A8 dentro de la banda
+    // 3600..3900 durante OBJ_REV_STABLE_MS continuos — mientras el hold de
+    // distancia (ver setpoints) esté corrigiendo, el giro espera. Colchón:
+    // si en OBJ_REV_STOP_TIMEOUT_MS total nunca se estabilizó, gira igual.
+    const float    BRAKE_VEL_THR  = 0.05f;
+    const uint32_t BRAKE_TIMEOUT  = 1500U;
+    const uint32_t PRE_ROTATE_MS  = 3000U;
+    if (obj_brake_start_ms == 0) {
+        obj_brake_start_ms = HAL_GetTick();
+        // Rumbo recto (2026-07-14): desde que el STOP es la entrada
+        // al detectar objeto, su hold hace también la reversa hasta
+        // la banda de A6/A8 — y salía chueca (reportado) porque no
+        // tenía ninguna corrección de rumbo. P sobre la diferencia
+        // ACUMULADA de counts (ver REV_STRAIGHT_*): ancla el rumbo
+        // de entrada y lo mantiene durante toda la fase, en ambos
+        // sentidos de corrección del hold.
+        __disable_irq();
+        obj_rev_r0 = encoder_right;
+        obj_rev_l0 = encoder_left;
+        __enable_irq();
+        obj_rev_steer_f      = 0.0f;
+        obj_rev_last_counts  = 0;
+        obj_rev_last_move_ms = HAL_GetTick();
+    }
+
+    {
+        __disable_irq();
+        int32_t rev_dr = encoder_right - obj_rev_r0;
+        int32_t rev_dl = encoder_left  - obj_rev_l0;
+        __enable_irq();
+        int32_t rev_counts = (abs(rev_dr) + abs(rev_dl)) / 2;
+        if (rev_counts != obj_rev_last_counts) {
+            obj_rev_last_counts  = rev_counts;
+            obj_rev_last_move_ms = HAL_GetTick();
+        }
+        // Solo corrige mientras hay movimiento real (gate por
+        // actividad de encoders);
+        // quieto, el target decae a 0 por el slew (anti-pivoteo).
+        float corr_target = 0.0f;
+        if ((HAL_GetTick() - obj_rev_last_move_ms) < REV_STRAIGHT_ACT_MS) {
+            corr_target = clampf_local(
+                REV_STRAIGHT_KC * (float)(rev_dr - rev_dl),
+                -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX);
+        }
+        float corr_delta = corr_target - obj_rev_steer_f;
+        if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
+        if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
+        obj_rev_steer_f += corr_delta;
+        steering_adjustment = obj_rev_steer_f;
+    }
+
+    // Fase 1: frenar hasta quieto o timeout (cruda: la deadbandeada con
+    // umbral 0.05 equivalía a ~0.40 m/s reales)
+    if (obj_pre_rotate_ms == 0) {
+        if (fabsf(velocity_est_f) < BRAKE_VEL_THR + 0.10f ||
+            (HAL_GetTick() - obj_brake_start_ms) > BRAKE_TIMEOUT) {
+            obj_pre_rotate_ms = HAL_GetTick();  // arranca fase 2
+        }
+    }
+
+    // Tracking de estabilidad de distancia: dentro de banda arranca/sigue
+    // el timer; fuera de banda se resetea (los 2s deben ser CONTINUOS).
+    {
+        float front_min = fminf((float)adcAvg[5], (float)adcAvg[7]);
+        uint8_t in_band = (front_min >= OBJ_REV_CLEAR_ADC &&
+                           front_min <= OBJ_REV_CLEAR_ADC + OBJ_REV_HOLD_BAND);
+        if (!in_band)                          obj_rev_band_enter_ms = 0;
+        else if (obj_rev_band_enter_ms == 0)   obj_rev_band_enter_ms = HAL_GetTick();
+    }
+    uint8_t dist_stable = (obj_rev_band_enter_ms != 0 &&
+                           (HAL_GetTick() - obj_rev_band_enter_ms) >= OBJ_REV_STABLE_MS);
+
+    // Fase 2: wait quieto + distancia estable 2s (o timeout total) antes de girar
+    if (obj_pre_rotate_ms != 0 &&
+        (HAL_GetTick() - obj_pre_rotate_ms) >= PRE_ROTATE_MS &&
+        (dist_stable ||
+         (HAL_GetTick() - obj_brake_start_ms) >= OBJ_REV_STOP_TIMEOUT_MS)) {
+        line_state          = LINE_STATE_OBJ_GIRO_ESQUIVE;
+        obj_rot_initialized = 0;
+        obj_rot_phase       = 0;
+        obj_rot_heading     = 0.0f;
+        obj_rot_phase1_ms   = 0;
+        steering_adjustment = 0.0f;
+        obj_brake_start_ms  = 0;
+        obj_pre_rotate_ms   = 0;
+        obj_rev_band_enter_ms = 0;
+    }
+}
+
+// OBJ_GIRO_ESQUIVE: giro de 90° para esquivar (sentido según obj_esquive_dir),
+// con ajuste fino por el lateral si el giro quedó corto.
+static void LineState_ObjGiroEsquive(void)
+{
+    // Giro 90° para esquivar objeto: MISMA lógica y constantes
+    // que el banco de pruebas de 90° en MANUAL, ya validado (pivot fijo
+    // con slowdown por encoder, freno arrancando al 85% del recorrido,
+    // continuidad del freno al terminar). Sentido según obj_esquive_dir
+    // (2026-07-13): +1 derecha (histórico), -1 izquierda (espejado).
+    const float  LINE_ROT_ENC_TARGET   = 372.0f;  // recortado más: 460→394→372 (seguía quedando grande)
+    const float  LINE_ROT_PIVOT        = 24.0f;
+    const float  LINE_ROT_BRAKE         = 10.0f;
+    const float  LINE_ROT_SLOWDOWN_DEG = 28.0f;
+    const float  LINE_ROT_ABS_TARGET   = 90.0f;
+    const uint32_t LINE_ROT_P0_MAX     = 1500U;
+    const uint32_t LINE_ROT_P1_MAX     = 800U;
+    const float  LINE_ROT_ENC_FRAC     = 0.60f;
+    const uint32_t LINE_ROT_BRAKE_DURATION = 250U;
+
+    if (!obj_rot_initialized) {
+        __disable_irq();
+        obj_rot_r0 = encoder_right;
+        obj_rot_l0 = encoder_left;
+        __enable_irq();
+        obj_rot_initialized = 1;
+        obj_rot_start_ms    = HAL_GetTick();
+        obj_rot_phase       = 0;
+        obj_rot_heading     = 0.0f;
+        obj_rot_phase1_ms   = 0;
+    }
+
+    float obj_gz_dps = (float)gz / 100.0f;
+    obj_rot_heading += obj_gz_dps * DT_CTRL_FIXED;
+
+    // Espeja pivot y freno según el sentido del esquive; el heading
+    // se compara siempre en valor absoluto, no necesita signo.
+    float rot_dir = (float)obj_esquive_dir;
+
+    __disable_irq();
+    int32_t dr = encoder_right - obj_rot_r0;
+    int32_t dl = encoder_left  - obj_rot_l0;
+    __enable_irq();
+    float rot_counts   = (fabsf((float)dr) + fabsf((float)dl)) * 0.5f;
+    float enc_heading_deg = rot_counts * (LINE_ROT_ABS_TARGET / LINE_ROT_ENC_TARGET);
+    // Transición de fase solo por encoder (ver LOST_ROTATE); abs_heading
+    // (con gyro) queda solo para el overshoot.
+    float abs_heading   = fmaxf(fabsf(obj_rot_heading), enc_heading_deg);
+    float enc_phase0_thr = LINE_ROT_ENC_TARGET * LINE_ROT_ENC_FRAC;
+
+    if (obj_rot_phase == 0) {
+        uint32_t elapsed = HAL_GetTick() - obj_rot_start_ms;
+        if (rot_counts >= enc_phase0_thr ||
+            elapsed    >= LINE_ROT_P0_MAX) {
+            obj_rot_phase     = 1;
+            obj_rot_phase1_ms = HAL_GetTick();
+        } else {
+            // Rampa de frenado interna también solo por encoder.
+            float remaining = LINE_ROT_ABS_TARGET - enc_heading_deg;
+            float slowdown  = (remaining < LINE_ROT_SLOWDOWN_DEG)
+                            ? (remaining / LINE_ROT_SLOWDOWN_DEG)
+                            : 1.0f;
+            float pivot = LINE_ROT_PIVOT * fmaxf(slowdown, 0.0f) * rot_dir;
+            line_pivot_active = 1;
+            motorRightVelocity = (int16_t)clampf_local(
+                -(pwm_sat + pivot), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(
+                -(pwm_sat - pivot), -60.0f, 60.0f);
+        }
+    }
+
+    if (obj_rot_phase == 1) {
+        uint32_t p1_elapsed = HAL_GetTick() - obj_rot_phase1_ms;
+        int enc_done      = (rot_counts >= LINE_ROT_ENC_TARGET);
+        // Freno arranca al 85% del recorrido, no recién al 100% (ver
+        // LOST_ROTATE) — el corte final sigue dependiendo de enc_done.
+        int enc_near_done = (rot_counts >= LINE_ROT_ENC_TARGET * 0.85f);
+        int overshoot     = (abs_heading > LINE_ROT_ABS_TARGET * 1.2f);
+        if ((enc_done && p1_elapsed >= LINE_ROT_BRAKE_DURATION) ||
+            p1_elapsed >= LINE_ROT_P1_MAX || overshoot) {
+            // Verificación por el lateral activo (2026-07-10): buena
+            // detención = la pared quedó a la vista (< 3200). Si no
+            // bajó de ahí, el giro quedó corto → fase 2 de ajuste fino
+            // (sigue pivotando despacio hasta verla). El overshoot NO
+            // entra al ajuste: girar más solo lo empeoraría.
+            if ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_ROT_ADC_GOOD ||
+                overshoot) {
+                line_state          = LINE_STATE_OBJ_PAUSA_GIRO;
+                obj_rot_initialized = 0;
+                obj_rot_phase       = 0;
+                obj_rot_heading     = 0.0f;
+                obj_rot_start_ms    = 0;
+            } else {
+                obj_rot_phase        = 2;
+                obj_rot_p2_c0        = rot_counts;
+                obj_rot_p2_ms        = HAL_GetTick();
+                obj_rot_adc_good_cnt = 0;
+            }
+            // Seguir aplicando el mismo freno diferencial un ciclo más al
+            // terminar (ver fix en banco MANUAL) — soltarlo de golpe a 0
+            // daba un empujón justo en la transición.
+            line_pivot_active = 1;
+            motorRightVelocity = (int16_t)clampf_local(
+                -(pwm_sat - LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(
+                -(pwm_sat + LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
+        } else if (!enc_near_done) {
+            float remaining = LINE_ROT_ENC_TARGET - rot_counts;
+            float ramp = fminf(remaining / (LINE_ROT_ENC_TARGET * 0.15f), 1.0f);
+            float pivot = LINE_ROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f) * rot_dir;
+            line_pivot_active = 1;
+            motorRightVelocity = (int16_t)clampf_local(
+                -(pwm_sat + pivot), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(
+                -(pwm_sat - pivot), -60.0f, 60.0f);
+        } else {
+            line_pivot_active = 1;
+            motorRightVelocity = (int16_t)clampf_local(
+                -(pwm_sat - LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(
+                -(pwm_sat + LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
+        }
+    } else if (obj_rot_phase == 2) {
+        // Ajuste fino por el lateral activo (ADC7 girando a derecha,
+        // ADC5 a izquierda; 2026-07-10): los 90° por encoders
+        // terminaron pero la pared no quedó a la vista lateral
+        // (≥ 3200) — le falta un poco más. Pivot suave en el mismo
+        // sentido del giro hasta que el lateral baje de
+        // OBJ_ROT_ADC_GOOD durante GOOD_CYC ciclos seguidos, con
+        // tope de counts extra y timeout (por si la pared quedó
+        // fuera de alcance).
+        uint8_t rot_adc_good =
+            ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_ROT_ADC_GOOD);
+        if (rot_adc_good) {
+            if (obj_rot_adc_good_cnt < 255) obj_rot_adc_good_cnt++;
+        } else {
+            obj_rot_adc_good_cnt = 0;
+        }
+        float extra_counts = rot_counts - obj_rot_p2_c0;
+
+        if (obj_rot_adc_good_cnt >= OBJ_ROT_ADC_GOOD_CYC ||
+            extra_counts >= OBJ_ROT_ADC_EXTRA_MAX ||
+            (HAL_GetTick() - obj_rot_p2_ms) > OBJ_ROT_ADC_EXTRA_MS) {
+            obj_rot_initialized = 0;
+            obj_rot_phase       = 0;
+            obj_rot_heading     = 0.0f;
+            obj_rot_start_ms    = 0;
+            // 2026-07-14: SIEMPRE sigue a PAUSA_GIRO, aunque el lateral
+            // no haya visto la pared. El aborto a LOST_FWD que había acá
+            // (2026-07-10, "detección fantasma") volvía a la línea al
+            // instante — reportado en el esquive a IZQUIERDA: "si ve la
+            // línea durante el giro se sale del modo esquive" y el robot
+            // regresaba directo al obstáculo. Con la entrada por la fase
+            // STOP (hold de distancia contra A6/A8 durante segundos) el
+            // objeto está confirmado de sobra: fantasma es casi imposible.
+            // Si la pared realmente no aparece bordeando, el timeout de
+            // pared perdida (5s → reposo) ya cubre ese caso sin volver
+            // hacia el obstáculo.
+            line_state = LINE_STATE_OBJ_PAUSA_GIRO;
+            // Mismo freno de continuidad que la salida de fase 1.
+            line_pivot_active = 1;
+            motorRightVelocity = (int16_t)clampf_local(
+                -(pwm_sat - LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(
+                -(pwm_sat + LINE_ROT_BRAKE * rot_dir), -60.0f, 60.0f);
+        } else {
+            float pivot = LINE_ROT_PIVOT * 0.5f * rot_dir;   // suave: es un retoque
+            line_pivot_active = 1;
+            motorRightVelocity = (int16_t)clampf_local(
+                -(pwm_sat + pivot), -60.0f, 60.0f);
+            motorLeftVelocity  = (int16_t)clampf_local(
+                -(pwm_sat - pivot), -60.0f, 60.0f);
+        }
+    }
+}
+
+// OBJ_PAUSA_GIRO: balance estático 2s con hold de posición, luego a bordear.
+static void LineState_ObjPausaGiro(void)
+{
+    // Balance estático 2s, luego pasa directo a OBJ_BORDEAR_PARED
+    // (se prueba saltear OBJ_BUSCAR_PARED, ver Registro de Cambios 2026-07-05).
+    steering_adjustment = 0.0f;
+    if (obj_hold_start_ms == 0) {
+        obj_hold_start_ms = HAL_GetTick();
+        // Ancla del hold de posición (ver setpoint de PAUSA_GIRO).
+        __disable_irq();
+        obj_pausa_r0 = encoder_right;
+        obj_pausa_l0 = encoder_left;
+        __enable_irq();
+    }
+    if (f_fallen) {
+        line_state        = LINE_STATE_FOLLOWING;
+        line_integral     = 0.0f;
+        line_error_prev   = 0.0f;
+        line_error_f_d    = 0.0f;
+        line_lost_ms      = HAL_GetTick();
+        obj_hold_start_ms = 0;
+        obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
+    } else if ((HAL_GetTick() - obj_hold_start_ms) >= OBJ_HOLD_DURATION_MS) {
+        line_state                 = LINE_STATE_OBJ_BORDEAR_PARED;
+        obj_hold_start_ms          = 0;
+        obj_wall_fwd_start_ms      = HAL_GetTick();
+        obj_wall_seq_start_ms      = HAL_GetTick();
+        obj_wall_vel_integral      = 0.0f;
+    }
+}
+
+// OBJ_BUSCAR_PARED: avanza despacio hasta ver la pared en el lateral activo.
+static void LineState_ObjBuscarPared(void)
+{
+    // Avanza despacio (PI de velocidad) hasta que el lateral activo detecta la pared.
+    // Timeout OBJ_WALL_APPROACH_TIMEOUT → vuelve a FOLLOWING si no encuentra pared.
+    uint8_t wall_found = ((float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD);
+    if (f_fallen) {
+        line_state                 = LINE_STATE_FOLLOWING;
+        obj_wall_approach_start_ms = 0;
+        obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
+    } else if (wall_found) {
+        line_state                 = LINE_STATE_OBJ_BORDEAR_PARED;
+        obj_wall_approach_start_ms = 0;
+        obj_wall_fwd_start_ms      = HAL_GetTick();
+        obj_wall_seq_start_ms      = HAL_GetTick();
+        obj_wall_vel_integral      = 0.0f;
+    } else if ((HAL_GetTick() - obj_wall_approach_start_ms) >= OBJ_WALL_APPROACH_TIMEOUT) {
+        line_state                 = LINE_STATE_OBJ_BORDEAR_PARED;
+        obj_wall_approach_start_ms = 0;
+        obj_wall_fwd_start_ms      = HAL_GetTick();
+        obj_wall_seq_start_ms      = HAL_GetTick();
+        obj_wall_vel_integral      = 0.0f;
+    }
+    // Mientras avanza: steering neutro, setpoint manejado por bloque de setpoints.
+    steering_adjustment = 0.0f;
+}
+
+// OBJ_BORDEAR_PARED: wall-following — avanza mientras el lateral ve la pared.
+static void LineState_ObjBordearPared(void)
+{
+    // Wall-following: avanza mientras el lateral activo ve el objeto.
+    // Si pierde el objeto → pivot hacia la pared. Si ve línea (tras 3s) → FOLLOWING.
+    // Lateral < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
+    // TOO_CLOSE_THOLD → pivot alejándose de la pared.
+    if (obj_wall_fwd_start_ms == 0)
+        obj_wall_fwd_start_ms = HAL_GetTick();
+    // Ignora línea solo los primeros OBJ_WALL_LINE_IGNORE_MS desde que
+    // se entró a la secuencia de wall-following (obj_wall_seq_start_ms,
+    // fijo, no se resetea al ciclar FWD/CLEAR/TURN) -- antes se usaba
+    // obj_wall_fwd_start_ms, que se reseteaba cada vez que se volvía a
+    // este estado desde GIRO_PARED, dejando la línea ignorada indefinidamente
+    // mientras el robot oscilaba entre bordear/girar buscando la pared.
+    uint8_t line_ignore   = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
+    float wall_adc        = (float)adcAvg[OBJ_WALL_ADC_IDX];
+    uint8_t wall_visible  = (wall_adc < OBJ_WALL_THRESHOLD);
+    uint8_t wall_reverse  = obj_wall_rev_latch;   // por counts (2026-07-10)
+    uint8_t too_close     = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
+    if (ObjWall_LineConfirmed(line_detected, line_ignore)) {
+        line_seen_since_entry = 1;
+        obj_wall_line_confirm_cnt = 0;
+        obj_final_turn_pending_ms = HAL_GetTick();
+        line_state          = LINE_STATE_FOLLOWING;
+        line_integral       = 0.0f;
+        line_error_prev     = 0.0f;
+        line_error_f_d      = 0.0f;
+        line_lost_ms        = HAL_GetTick();
+        steering_adjustment = 0.0f;
+        obj_wall_fwd_start_ms = 0;
+        obj_wall_seq_start_ms = 0;
+        obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
+    } else if (wall_reverse) {
+        // Demasiado cerca: reversa pareja (mismo P de rumbo recto,
+        // ver REV_STRAIGHT_KP/MAX/SLEW). line_pivot_active queda en 0: el
+        // formato compartido de motores aplica half_steer=steering_adjustment*0.5.
+        float rate_diff = speed_right_rps_s - speed_left_rps_s;
+        float corr_target = clampf_local(
+            REV_STRAIGHT_KP * rate_diff,
+            -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
+        );
+        float corr_delta = corr_target - obj_rev_steer_f;
+        if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
+        if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
+        obj_rev_steer_f += corr_delta;
+        steering_adjustment = obj_rev_steer_f;
+    } else if (too_close) {
+        // Demasiado cerca: pivot alejándose de la pared (según sentido)
+        line_pivot_active  = 1;
+        motorRightVelocity = (int16_t)clampf_local(
+            -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
+        motorLeftVelocity  = (int16_t)clampf_local(
+            -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
+    } else if (!wall_visible) {
+        // Perdió la pared: en vez de girar ya mismo, avanza un poco más
+        // (OBJ_WALL_CLEAR_COUNTS) para no quedar pivoteando pegado a la
+        // esquina/pared.
+        line_state                 = LINE_STATE_OBJ_PARED_LIBRE;
+        steering_adjustment        = 0.0f;
+        obj_wall_fwd_start_ms      = 0;
+        obj_wall_clear_initialized = 0;
+        obj_wall_lost_ms           = HAL_GetTick();  // arranca la ventana de 2s de ignorar línea en WALL_CLEAR/WALL_TURN
+    } else {
+        // Avanza hacia adelante con ángulo fijo; yaw-lock se aplica al calcular motores.
+        steering_adjustment = 0.0f;
+        obj_rev_steer_f      = 0.0f;
+    }
+}
+
+// OBJ_PARED_LIBRE: perdió la pared — avanza unos counts más antes de girar.
+static void LineState_ObjParedLibre(void)
+{
+    // Avanza OBJ_WALL_CLEAR_COUNTS counts de encoder más después de perder
+    // la pared en WALL_FWD, antes de girar -- para no quedar pivoteando
+    // pegado a la esquina/pared. Misma reversa/pivot de seguridad que
+    // WALL_FWD si en el medio se acerca demasiado.
+    if (!obj_wall_clear_initialized) {
+        __disable_irq();
+        obj_wall_clear_r0 = encoder_right;
+        obj_wall_clear_l0 = encoder_left;
+        __enable_irq();
+        obj_wall_clear_initialized = 1;
+    }
+    __disable_irq();
+    int32_t clear_dr = encoder_right - obj_wall_clear_r0;
+    int32_t clear_dl = encoder_left  - obj_wall_clear_l0;
+    __enable_irq();
+    int32_t clear_counts = (abs(clear_dr) + abs(clear_dl)) / 2;
+
+    float wall_adc       = (float)adcAvg[OBJ_WALL_ADC_IDX];
+    uint8_t wall_reverse = obj_wall_rev_latch;   // por counts (2026-07-10)
+    uint8_t too_close    = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
+    // Misma ventana que BORDEAR_PARED, medida desde la entrada a TODA
+    // la secuencia (obj_wall_seq_start_ms) — ver fix 2026-07-05.
+    uint8_t line_ignore2 = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
+
+    if (ObjWall_LineConfirmed(line_detected, line_ignore2)) {
+        line_seen_since_entry = 1;
+        obj_wall_line_confirm_cnt = 0;
+        obj_final_turn_pending_ms = HAL_GetTick();
+        line_state          = LINE_STATE_FOLLOWING;
+        line_integral       = 0.0f;
+        line_error_prev     = 0.0f;
+        line_error_f_d      = 0.0f;
+        line_lost_ms        = HAL_GetTick();
+        steering_adjustment = 0.0f;
+        obj_wall_clear_initialized = 0;
+        obj_wall_seq_start_ms = 0;
+        obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
+    } else if (wall_reverse) {
+        float rate_diff = speed_right_rps_s - speed_left_rps_s;
+        float corr_target = clampf_local(
+            REV_STRAIGHT_KP * rate_diff,
+            -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
+        );
+        float corr_delta = corr_target - obj_rev_steer_f;
+        if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
+        if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
+        obj_rev_steer_f += corr_delta;
+        steering_adjustment = obj_rev_steer_f;
+    } else if (too_close) {
+        line_pivot_active  = 1;
+        motorRightVelocity = (int16_t)clampf_local(
+            -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
+        motorLeftVelocity  = (int16_t)clampf_local(
+            -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
+    } else if (clear_counts >= OBJ_WALL_CLEAR_COUNTS) {
+        line_state                 = LINE_STATE_OBJ_GIRO_PARED;
+        steering_adjustment        = 0.0f;
+        obj_wall_clear_initialized = 0;
+    } else {
+        steering_adjustment = 0.0f;
+        obj_rev_steer_f      = 0.0f;
+    }
+}
+
+// OBJ_GIRO_PARED: pivot hacia la pared hasta re-verla en el lateral activo.
+static void LineState_ObjGiroPared(void)
+{
+    // Pivot hacia la pared hasta re-verla en el lateral activo o detectar línea.
+    // Lateral < REVERSE_THOLD → reversa pareja. Entre REVERSE_THOLD y
+    // TOO_CLOSE_THOLD → pivot alejándose en cambio.
+    float wall_adc       = (float)adcAvg[OBJ_WALL_ADC_IDX];
+    uint8_t wall_visible = (wall_adc < OBJ_WALL_THRESHOLD);
+    uint8_t wall_reverse = obj_wall_rev_latch;   // por counts (2026-07-10)
+    uint8_t too_close    = (!wall_reverse) && (wall_adc < OBJ_WALL_TOO_CLOSE_THOLD);
+    // Misma ventana que BORDEAR_PARED/PARED_LIBRE, medida desde la
+    // entrada a toda la secuencia (obj_wall_seq_start_ms).
+    uint8_t line_ignore2 = ((HAL_GetTick() - obj_wall_seq_start_ms) < OBJ_WALL_LINE_IGNORE_MS);
+    if (ObjWall_LineConfirmed(line_detected, line_ignore2)) {
+        line_seen_since_entry = 1;
+        obj_wall_line_confirm_cnt = 0;
+        obj_final_turn_pending_ms = HAL_GetTick();
+        line_state          = LINE_STATE_FOLLOWING;
+        line_integral       = 0.0f;
+        line_error_prev     = 0.0f;
+        line_error_f_d      = 0.0f;
+        line_lost_ms        = HAL_GetTick();
+        steering_adjustment = 0.0f;
+        line_pivot_active   = 0;
+        obj_wall_seq_start_ms = 0;
+        obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
+    } else if (wall_reverse) {
+        // Demasiado cerca: reversa pareja (mismo P de rumbo recto,
+        // ver REV_STRAIGHT_KP/MAX/SLEW). line_pivot_active queda en 0.
+        float rate_diff = speed_right_rps_s - speed_left_rps_s;
+        float corr_target = clampf_local(
+            REV_STRAIGHT_KP * rate_diff,
+            -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
+        );
+        float corr_delta = corr_target - obj_rev_steer_f;
+        if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
+        if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
+        obj_rev_steer_f += corr_delta;
+        steering_adjustment = obj_rev_steer_f;
+    } else if (too_close) {
+        // Demasiado cerca: pivot alejándose de la pared (según sentido)
+        line_pivot_active  = 1;
+        motorRightVelocity = (int16_t)clampf_local(
+            -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
+        motorLeftVelocity  = (int16_t)clampf_local(
+            -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
+    } else if (wall_visible) {
+        line_state            = LINE_STATE_OBJ_BORDEAR_PARED;
+        line_pivot_active     = 0;
+        obj_wall_fwd_start_ms = HAL_GetTick();
+        obj_wall_vel_integral = 0.0f;
+    } else {
+        // Pivot hacia el lado de la pared (opuesto al giro de esquive):
+        // izquierda si se esquivó a derecha, y viceversa.
+        line_pivot_active  = 1;
+        motorRightVelocity = (int16_t)clampf_local(
+            -(pwm_sat - OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
+        motorLeftVelocity  = (int16_t)clampf_local(
+            -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 15a — Motores en modo LINEA: despacha el handler del sub-estado
+// activo y aplica el formato común de motores (pwm_sat ± steering) si
+// ningún handler tomó control directo de las ruedas (line_pivot_active).
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_MotoresLinea(void)
+{
+    line_pivot_active = 0;
+
+    switch (line_state) {
+        case LINE_STATE_FOLLOWING:         LineState_Following();       break;
+        case LINE_STATE_LOST:
+        case LINE_STATE_SEARCHING:         LineState_Lost();            break;
+        case LINE_STATE_LOST_BRAKE:        LineState_LostBrake();       break;
+        case LINE_STATE_LOST_ROTATE:       LineState_LostRotate();      break;
+        case LINE_STATE_LOST_SETTLE:       LineState_LostSettle();      break;
+        case LINE_STATE_LOST_FWD:          LineState_LostFwd();         break;
+        case LINE_STATE_EDGE_WAIT:         LineState_EdgeWait();        break;
+        case LINE_STATE_EDGE_ROTATE:       LineState_EdgeRotate();      break;
+        case LINE_STATE_EDGE_SETTLE:       LineState_EdgeSettle();      break;
+        case LINE_STATE_EDGE_FWD:          LineState_EdgeFwd();         break;
+        case LINE_STATE_GIVEN_UP:          LineState_GivenUp();         break;
+        case LINE_STATE_PERP_ROTATE:       LineState_PerpRotate();      break;
+        case LINE_STATE_OBJ_FRENO_REVERSA: LineState_ObjFrenoReversa(); break;
+        case LINE_STATE_OBJ_GIRO_ESQUIVE:  LineState_ObjGiroEsquive();  break;
+        case LINE_STATE_OBJ_PAUSA_GIRO:    LineState_ObjPausaGiro();    break;
+        case LINE_STATE_OBJ_BUSCAR_PARED:  LineState_ObjBuscarPared();  break;
+        case LINE_STATE_OBJ_BORDEAR_PARED: LineState_ObjBordearPared(); break;
+        case LINE_STATE_OBJ_PARED_LIBRE:   LineState_ObjParedLibre();   break;
+        case LINE_STATE_OBJ_GIRO_PARED:    LineState_ObjGiroPared();    break;
+    }
+
+    // Cuando sigue línea: limitar integral para evitar deriva.
+    // Cuando pierde línea (LOST/SEARCHING): permitir hasta ±8 como
+    // BALANCE_ONLY para que el motor izquierdo tenga suficiente salida.
+    if (line_state == LINE_STATE_FOLLOWING) {
+        if (integral >  2.0f) integral =  2.0f;
+        if (integral < -2.0f) integral = -2.0f;
+    }
+
+    if (!line_pivot_active) {
+        float half_steer = steering_adjustment * 0.5f;
+
+        // En LOST/SEARCHING/OBJ_HOLD/LOST_FWD/EDGE_FWD/WALL_FWD/WALL_CLEAR (solo
+        // cuando avanzan derecho, steering_adjustment==0): corrección yaw igual
+        // que BALANCE_ONLY. Cuando esos mismos estados están corrigiendo una
+        // reversa (steering_adjustment != 0, ver los cases), se respeta esa
+        // corrección en vez de pisarla con el término de gyro -- antes este
+        // override se aplicaba siempre que el line_state coincidiera, sin
+        // importar si había una corrección real activa, y la anulaba en
+        // silencio. OBJ_ROTATE usa steering_adjustment directo (ver el case).
+        if (steering_adjustment == 0.0f &&
+            (line_state == LINE_STATE_LOST     ||
+             line_state == LINE_STATE_SEARCHING ||
+             line_state == LINE_STATE_OBJ_PAUSA_GIRO ||
+             line_state == LINE_STATE_OBJ_BUSCAR_PARED ||
+             line_state == LINE_STATE_OBJ_BORDEAR_PARED ||
+             line_state == LINE_STATE_OBJ_PARED_LIBRE ||
+             line_state == LINE_STATE_LOST_FWD ||
+             line_state == LINE_STATE_EDGE_FWD)) {
+            // 0.23 = 0.3*(100/131): misma restauración de ganancia efectiva
+            // que la corrección de yaw de balance común (ver ahí). gz crudo
+            // con zona muerta (sin filtro — ver GZ_YAW_ASSIST_DB).
+            half_steer = apply_deadbandf((float)gz / 100.0f, GZ_YAW_ASSIST_DB) * 0.23f;
+        }
+
+        float mR = pwm_sat - half_steer;
+        float mL = pwm_sat + half_steer;
+
+        if (mR >  40.0f) mR =  40.0f;
+        if (mR < -40.0f) mR = -40.0f;
+        if (mL >  40.0f) mL =  40.0f;
+        if (mL < -40.0f) mL = -40.0f;
+
+        motorRightVelocity = -(int16_t)lroundf(mL);
+        motorLeftVelocity  = -(int16_t)lroundf(mR);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 15b — Motores en modo MANUAL (o override manual durante LINEA):
+// giro rampeado o rumbo recto por encoders, mezclados con el PWM común.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_MotoresManual(void)
+{
+    line_integral       = 0.0f;
+    line_error_prev     = 0.0f;
+    line_state          = LINE_STATE_FOLLOWING;
+
+    // Control manual normal (comandos por WiFi/USB). El banco de pruebas
+    // del giro de 90° que se activaba con el joystick/comandos en reposo
+    // se eliminó a pedido del usuario: MANUAL ahora solo mueve el robot en
+    // respuesta a comandos, sin ningún ciclo automático de rotación. También
+    // se entra acá con manual_line_override=1 (LINE_FOLLOWING sin ver la
+    // línea + comando activo) — mismo control, reutilizado tal cual; el
+    // `line_state = LINE_STATE_FOLLOWING` de arriba mantiene la máquina de
+    // estados del seguidor limpia mientras dura el override.
+    uint8_t manual_turning = fabsf(manual_steering_cmd) > 0.5f;
+
+    if (manual_turning) {
+        // Giro: rampa suave hacia manual_steering_cmd. Bajado a 1/4 de la
+        // rampa anterior (0.25→0.0625/ciclo) porque, aun con la magnitud del
+        // comando también reducida a 1/4 (±60→±15 en MOVE_LEFT/RIGHT,
+        // UNER.c), el giro seguía sintiéndose demasiado fuerte — "siempre
+        // movimientos suaves".
+        const float STEER_RATE = 0.0625f;
+        float steer_delta = manual_steering_cmd - steering_adjustment;
+        if (steer_delta >  STEER_RATE) steer_delta =  STEER_RATE;
+        if (steer_delta < -STEER_RATE) steer_delta = -STEER_RATE;
+        steering_adjustment += steer_delta;
+        manual_straight_steer_f = steering_adjustment; // sincronizado para la transición a "sin giro"
+    } else {
+        // Sin giro comandado: corrección de rumbo recto para que
+        // adelante/atrás no se curve por asimetría mecánica entre ruedas —
+        // mismo algoritmo P sobre diferencia de velocidad de ruedas ya
+        // usado y calibrado en la reversa recta de OBJ_REVERSE/wall-following
+        // (ver REV_STRAIGHT_KP/MAX/SLEW), reutilizado tal cual.
+        float rate_diff = speed_right_rps_s - speed_left_rps_s;
+        float corr_target = clampf_local(
+            REV_STRAIGHT_KP * rate_diff,
+            -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
+        );
+        float corr_delta = corr_target - manual_straight_steer_f;
+        if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
+        if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
+        manual_straight_steer_f += corr_delta;
+        steering_adjustment = manual_straight_steer_f;
+    }
+
+    static float prev_steering_cmd = 0.0f;
+    if ((manual_steering_cmd > 0.5f && prev_steering_cmd < -0.5f) ||
+        (manual_steering_cmd < -0.5f && prev_steering_cmd > 0.5f)) {
+        integral = 0.0f;
+    }
+    prev_steering_cmd = manual_steering_cmd;
+
+    float mR = pwm_sat - steering_adjustment;
+    float mL = pwm_sat + steering_adjustment;
+    if (mR >  100.0f) mR =  100.0f;
+    if (mR < -100.0f) mR = -100.0f;
+    if (mL >  100.0f) mL =  100.0f;
+    if (mL < -100.0f) mL = -100.0f;
+
+    motorRightVelocity = -(int16_t)lroundf(mL);
+    motorLeftVelocity  = -(int16_t)lroundf(mR);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 15c — Motores en BALANCE/IDLE-activo: PWM común ± corrección de
+// rumbo (yaw-assist por gyro Z, o el steering PID de lazo cerrado).
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_MotoresBalance(void)
+{
+    line_integral       = 0.0f;
+    line_error_prev     = 0.0f;
+    steering_adjustment = 0.0f;
+    line_state          = LINE_STATE_FOLLOWING;
+
+    // steer_pid_enabled=0: corrección open-loop por giroscopio Z (comportamiento original)
+    // steer_pid_enabled=1: corrección de lazo cerrado por encoders
+    // Ganancia 0.23 = 0.3*(100/131): restaura la ganancia EFECTIVA que estaba
+    // calibrada antes del fix de escala del gyro (2026-07-04). gz crudo con
+    // zona muerta (sin filtro por software — ver GZ_YAW_ASSIST_DB): giros
+    // chicos por ruido no generan corrección ni disparan la compensación
+    // de deadband de motor.
+    float correction = steer_pid_enabled
+                     ? steer_correction
+                     : (-apply_deadbandf((float)gz / 100.0f, GZ_YAW_ASSIST_DB) * 0.23f);
+
+    float mR = pwm_sat + correction;
+    float mL = pwm_sat - correction;
+
+    if (mR >  100.0f) mR =  100.0f;
+    if (mR < -100.0f) mR = -100.0f;
+    if (mL >  100.0f) mL =  100.0f;
+    if (mL < -100.0f) mL = -100.0f;
+
+    motorRightVelocity = -(int16_t)lroundf(mL);
+    motorLeftVelocity  = -(int16_t)lroundf(mR);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 15 — Mezcla de motores: elige la rama según el modo. Caído no se
+// toca nada (la salida final ya corta los motores). En MOTOR_TEST el
+// comando SETMOTORSPEED controla directo y acá no se pisa.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_MezclaMotores(void)
+{
+    if (f_fallen) return;
+
+    if (robot_state == ROBOT_STATE_LINE_FOLLOWING && !manual_line_override) {
+        Ctrl_MotoresLinea();
+    } else if (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) {
+        Ctrl_MotoresManual();
+    } else if (robot_state != ROBOT_STATE_MOTOR_TEST) {
+        Ctrl_MotoresBalance();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 16 — Telemetría: log binario WiFi, push de odometría y CSV USB.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_Telemetria(void)
+{
+    roll_deg = filtered_roll_deg;
+
+    log_counter++;
+
+    if (f_send_wifi_log && (log_counter % LOG_WIFI_DECIM == 0)) {
+        WifiLogData_t wlog;
+        wlog.t_ms       = HAL_GetTick();
+        wlog.roll_filt  = filtered_roll_deg;
+        wlog.output     = output;
+        wlog.p_term     = p_term;
+        wlog.i_term     = i_term;
+        wlog.d_term     = d_term;
+        wlog.mR         = motorRightVelocity;
+        wlog.mL         = motorLeftVelocity;
+        wlog.dyn_sp     = dynamic_setpoint_f;
+        wlog.dt_ctrl_us = (uint32_t)(dt_ctrl * 1000000.0f);
+
+        wlog.line_error          = line_error;
+        wlog.p_line              = log_p_line;
+        wlog.i_line              = log_i_line;
+        wlog.d_line              = log_d_line;
+        wlog.steering_adjustment = steering_adjustment;
+        wlog.adc1                = adcAvg[0];
+        wlog.adc2                = adcAvg[1];
+        wlog.adc3                = adcAvg[2];
+        wlog.adc4                = adcAvg[3];
+
+        UNER_SendWifiLogData(&wlog);
+    }
+
+    // Push de odometría/línea por WiFi para graficar (mapa XY, franja de línea) en
+    // Qt: independiente de ACTIVATE_WIFI_LOG, arranca solo con f_wifi_connected y a
+    // un ritmo bajo (WIFI_ODOM_PERIOD_MS) para no competir por ancho de banda/CPU
+    // con la telemetría de control ya existente.
+    if (f_wifi_connected && (uint32_t)(HAL_GetTick() - last_wifi_odom_ms) >= WIFI_ODOM_PERIOD_MS) {
+        last_wifi_odom_ms = HAL_GetTick();
+
+        WifiOdomData_t odata;
+        odata.seq           = wifi_odom_seq++;
+        odata.t_ms          = HAL_GetTick();
+        odata.x_m           = odom_x_m;
+        odata.y_m           = odom_y_m;
+        odata.theta_deg     = odom_theta_deg;
+        odata.line_error    = line_error_disp;
+        odata.line_detected = line_detected_disp;
+        odata.robot_state   = robot_state;
+        odata.line_state    = (uint8_t)line_state;
+        odata.adc5          = adcAvg[4];  // sensores de objeto: menos = más cerca,
+        odata.adc6          = adcAvg[5];  // ~4095 = nada adelante — para graficar
+        odata.adc7          = adcAvg[6];  // la barrera/cuerpo frente al robot en Qt
+        odata.adc8          = adcAvg[7];
+        odata.roll_deg      = filtered_roll_deg;  // balanceo → Vista 3D de Qt
+        odata.lat_deg       = lat_tilt_f;          // banking lateral → Vista 3D de Qt
+
+        UNER_SendWifiOdomData(&odata);
+    }
+
+    if (f_send_csv_log && !log_header_sent) {
+        USB_DebugStr("t_ms,dt_us,dt_ctrl_us,accel_roll,accel_roll_f,gyro_y,gyro_f,roll_filt,dyn_sp,error,p,i,d,output,pwm_cmd,pwm_sat,sat,mR,mL,pitch,ax,ay,az,gx,gy,gz\r\n");
+        log_header_sent = 1;
+    }
+
+    if (f_send_csv_log && (log_counter % LOG_DECIM == 0)) {
+        char buf[128];
+
+        int roll_i   = (int)(filtered_roll_deg * 1000.0f);
+        int p_i      = (int)(p_term * 1000.0f);
+        int i_i      = (int)(i_term * 1000.0f);
+        int d_i      = (int)(d_term * 1000.0f);
+        int sp_i     = (int)(dynamic_setpoint_f * 1000.0f);
+        int error_i  = (int)(error * 1000.0f);
+        int gyrof_i  = (int)(gyro_f * 1000.0f);
+        int accel_i  = (int)(accel_ang_deg * 1000.0f);
+        int accelf_i = (int)(accel_roll_f * 1000.0f);
+        int output_i = (int)(output * 1000.0f);
+        int pwmcmd_i = (int)(pwm_cmd * 100.0f);
+        int pwmsat_i = (int)(pwm_sat * 100.0f);
+        int pitch_i  = (int)(pitch_deg * 1000.0f);
+
+        int ax_i = (int)ax;
+        int ay_i = (int)ay;
+        int az_i = (int)az;
+        int gx_i = (int)gx;
+        int gy_i = (int)gy;
+        int gz_i = (int)gz;
+
+        int len = snprintf(buf, sizeof(buf),
+            "%lu,%lu,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
+            HAL_GetTick(),                 // t_ms
+            (uint32_t)(dt_real * 1000000.0f), // dt_us
+            (uint32_t)(dt_ctrl * 1000000.0f), // dt_ctrl_us
+            accel_i,                       // accel_roll x1000
+            accelf_i,                      // accel_roll_f x1000
+            (int)(gyro_rate_dps * 1000.0f),// gyro_y x1000
+            gyrof_i,                       // gyro_f x1000
+            roll_i,                        // roll_filt x1000
+            sp_i,                          // dyn_sp x1000
+            error_i,                       // error x1000
+            p_i,                           // p x1000
+            i_i,                           // i x1000
+            d_i,                           // d x1000
+            output_i,                      // output x1000
+            pwmcmd_i,                      // pwm_cmd x100
+            pwmsat_i,                      // pwm_sat x100
+            sat_flag,                      // sat
+            motorRightVelocity,            // mR
+            motorLeftVelocity,             // mL
+            pitch_i,                       // pitch x1000
+            ax_i, ay_i, az_i,              // accel raw
+            gx_i, gy_i, gz_i               // gyro raw
+        );
+
+        if (len > 0) {
+            USB_DebugSend((uint8_t*)buf, (uint16_t)len);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Etapa 17 — Salida a motores: paro por "en el aire", compensación de
+// zona muerta (estática/cinética según la rueda gire o no) y MotorControl.
+// ─────────────────────────────────────────────────────────────────────
+static void Ctrl_SalidaMotores(void)
+{
     // En el aire >2s: detener motores hasta que los sensores de línea vean superficie.
     if (robot_state == ROBOT_STATE_LINE_FOLLOWING && f_in_air) {
         motorRightVelocity = 0;
@@ -5746,6 +5819,32 @@ static void ControlStep10ms(void)
     } else {
         MotorControl(0, 0);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// ORQUESTADOR — un ciclo completo de control (100 Hz, llamado por TIM1).
+// El orden de las etapas es el contrato: cada una consume lo que dejaron
+// las anteriores en las variables de ciclo (ver bloque al inicio).
+// ─────────────────────────────────────────────────────────────────────
+static void ControlStep10ms(void)
+{
+    if (!Ctrl_LeerIMU())       return;   // sin dato nuevo del MPU: el ciclo no corre
+    Ctrl_VelocidadEncoders();
+    Ctrl_LatchesPared();
+    Ctrl_Odometria();
+    Ctrl_SteeringLazoCerrado();
+    if (!Ctrl_TimingDt())      return;   // primer ciclo: todavía no hay dt válido
+    Ctrl_FiltroIMU();
+    Ctrl_CuarentenaLinea();
+    Ctrl_EntradasLinea();
+    Ctrl_OverrideManualLinea();
+    Ctrl_CambiosDeEstado();
+    Ctrl_SetpointDinamico();
+    Ctrl_DeteccionCaida();
+    Ctrl_PIDBalance();
+    Ctrl_MezclaMotores();
+    Ctrl_Telemetria();
+    Ctrl_SalidaMotores();
 }
 
 /* USER CODE END 0 */
@@ -6258,7 +6357,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
+  sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -6295,7 +6394,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_5;
   sConfig.Rank = 5;
-  sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
+  sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
