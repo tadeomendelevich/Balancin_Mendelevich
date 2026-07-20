@@ -156,8 +156,10 @@ typedef enum {
 #define DEAD_ZONE_ANGLE      	15.0f   // entre 35° y 120° → zona muerta, motores off
 // Corte de emergencia exclusivo del modo línea. Usa velocidad filtrada y
 // confirmación breve para no disparar por un solo escalón cuantizado del encoder.
-#define LINE_SPEED_EMERGENCY_LIMIT       3.30f  // m/s: corte total de motores
-#define LINE_SPEED_EMERGENCY_TRIP_CYC    2U     // 20ms consecutivos sobre el límite
+#define LINE_SPEED_EMERGENCY_LIMIT       10.00f  // m/s: corte total
+#define LINE_SPEED_EMERGENCY_RAW_SUPPORT 3.00f  // cada ciclo debe tener movimiento real, no solo cola del filtro
+#define LINE_SPEED_EMERGENCY_TRIP_CYC    3U     // 30ms con muestras nuevas que confirmen exceso
+#define LINE_SPEED_EMERGENCY_ARM_MS      500U   // ignora el transitorio de entrada al modo línea
 #define LINE_SPEED_EMERGENCY_RESET_VEL   0.50f  // m/s: velocidad segura para rearmar
 #define LINE_SPEED_EMERGENCY_RESET_CYC   50U    // 500ms seguro y vertical antes de volver
 
@@ -339,6 +341,8 @@ typedef enum {
 
 #define OBJ_DETECT_THRESHOLD_VAL   3200.0f   // objeto detectado si ADC < este valor (sin objeto: ~4095, con objeto: <2000)
 #define OBJ_DETECT_DEBOUNCE_CNT    10         // ciclos consecutivos (100 ms) para confirmar objeto
+#define OBJ_FRONT_CONFIRM_CYC      5U         // 50ms: ADC6 o ADC8 debe confirmar el objeto
+#define OBJ_FRONT_CONFIRM_TIMEOUT_MS 800U     // sin confirmación frontal, cancelar el falso esquive
 // Distancia objetivo al objeto: el hold del STOP (OBJ_FRENO_REVERSA) retrocede/
 // avanza hasta que ADC6 y ADC8 (los frontales) lean dentro de la banda
 // CLEAR..CLEAR+BAND — así la distancia final al objeto es siempre la misma,
@@ -605,6 +609,8 @@ static uint8_t f_wifi_connected = 0;
 static volatile uint32_t wifi_splash_until_ms = 0;
 static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
 static uint8_t speed_limit_fault = 0; // caída forzada por exceso de velocidad en LINE
+static float speed_limit_trip_velocity = 0.0f; // velocidad de avance que produjo el corte
+static uint32_t speed_limit_arm_after_ms = 0;  // instante desde el cual se habilita el corte
 
 static float dt_real        = 0.0f;		// Monitoreo del perÃ­odo real entre muestras
 
@@ -688,6 +694,7 @@ static float pwm_sat_prev = 0.0f;
 static float prev_error = 0.0f;
 static uint8_t balance_hold_active = 0;
 static uint32_t obj_detect_ignore_until_ms = 0;  // ignora sensores de objeto hasta este tick
+static uint8_t  obj_false_trigger_lockout = 0;   // tras falso positivo, espera que ADC5-ADC8 queden libres
 static uint8_t  prev_all_line_black        = 1;  // todos los sensores de línea en negro (robot en el aire)
 static uint32_t all_black_start_ms         = 0;  // tick en que empezaron a verse todos negros
 static uint32_t last_partial_line_ms       = 0;  // último ciclo con línea detectada SIN los 4 en negro (vista "parcial" real, imposible en el aire)
@@ -730,6 +737,8 @@ static float    obj_wall_vel_integral = 0.0f;     // integral del PI de velocida
 static uint32_t obj_brake_start_ms   = 0;         // inicio de OBJ_BRAKE (file-scope para reset en caída)
 static uint32_t obj_pre_rotate_ms    = 0;         // inicio del wait post-freno antes de OBJ_ROTATE
 static uint32_t obj_rev_band_enter_ms = 0;        // entrada a la banda 3600..3900 de A6/A8 en STOP (0 = fuera de banda)
+static uint8_t  obj_front_confirm_count = 0;      // lecturas consecutivas de objeto en ADC6/ADC8
+static uint8_t  obj_front_confirmed = 0;          // latch: habilita hold de distancia y giro
 static uint32_t obj_hold_start_ms    = 0;         // inicio de la pausa post-giro (PAUSA_GIRO, 2s)
 static int32_t  obj_pausa_r0         = 0;         // ancla de posición del hold post-giro (PAUSA_GIRO)
 static int32_t  obj_pausa_l0         = 0;
@@ -771,7 +780,7 @@ volatile int32_t encoder_right = 0;
 volatile int32_t encoder_left  = 0;
 
 // ── ODOMETRÍA DE POSE ─────────────────────────────────────────────────────
-// Pose estimada del robot en el plano, integrada a 100 Hz en ControlStep10ms:
+// Pose estimada del robot en el plano, integrada a 100 Hz en ControlCiclo10ms:
 //  - distancia: promedio de encoders (misma escala ENC_CPR/ENC_VEL_SCALE que velocity_est)
 //  - rumbo: gyro Z integrado (menos sensible al slip de ruedas que el diferencial de encoders)
 // Marco de referencia: (0,0) y θ=0 en el punto/orientación donde se hizo el último
@@ -871,7 +880,7 @@ void appOnESP01ChangeState(_eESP01STATUS state);
 
 void ProcessEspRxLimited(void);
 
-static void ControlStep10ms(void);
+static void ControlCiclo10ms(void);
 static float ComputeSteeringPID(float speed_r, float speed_l, float sp);
 static void  SteeringPID_Reset(void);
 static void  SampleEncoders250us(void);
@@ -1983,7 +1992,9 @@ void updateDisplay(void) {
         OLED_Puts7CenteredX("LIMITE DE", 0, SCREEN_W - 1, 14);
         OLED_Puts7CenteredX("VELOCIDAD", 0, SCREEN_W - 1, 27);
         OLED_Puts7CenteredX("EXCEDIDO", 0, SCREEN_W - 1, 40);
-        OLED_Str5Centered(55, "MOTORES APAGADOS");
+        FormatSignedFixed(nbuf, sizeof(nbuf), speed_limit_trip_velocity, 2);
+        snprintf(lbuf, sizeof(lbuf), "V:%s M/S", nbuf);
+        OLED_Str5Centered(55, lbuf);
         SSD1306_RequestUpdate();
         return;
     }
@@ -2490,9 +2501,9 @@ static void I2C1_Recover(void)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  LOOP DE CONTROL (100 Hz) — etapas de ControlStep10ms
+//  LOOP DE CONTROL (100 Hz) — etapas de ControlCiclo10ms
 //
-//  ControlStep10ms (al final de este bloque) es solo el orquestador: llama a
+//  ControlCiclo10ms (al final de este bloque) es solo el orquestador: llama a
 //  las etapas en orden. Cada etapa es una función Ctrl_* de acá abajo, en el
 //  mismo orden en que se ejecutan. Las variables de este bloque son el
 //  "contexto del ciclo": se recalculan completas en cada ciclo de 10ms y
@@ -2910,13 +2921,32 @@ static void Ctrl_EntradasLinea(void)
         // consecutivos (10 ciclos = 100 ms), arranca la secuencia de evasión.
         {
             static uint8_t obj_cnt = 0;
+            static uint8_t obj_clear_cnt = 0;
             uint8_t obj_now = ((float)adcAvg[4] < OBJ_DETECT_THRESHOLD_f ||
                                (float)adcAvg[5] < OBJ_DETECT_THRESHOLD_f ||
                                (float)adcAvg[6] < OBJ_DETECT_THRESHOLD_f ||
                                (float)adcAvg[7] < OBJ_DETECT_THRESHOLD_f);
-            if (obj_now) { if (obj_cnt < OBJ_DETECT_DEBOUNCE_CNT) obj_cnt++; }
-            else         { obj_cnt = 0; }
+            if (obj_false_trigger_lockout) {
+                // No reintentar cada pocos segundos si el sensor que causó el
+                // falso positivo continúa activo. Rearma sólo cuando los cuatro
+                // sensores permanecen libres durante la misma ventana de debounce.
+                obj_cnt = 0;
+                if (!obj_now) {
+                    if (obj_clear_cnt < OBJ_DETECT_DEBOUNCE_CNT) obj_clear_cnt++;
+                    if (obj_clear_cnt >= OBJ_DETECT_DEBOUNCE_CNT) {
+                        obj_false_trigger_lockout = 0;
+                        obj_clear_cnt = 0;
+                    }
+                } else {
+                    obj_clear_cnt = 0;
+                }
+            } else {
+                obj_clear_cnt = 0;
+                if (obj_now) { if (obj_cnt < OBJ_DETECT_DEBOUNCE_CNT) obj_cnt++; }
+                else         { obj_cnt = 0; }
+            }
             if (obj_cnt >= OBJ_DETECT_DEBOUNCE_CNT &&
+                !obj_false_trigger_lockout &&
                 line_state == LINE_STATE_FOLLOWING &&
                 HAL_GetTick() >= obj_detect_ignore_until_ms) {
                 // 2026-07-14: directo a la fase STOP, sin pasar por ESPERA_REVERSA.
@@ -2929,6 +2959,8 @@ static void Ctrl_EntradasLinea(void)
                 obj_brake_start_ms   = 0;
                 obj_pre_rotate_ms    = 0;
                 obj_rev_band_enter_ms = 0;
+                obj_front_confirm_count = 0;
+                obj_front_confirmed = 0;
                 obj_cnt              = 0;
                 // Sentido alternado (2026-07-13): esta esquiva usa el sentido
                 // programado y deja armado el opuesto para el próximo objeto.
@@ -3256,11 +3288,15 @@ static void Ctrl_CambiosDeEstado(void)
         perp_from_obj_avoidance   = 0;
         perp_obj_brake_start_ms   = 0;
         obj_wall_line_confirm_cnt = 0;
+        obj_false_trigger_lockout = 0;
+        obj_front_confirm_count = 0;
+        obj_front_confirmed = 0;
         odom_x_m            = 0.0f;   // odometría: origen = punto de entrada al modo
         odom_y_m            = 0.0f;
         odom_theta_deg      = 0.0f;
         line_loss_pose_valid = 0;     // snapshot viejo queda en el marco anterior
         lost_ret_ov_active   = 0;
+        speed_limit_arm_after_ms = HAL_GetTick() + LINE_SPEED_EMERGENCY_ARM_MS;
     }
 
     if (robot_state != ROBOT_STATE_LINE_FOLLOWING && prev_robot_state == ROBOT_STATE_LINE_FOLLOWING) {
@@ -3404,6 +3440,16 @@ static void Ctrl_SetpointDinamico(void)
             line_enc_angle_corr   = 0.0f;
             line_reverse_boost    = 0.0f;
         } else if (line_state == LINE_STATE_OBJ_FRENO_REVERSA) {
+            if (!obj_front_confirmed) {
+                // La detección inicial acepta ADC5-ADC8. Hasta que uno de los
+                // frontales confirme, solo frenar: 4095 no debe interpretarse
+                // como "objeto lejos" ni generar avance hacia adelante.
+                base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+                brake_setpoint_target = ComputeBrakeFromVelocity(
+                    velocity_est_f, BRAKE_TILT_MAX);
+                line_enc_angle_corr   = 0.0f;
+                line_reverse_boost    = 0.0f;
+            } else {
             // Frenado post-reversa + hold de distancia por ADC6/ADC8: la reversa
             // cortó en OBJ_REV_CLEAR_ADC; acá se sostiene esa distancia mientras
             // dura el STOP. Antes era bang-bang puro con ±2.75° fijos: se pasaba
@@ -3451,6 +3497,7 @@ static void Ctrl_SetpointDinamico(void)
             }
             line_enc_angle_corr   = 0.0f;
             line_reverse_boost    = 0.0f;
+            }
         } else if (line_state == LINE_STATE_LOST_FWD) {
             // Avance post-180°: PI de velocidad (ver LOST_FWD_* arriba), con deadband
             // (BRAKE_VEL_DEADBAND) y anti-windup igual que el PI de línea normal.
@@ -3905,17 +3952,24 @@ static void Ctrl_DeteccionCaida(void)
     static uint8_t speed_trip_count      = 0;
     static uint8_t speed_safe_count      = 0;
 
-    // Emergencia de velocidad: no cambia robot_state ni line_state. Enclava la
-    // misma salida segura de una caída para que Ctrl_SalidaMotores corte ambos
-    // motores. Dos muestras filtradas consecutivas evitan falsos positivos.
-    float abs_speed_filtered = fabsf(velocity_est_f);
+    // Emergencia de velocidad: protege el avance descontrolado, no una corrección
+    // breve en reversa. El filtro solo no alcanza para confirmar: un único salto
+    // crudo queda varios ciclos en su cola EMA y antes contaba como 2 muestras.
+    // Por eso cada ciclo sobre el límite también debe traer velocidad cruda nueva.
+    float forward_speed_filtered = fmaxf(0.0f, -velocity_est_f);
+    float forward_speed_raw      = fmaxf(0.0f, -velocity_est);
     float abs_speed_raw      = fabsf(velocity_est);
-    if (!speed_limit_fault && robot_state == ROBOT_STATE_LINE_FOLLOWING) {
-        if (abs_speed_filtered > LINE_SPEED_EMERGENCY_LIMIT) {
+    uint8_t speed_limit_armed =
+        ((int32_t)(HAL_GetTick() - speed_limit_arm_after_ms) >= 0);
+    if (!speed_limit_fault && robot_state == ROBOT_STATE_LINE_FOLLOWING &&
+        speed_limit_armed) {
+        if (forward_speed_filtered > LINE_SPEED_EMERGENCY_LIMIT &&
+            forward_speed_raw > LINE_SPEED_EMERGENCY_RAW_SUPPORT) {
             if (speed_trip_count < LINE_SPEED_EMERGENCY_TRIP_CYC)
                 speed_trip_count++;
             if (speed_trip_count >= LINE_SPEED_EMERGENCY_TRIP_CYC) {
                 speed_limit_fault = 1;
+                speed_limit_trip_velocity = forward_speed_filtered;
                 speed_safe_count  = 0;
             }
         } else {
@@ -3988,6 +4042,9 @@ static void Ctrl_DeteccionCaida(void)
             obj_brake_start_ms   = 0;
             obj_pre_rotate_ms    = 0;
             obj_rev_band_enter_ms = 0;
+            obj_false_trigger_lockout = 0;
+            obj_front_confirm_count = 0;
+            obj_front_confirmed     = 0;
             obj_hold_start_ms    = 0;
             obj_wall_approach_start_ms = 0;
             obj_wall_fwd_start_ms      = 0;
@@ -5101,15 +5158,15 @@ static void LineState_GivenUp(void)
 static void LineState_ObjFrenoReversa(void)
 {
     // Fase 1: espera a que la velocidad caiga. Fase 2: wait antes de rotar.
-    // Además, el giro exige distancia ESTABLE: A6 y A8 dentro de la banda
-    // 3600..3900 durante OBJ_REV_STABLE_MS continuos — mientras el hold de
-    // distancia (ver setpoints) esté corrigiendo, el giro espera. Colchón:
-    // si en OBJ_REV_STOP_TIMEOUT_MS total nunca se estabilizó, gira igual.
+    // Además, el giro exige que A6 o A8 haya confirmado primero el objeto.
+    // Una vez confirmado, espera distancia estable dentro de la banda o usa
+    // OBJ_REV_STOP_TIMEOUT_MS como colchón. Sin confirmación frontal, aborta.
     const float    BRAKE_VEL_THR  = 0.05f;
     const uint32_t BRAKE_TIMEOUT  = 1500U;
     const uint32_t PRE_ROTATE_MS  = 3000U;
+    uint32_t now = HAL_GetTick();
     if (obj_brake_start_ms == 0) {
-        obj_brake_start_ms = HAL_GetTick();
+        obj_brake_start_ms = now;
         // Rumbo recto (2026-07-14): desde que el STOP es la entrada
         // al detectar objeto, su hold hace también la reversa hasta
         // la banda de A6/A8 — y salía chueca (reportado) porque no
@@ -5123,7 +5180,44 @@ static void LineState_ObjFrenoReversa(void)
         __enable_irq();
         obj_rev_steer_f      = 0.0f;
         obj_rev_last_counts  = 0;
-        obj_rev_last_move_ms = HAL_GetTick();
+        obj_rev_last_move_ms = now;
+    }
+
+    // La detección inicial puede provenir de cualquiera de ADC5-ADC8. Antes
+    // de autorizar el hold de distancia y el giro, exigir que ADC6 o ADC8
+    // realmente vea el objeto durante varias lecturas consecutivas.
+    uint8_t front_object_now =
+        ((float)adcAvg[5] < OBJ_DETECT_THRESHOLD_f ||
+         (float)adcAvg[7] < OBJ_DETECT_THRESHOLD_f);
+    if (!obj_front_confirmed) {
+        if (front_object_now) {
+            if (obj_front_confirm_count < OBJ_FRONT_CONFIRM_CYC)
+                obj_front_confirm_count++;
+            if (obj_front_confirm_count >= OBJ_FRONT_CONFIRM_CYC)
+                obj_front_confirmed = 1;
+        } else {
+            obj_front_confirm_count = 0;
+        }
+
+        if (!obj_front_confirmed &&
+            (now - obj_brake_start_ms) >= OBJ_FRONT_CONFIRM_TIMEOUT_MS) {
+            // Falso positivo lateral: no girar ni consumir la alternancia.
+            line_state                 = LINE_STATE_FOLLOWING;
+            obj_esquive_next_dir       = obj_esquive_dir;
+            obj_false_trigger_lockout  = 1;
+            obj_brake_start_ms         = 0;
+            obj_pre_rotate_ms          = 0;
+            obj_rev_band_enter_ms      = 0;
+            obj_front_confirm_count    = 0;
+            obj_front_confirmed        = 0;
+            obj_rev_steer_f            = 0.0f;
+            steering_adjustment        = 0.0f;
+            line_integral              = 0.0f;
+            line_error_prev            = 0.0f;
+            line_error_f_d             = 0.0f;
+            line_lost_ms               = now;
+            return;
+        }
     }
 
     {
@@ -5134,13 +5228,13 @@ static void LineState_ObjFrenoReversa(void)
         int32_t rev_counts = (abs(rev_dr) + abs(rev_dl)) / 2;
         if (rev_counts != obj_rev_last_counts) {
             obj_rev_last_counts  = rev_counts;
-            obj_rev_last_move_ms = HAL_GetTick();
+            obj_rev_last_move_ms = now;
         }
         // Solo corrige mientras hay movimiento real (gate por
         // actividad de encoders);
         // quieto, el target decae a 0 por el slew (anti-pivoteo).
         float corr_target = 0.0f;
-        if ((HAL_GetTick() - obj_rev_last_move_ms) < REV_STRAIGHT_ACT_MS) {
+        if ((now - obj_rev_last_move_ms) < REV_STRAIGHT_ACT_MS) {
             corr_target = clampf_local(
                 REV_STRAIGHT_KC * (float)(rev_dr - rev_dl),
                 -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX);
@@ -5156,8 +5250,8 @@ static void LineState_ObjFrenoReversa(void)
     // umbral 0.05 equivalía a ~0.40 m/s reales)
     if (obj_pre_rotate_ms == 0) {
         if (fabsf(velocity_est_f) < BRAKE_VEL_THR + 0.10f ||
-            (HAL_GetTick() - obj_brake_start_ms) > BRAKE_TIMEOUT) {
-            obj_pre_rotate_ms = HAL_GetTick();  // arranca fase 2
+            (now - obj_brake_start_ms) > BRAKE_TIMEOUT) {
+            obj_pre_rotate_ms = now;  // arranca fase 2
         }
     }
 
@@ -5168,16 +5262,17 @@ static void LineState_ObjFrenoReversa(void)
         uint8_t in_band = (front_min >= OBJ_REV_CLEAR_ADC &&
                            front_min <= OBJ_REV_CLEAR_ADC + OBJ_REV_HOLD_BAND);
         if (!in_band)                          obj_rev_band_enter_ms = 0;
-        else if (obj_rev_band_enter_ms == 0)   obj_rev_band_enter_ms = HAL_GetTick();
+        else if (obj_rev_band_enter_ms == 0)   obj_rev_band_enter_ms = now;
     }
     uint8_t dist_stable = (obj_rev_band_enter_ms != 0 &&
-                           (HAL_GetTick() - obj_rev_band_enter_ms) >= OBJ_REV_STABLE_MS);
+                           (now - obj_rev_band_enter_ms) >= OBJ_REV_STABLE_MS);
 
     // Fase 2: wait quieto + distancia estable 2s (o timeout total) antes de girar
     if (obj_pre_rotate_ms != 0 &&
-        (HAL_GetTick() - obj_pre_rotate_ms) >= PRE_ROTATE_MS &&
+        (now - obj_pre_rotate_ms) >= PRE_ROTATE_MS &&
         (dist_stable ||
-         (HAL_GetTick() - obj_brake_start_ms) >= OBJ_REV_STOP_TIMEOUT_MS)) {
+         (now - obj_brake_start_ms) >= OBJ_REV_STOP_TIMEOUT_MS) &&
+        obj_front_confirmed) {
         line_state          = LINE_STATE_OBJ_GIRO_ESQUIVE;
         obj_rot_initialized = 0;
         obj_rot_phase       = 0;
@@ -5187,6 +5282,8 @@ static void LineState_ObjFrenoReversa(void)
         obj_brake_start_ms  = 0;
         obj_pre_rotate_ms   = 0;
         obj_rev_band_enter_ms = 0;
+        obj_front_confirm_count = 0;
+        obj_front_confirmed = 0;
     }
 }
 
@@ -5998,7 +6095,7 @@ static void Ctrl_SalidaMotores(void)
 // El orden de las etapas es el contrato: cada una consume lo que dejaron
 // las anteriores en las variables de ciclo.
 // ─────────────────────────────────────────────────────────────────────
-static void ControlStep10ms(void)
+static void ControlCiclo10ms(void)
 {
     if (!Ctrl_LeerIMU())       return;   // sin dato nuevo del MPU: el ciclo no corre
     Ctrl_VelocidadEncoders();
@@ -6283,7 +6380,7 @@ int main(void)
 	      if (mpu_data_ready_for_ctrl) {
 	          mpu_data_ready_for_ctrl = 0;
 	          last_ctrl_ms = HAL_GetTick();
-	          ControlStep10ms();
+	          ControlCiclo10ms();
 	      }
 
 	      if (mpu_initialized && last_ctrl_ms != 0 &&
