@@ -169,6 +169,7 @@ typedef enum {
 #define LINE_SPEED_EMERGENCY_RAW_SUPPORT 3.00f  // cada ciclo debe tener movimiento real, no solo cola del filtro
 #define LINE_SPEED_EMERGENCY_TRIP_CYC    3U     // 30ms con muestras nuevas que confirmen exceso
 #define LINE_SPEED_EMERGENCY_ARM_MS      500U   // ignora el transitorio de entrada al modo línea
+#define SPEED_LIMIT_RECOVERY_GRACE_MS   2000U   // tiempo para apoyar el robot tras levantarlo
 #define LINE_SPEED_EMERGENCY_RESET_VEL   0.50f  // m/s: velocidad segura para rearmar
 #define LINE_SPEED_EMERGENCY_RESET_CYC   50U    // 500ms seguro y vertical antes de volver
 
@@ -4053,7 +4054,8 @@ static void Ctrl_DeteccionCaida(void)
                                    : BAL_MAN_SPEED_EMERGENCY_LIMIT;
     uint8_t speed_limit_armed =
         ((int32_t)(HAL_GetTick() - speed_limit_arm_after_ms) >= 0);
-    if (!speed_limit_fault && (line_speed_mode || bidir_speed_mode) &&
+    if (!f_fallen && !speed_limit_fault &&
+        (line_speed_mode || bidir_speed_mode) &&
         speed_limit_armed) {
         if (monitored_speed_filtered > monitored_speed_limit &&
             monitored_speed_raw > LINE_SPEED_EMERGENCY_RAW_SUPPORT) {
@@ -4196,6 +4198,11 @@ static void Ctrl_DeteccionCaida(void)
 
         if (!speed_limit_fault && recover_by_angle && !fall_upside_down && !in_dead_zone) {
             f_fallen = 0;
+            // Al levantarlo, las ruedas quedan en el aire y pueden marcar una
+            // velocidad enorme sin que exista desplazamiento real. Dar tiempo
+            // para apoyarlo antes de volver a habilitar el corte de velocidad.
+            speed_limit_arm_after_ms = HAL_GetTick() + SPEED_LIMIT_RECOVERY_GRACE_MS;
+            speed_trip_count         = 0;
             accel_roll_f      = accel_ang_deg;
             filtered_roll_deg = accel_ang_deg;
             integral                  = 0.0f;
