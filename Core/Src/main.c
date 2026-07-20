@@ -156,6 +156,12 @@ typedef enum {
 #define RECOVER_ANGLE        	2.0f
 #define UPSIDE_DOWN_ANGLE    	120.0f  // más agresivo para detectar boca abajo antes
 #define DEAD_ZONE_ANGLE      	15.0f   // entre 35° y 120° → zona muerta, motores off
+// Corte de emergencia exclusivo del modo línea. Usa velocidad filtrada y
+// confirmación breve para no disparar por un solo escalón cuantizado del encoder.
+#define LINE_SPEED_EMERGENCY_LIMIT       3.30f  // m/s: corte total de motores
+#define LINE_SPEED_EMERGENCY_TRIP_CYC    2U     // 20ms consecutivos sobre el límite
+#define LINE_SPEED_EMERGENCY_RESET_VEL   0.50f  // m/s: velocidad segura para rearmar
+#define LINE_SPEED_EMERGENCY_RESET_CYC   50U    // 500ms seguro y vertical antes de volver
 
 #define MOTOR_RIGHT_DEADBAND  	8   // offset sumado al motor derecho para compensar su mayor zona muerta (0 = sin compensación)
 #define MOTOR_LEFT_DEADBAND   	8   // ídem motor izquierdo — ajustar si el izq. no arranca a PWM bajo
@@ -229,6 +235,14 @@ typedef enum {
 #define LINE_BRAKE_ANGLE_MAX    3.0f   // inclinación máxima hacia atrás en seguimiento
 #define LINE_SP_STEP_NORMAL     0.15f  // grados/ciclo al acelerar o aliviar el freno
 #define LINE_SP_STEP_BRAKE      0.30f  // grados/ciclo al entrar en freno por sobrevelocidad
+// Gobernador predictivo de velocidad: solo interviene cerca del tope GLOBAL.
+// Proyecta la velocidad con la aceleración filtrada y empieza a frenar antes
+// de LINE_SPEED_TARGET; no modifica el perfil de velocidad normal de las curvas.
+#define LINE_SPEED_GUARD_MARGIN     0.15f  // m/s por debajo del tope donde empieza la guarda
+#define LINE_SPEED_PREDICT_SEC      0.15f  // horizonte de predicción
+#define LINE_ACCEL_FILTER_ALPHA     0.20f  // filtro de la derivada cuantizada de encoders
+#define LINE_ACCEL_EST_MAX          8.0f   // m/s², rechazo de saltos imposibles de un tick
+#define LINE_SPEED_GUARD_KP         6.0f   // grados de freno por m/s proyectado sobre la guarda
 // Avance post-giro (LOST_FWD / EDGE_FWD): PI de velocidad.
 // 2026-07-04: con TARGET=0.18 y ANGLE_MAX=1.0° (valores del avance "a ciegas",
 // bajados cuando se aceleraba demasiado) el robot quedaba totalmente detenido en
@@ -595,6 +609,7 @@ static uint8_t f_wifi_connected = 0;
 #define WIFI_SPLASH_MS  4000
 static volatile uint32_t wifi_splash_until_ms = 0;
 static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
+static uint8_t speed_limit_fault = 0; // caída forzada por exceso de velocidad en LINE
 
 static float dt_real        = 0.0f;		// Monitoreo del perÃ­odo real entre muestras
 
@@ -1941,6 +1956,18 @@ void updateDisplay(void) {
     char nbuf[16];
     char lbuf[24];
 
+    // Alarma enclavada: prioridad sobre todas las pantallas y el splash WiFi.
+    // El modo sigue siendo LINE; f_fallen solo mantiene los motores apagados.
+    if (speed_limit_fault) {
+        OLED_Header("LINEA");
+        OLED_Puts7CenteredX("LIMITE DE", 0, SCREEN_W - 1, 14);
+        OLED_Puts7CenteredX("VELOCIDAD", 0, SCREEN_W - 1, 27);
+        OLED_Puts7CenteredX("EXCEDIDO", 0, SCREEN_W - 1, 40);
+        OLED_Str5Centered(55, "MOTORES APAGADOS");
+        SSD1306_RequestUpdate();
+        return;
+    }
+
     // ── Splash de conexión WiFi: pisa CUALQUIER pantalla durante WIFI_SPLASH_MS
     // y al vencer vuelve sola a la que estaba (f_change_display no se toca).
     if (wifi_splash_until_ms != 0) {
@@ -2473,6 +2500,9 @@ static float   w_sum = 0.0f;                     // suma de pesos del centroide
 static float   line_angle_cmd = 0.0f;            // ángulo pedido por el PI de velocidad
 static float   line_desired_forward_vel = 0.0f;
 static float   line_forward_vel = 0.0f;
+static float   line_forward_accel_f = 0.0f;       // aceleración filtrada para guarda predictiva
+static float   line_forward_vel_prev = 0.0f;
+static uint8_t line_speed_predict_valid = 0;
 static uint8_t manual_line_override = 0;         // comandos manuales durante LINE sin ver línea
 static uint8_t line_pivot_active = 0;            // 1 = el sub-estado ya escribió los motores
 
@@ -3049,8 +3079,35 @@ static void Ctrl_EntradasLinea(void)
         line_desired_forward_vel = line_detected
             ? fmaxf(LINE_SPEED_TARGET * 0.20f, LINE_SPEED_TARGET * speed_factor)
             : 0.0f;
-        // deadband para filtrar ruido de cuantización de encoders (ver BRAKE_VEL_DEADBAND)
-        line_forward_vel = apply_deadbandf(fmaxf(0.0f, -velocity_est_f), BRAKE_VEL_DEADBAND);
+        // Para el PI de línea el deadband debe ser de tipo "cero o valor real".
+        // apply_deadbandf() resta 0.35 a toda lectura válida: a 2.50m/s hacía
+        // creer al control que iba a 2.15m/s y seguía acelerando sobre el tope.
+        float line_forward_vel_raw = fmaxf(0.0f, -velocity_est_f);
+        line_forward_vel = (line_forward_vel_raw > BRAKE_VEL_DEADBAND)
+                         ? line_forward_vel_raw : 0.0f;
+
+        // Estimación de aceleración para anticipar el cruce del límite. Solo
+        // se conserva mientras sigue una línea real; así una readquisición no
+        // genera una derivada falsa por el salto desde cero.
+        if (line_state == LINE_STATE_FOLLOWING && line_detected) {
+            if (!line_speed_predict_valid) {
+                line_forward_vel_prev   = line_forward_vel_raw;
+                line_forward_accel_f    = 0.0f;
+                line_speed_predict_valid = 1;
+            } else {
+                float accel_raw = (line_forward_vel_raw - line_forward_vel_prev) /
+                                  DT_CTRL_FIXED;
+                accel_raw = clampf_local(accel_raw,
+                                         -LINE_ACCEL_EST_MAX, LINE_ACCEL_EST_MAX);
+                line_forward_accel_f += LINE_ACCEL_FILTER_ALPHA *
+                                        (accel_raw - line_forward_accel_f);
+                line_forward_vel_prev = line_forward_vel_raw;
+            }
+        } else {
+            line_forward_accel_f     = 0.0f;
+            line_forward_vel_prev    = line_forward_vel_raw;
+            line_speed_predict_valid = 0;
+        }
 
         // PI de velocidad → inclinación de avance. Convierte un error de
         // velocidad [m/s] en un ángulo de setpoint [°]: ángulo = Kp·e + Ki·∫e.
@@ -3080,6 +3137,23 @@ static void Ctrl_EntradasLinea(void)
                 line_vel_kp_eff * vel_error + line_vel_i_term,
                 -LINE_BRAKE_ANGLE_MAX, LINE_ANGLE
             );
+
+            // Guarda independiente del PI: si la velocidad proyectada a 150ms
+            // cruza la franja previa al tope global, fuerza un ángulo de freno.
+            // Solo toma aceleración positiva; al desacelerar no interfiere.
+            float predicted_forward_vel = line_forward_vel_raw +
+                fmaxf(line_forward_accel_f, 0.0f) * LINE_SPEED_PREDICT_SEC;
+            float guard_speed = fmaxf(0.0f,
+                LINE_SPEED_TARGET - LINE_SPEED_GUARD_MARGIN);
+            if (predicted_forward_vel > guard_speed) {
+                float guard_brake = -clampf_local(
+                    LINE_SPEED_GUARD_KP * (predicted_forward_vel - guard_speed),
+                    0.0f, LINE_BRAKE_ANGLE_MAX);
+                if (guard_brake < line_angle_cmd)
+                    line_angle_cmd = guard_brake;
+                // No conservar empuje integral mientras la guarda está frenando.
+                line_vel_integral *= 0.50f;
+            }
         } else {
             line_vel_integral *= 0.80f;
             line_angle_cmd = 0.0f;
@@ -3807,7 +3881,29 @@ static void Ctrl_DeteccionCaida(void)
     uint8_t upright_now     = (abs_roll_raw < RECOVER_ANGLE);
     uint8_t upside_down_now = (abs_roll_raw > UPSIDE_DOWN_ANGLE);
 
-    static uint8_t dead_zone_count = 0;
+    static uint8_t dead_zone_count       = 0;
+    static uint8_t speed_trip_count      = 0;
+    static uint8_t speed_safe_count      = 0;
+
+    // Emergencia de velocidad: no cambia robot_state ni line_state. Enclava la
+    // misma salida segura de una caída para que Ctrl_SalidaMotores corte ambos
+    // motores. Dos muestras filtradas consecutivas evitan falsos positivos.
+    float abs_speed_filtered = fabsf(velocity_est_f);
+    float abs_speed_raw      = fabsf(velocity_est);
+    if (!speed_limit_fault && robot_state == ROBOT_STATE_LINE_FOLLOWING) {
+        if (abs_speed_filtered > LINE_SPEED_EMERGENCY_LIMIT) {
+            if (speed_trip_count < LINE_SPEED_EMERGENCY_TRIP_CYC)
+                speed_trip_count++;
+            if (speed_trip_count >= LINE_SPEED_EMERGENCY_TRIP_CYC) {
+                speed_limit_fault = 1;
+                speed_safe_count  = 0;
+            }
+        } else {
+            speed_trip_count = 0;
+        }
+    } else if (!speed_limit_fault) {
+        speed_trip_count = 0;
+    }
 
     if (abs_roll_raw >= FALL_ANGLE) {
         if (dead_zone_count < 10) dead_zone_count++;
@@ -3839,7 +3935,7 @@ static void Ctrl_DeteccionCaida(void)
     uint8_t fall_upside_down = (upside_down_count >= 5);
 
     if (!f_fallen) {
-        if (fall_by_angle || fall_upside_down || in_dead_zone) {
+        if (speed_limit_fault || fall_by_angle || fall_upside_down || in_dead_zone) {
             f_fallen = 1;
             integral            = 0.0f;
             balance_hold_active = 0;
@@ -3883,6 +3979,9 @@ static void Ctrl_DeteccionCaida(void)
             edge_wait_start_ms         = 0;
             line_quiet_cycles          = 0;
             lost_ret_ov_active         = 0;
+            line_forward_accel_f       = 0.0f;
+            line_forward_vel_prev      = 0.0f;
+            line_speed_predict_valid   = 0;
             // Si se cayó durante la evasión (LINE_STATE_OBJ_*, últimos del enum, de ahí
             // el ">="), abandona la evasión y vuelve a FOLLOWING en vez de retomarla.
             if (line_state >= LINE_STATE_OBJ_FRENO_REVERSA) {
@@ -3894,7 +3993,28 @@ static void Ctrl_DeteccionCaida(void)
             }
         }
     } else {
-        if (recover_by_angle && !fall_upside_down && !in_dead_zone) {
+        // Una caída por velocidad NO puede recuperarse solo porque el robot
+        // sigue vertical durante los primeros milisegundos. Primero debe quedar
+        // por debajo de RESET_VEL durante 500ms; luego usa el rearme normal por
+        // ángulo y continúa en el mismo ROBOT_STATE_LINE_FOLLOWING.
+        if (speed_limit_fault) {
+            // Durante f_fallen los filtros se ponen a cero en cada ciclo; para
+            // el rearme se usa la lectura cruda recién calculada del encoder.
+            if (abs_speed_raw < LINE_SPEED_EMERGENCY_RESET_VEL) {
+                if (speed_safe_count < LINE_SPEED_EMERGENCY_RESET_CYC)
+                    speed_safe_count++;
+            } else {
+                speed_safe_count = 0;
+            }
+            if (speed_safe_count >= LINE_SPEED_EMERGENCY_RESET_CYC &&
+                recover_by_angle && !fall_upside_down && !in_dead_zone) {
+                speed_limit_fault = 0;
+                speed_trip_count  = 0;
+                speed_safe_count  = 0;
+            }
+        }
+
+        if (!speed_limit_fault && recover_by_angle && !fall_upside_down && !in_dead_zone) {
             f_fallen = 0;
             accel_roll_f      = accel_ang_deg;
             filtered_roll_deg = accel_ang_deg;
