@@ -8,32 +8,37 @@
 #include "UNER.h"
 #include <stddef.h>
 #include <string.h>
-#include <stdlib.h>
 #include "ESP01.h"
-
-#include <stdarg.h>       // para va_list, va_start, va_end
-#include "usbd_cdc_if.h"  // para CDC_Transmit_FS
 #include "usbd_core.h"    // para USBD_HandleTypeDef, USBD_STATE_CONFIGURED
-void USB_Debug(const char *fmt, ...);  // declaración implícita del prototipo
 
+extern void USB_Debug(const char *fmt, ...);
+extern void USB_DebugStr(const char *dbgStr);
 
-#include "ESP01.h"
-
-char *firmware = "UNER V1.0";
-
-uint16_t globalIndex = 0;
+static const char firmware[] = "UNER V1.0";
 
 static _sRx *unerRx;
 static _sTx *unerTx;
 
-_uWord myWord;
-
-// buffer temporal para formateo
-//static char dbgBuf[128];
-
 // Prototipo externo de estado USB (ya lo tienes en main.c)
 extern USBD_HandleTypeDef hUsbDeviceFS;
-extern uint8_t usb_enqueue_tx(const uint8_t *data, uint16_t len);
+extern uint8_t usb_enqueue_tx_segments(const uint8_t *first, uint16_t first_len,
+                                       const uint8_t *second, uint16_t second_len);
+
+static void decodeCommand(_sRx *dataRx, _sTx *dataTx);
+static void UNER_SendData(void);
+static uint8_t putHeaderOnTx(_sTx *dataTx, _eCmd ID, uint8_t frameLength);
+static uint8_t putByteOnTx(_sTx *dataTx, uint8_t byte);
+static uint8_t putStrOntx(_sTx *dataTx, const char *str);
+static uint8_t getByteFromRx(_sRx *dataRx, uint8_t iniPos, uint8_t finalPos);
+static void putBytesOnTx(_sTx *dataTx, const void *bytes, uint8_t length);
+static void putU16OnTx(_sTx *dataTx, uint16_t value);
+static void putF32OnTx(_sTx *dataTx, float value);
+static float getF32FromRx(_sRx *dataRx);
+static int32_t getI32FromRx(_sRx *dataRx);
+static void putPidValuesOnTx(_sTx *dataTx);
+static uint8_t sensorsAreRegistered(void);
+static void putAllSensorsOnTx(_sTx *dataTx);
+static void UNER_SendWifiStruct(_eCmd command, const void *data, uint8_t payloadLen);
 
 static int16_t *p_ax = NULL, *p_ay = NULL, *p_az = NULL;
 static int16_t *p_gx = NULL, *p_gy = NULL, *p_gz = NULL;
@@ -85,8 +90,9 @@ static float *p_odom_theta = NULL;
 static float *p_setpoint_trim = NULL;
 
 static uint8_t last_manual_cmd = 0;
+static volatile uint32_t rx_overflow_count = 0;
 
-void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr) {
+void UNER_Init(_sRx *rx, _sTx *tx) {
     unerRx = rx;
     unerTx = tx;
     unerRx->indexR = 0;
@@ -103,13 +109,20 @@ void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az
     unerRx->isComannd = false;
     unerTx->chk       = 0;
 
-    p_ax = ax_ptr; p_ay = ay_ptr; p_az = az_ptr;
-    p_gx = gx_ptr; p_gy = gy_ptr; p_gz = gz_ptr;
 }
 
 void UNER_PushByte(uint8_t byte) {
-    unerRx->buff[unerRx->indexW++] = byte;
-    unerRx->indexW &= unerRx->mask;
+    uint8_t next;
+
+    if (unerRx == NULL || unerRx->buff == NULL) return;
+    next = (uint8_t)((unerRx->indexW + 1U) & unerRx->mask);
+    if (next == unerRx->indexR) {
+        rx_overflow_count++;
+        return;
+    }
+
+    unerRx->buff[unerRx->indexW] = byte;
+    unerRx->indexW = next;
 }
 
 void UNER_Task(void) {
@@ -187,35 +200,7 @@ void UNER_Task(void) {
     }
 }
 
-void UNER_Send(uint8_t cmd, const uint8_t *payload, uint8_t length) {
-    uint8_t chk = 0;
-    char header[] = { 'U', 'N', 'E', 'R' };
-
-    for (int i = 0; i < 4; i++) {
-        unerTx->buff[unerTx->indexW++] = header[i];
-        unerTx->indexW &= unerTx->mask;
-    }
-
-    uint8_t len = length + 1;
-    unerTx->buff[unerTx->indexW++] = len;
-    unerTx->indexW &= unerTx->mask;
-    unerTx->buff[unerTx->indexW++] = ':';
-    unerTx->indexW &= unerTx->mask;
-    unerTx->buff[unerTx->indexW++] = cmd;
-    unerTx->indexW &= unerTx->mask;
-
-    chk ^= ('U' ^ 'N' ^ 'E' ^ 'R' ^ len ^ ':' ^ cmd);
-    for (uint8_t i = 0; i < length; i++) {
-        unerTx->buff[unerTx->indexW++] = payload[i];
-        unerTx->indexW &= unerTx->mask;
-        chk ^= payload[i];
-    }
-
-    unerTx->buff[unerTx->indexW++] = chk;
-    unerTx->indexW &= unerTx->mask;
-}
-
-uint8_t putHeaderOnTx(_sTx  *dataTx, _eCmd ID, uint8_t frameLength)
+static uint8_t putHeaderOnTx(_sTx *dataTx, _eCmd ID, uint8_t frameLength)
 {
     dataTx->chk = 0;
     dataTx->buff[dataTx->indexW++]='U';
@@ -237,7 +222,7 @@ uint8_t putHeaderOnTx(_sTx  *dataTx, _eCmd ID, uint8_t frameLength)
     return  dataTx->chk;
 }
 
-uint8_t putByteOnTx(_sTx *dataTx, uint8_t byte)
+static uint8_t putByteOnTx(_sTx *dataTx, uint8_t byte)
 {
     dataTx->buff[dataTx->indexW++]=byte;
     dataTx->indexW &= dataTx->mask;
@@ -245,18 +230,15 @@ uint8_t putByteOnTx(_sTx *dataTx, uint8_t byte)
     return dataTx->chk;
 }
 
-uint8_t putStrOntx(_sTx *dataTx, const char *str)
+static uint8_t putStrOntx(_sTx *dataTx, const char *str)
 {
-    globalIndex=0;
-    while(str[globalIndex]){
-        dataTx->buff[dataTx->indexW++]=str[globalIndex];
-        dataTx->indexW &= dataTx->mask;
-        dataTx->chk ^= str[globalIndex++];
-    }
+    while (*str)
+        putByteOnTx(dataTx, (uint8_t)*str++);
+
     return dataTx->chk ;
 }
 
-uint8_t getByteFromRx(_sRx *dataRx, uint8_t iniPos, uint8_t finalPos){
+static uint8_t getByteFromRx(_sRx *dataRx, uint8_t iniPos, uint8_t finalPos){
     uint8_t getByte;
     dataRx->indexData += iniPos;
     dataRx->indexData &=dataRx->mask;
@@ -266,7 +248,74 @@ uint8_t getByteFromRx(_sRx *dataRx, uint8_t iniPos, uint8_t finalPos){
     return getByte;
 }
 
-void decodeCommand(_sRx *dataRx, _sTx *dataTx)
+static void putBytesOnTx(_sTx *dataTx, const void *bytes, uint8_t length)
+{
+    const uint8_t *src = (const uint8_t *)bytes;
+    for (uint8_t i = 0; i < length; i++)
+        putByteOnTx(dataTx, src[i]);
+}
+
+static void putU16OnTx(_sTx *dataTx, uint16_t value)
+{
+    _uWord word = {0};
+    word.ui16[0] = value;
+    putBytesOnTx(dataTx, word.ui8, 2);
+}
+
+static void putF32OnTx(_sTx *dataTx, float value)
+{
+    _uWord word;
+    word.f32 = value;
+    putBytesOnTx(dataTx, word.ui8, 4);
+}
+
+static float getF32FromRx(_sRx *dataRx)
+{
+    _uWord word;
+    for (uint8_t i = 0; i < 4; i++)
+        word.ui8[i] = getByteFromRx(dataRx, 1, 0);
+    return word.f32;
+}
+
+static int32_t getI32FromRx(_sRx *dataRx)
+{
+    _uWord word;
+    for (uint8_t i = 0; i < 4; i++)
+        word.ui8[i] = getByteFromRx(dataRx, 1, 0);
+    return word.i32;
+}
+
+static void putPidValuesOnTx(_sTx *dataTx)
+{
+    putF32OnTx(dataTx, *p_KP);
+    putF32OnTx(dataTx, *p_KD);
+    putF32OnTx(dataTx, *p_KI);
+}
+
+static uint8_t sensorsAreRegistered(void)
+{
+    return p_adcBuf != NULL && adcBufLen >= 8U &&
+           p_ax != NULL && p_ay != NULL && p_az != NULL &&
+           p_gx != NULL && p_gy != NULL && p_gz != NULL &&
+           p_roll != NULL && p_pitch != NULL;
+}
+
+static void putAllSensorsOnTx(_sTx *dataTx)
+{
+    for (uint8_t i = 0; i < 8U; i++)
+        putU16OnTx(dataTx, p_adcBuf[i]);
+
+    putU16OnTx(dataTx, (uint16_t)*p_ax);
+    putU16OnTx(dataTx, (uint16_t)*p_ay);
+    putU16OnTx(dataTx, (uint16_t)*p_az);
+    putU16OnTx(dataTx, (uint16_t)*p_gx);
+    putU16OnTx(dataTx, (uint16_t)*p_gy);
+    putU16OnTx(dataTx, (uint16_t)*p_gz);
+    putF32OnTx(dataTx, *p_roll);
+    putF32OnTx(dataTx, *p_pitch);
+}
+
+static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 {
     switch(dataRx->buff[dataRx->indexData]){
         case ALIVE:
@@ -281,74 +330,37 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
             putByteOnTx(dataTx, dataTx->chk);
         break;
         case GETADCVALUES:
-        	putHeaderOnTx(dataTx, GETADCVALUES, 17);
-
-			myWord.ui16[0] =  (int16_t)p_adcBuf[0]; 		// ADC 1
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[1];			// ADC 2
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[2];			// ADC 3
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[3];			// ADC 4
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[4];			// ADC 5
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[5];			// ADC 6
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[6];			// ADC 7
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[7];			// ADC 8
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-
+			if (p_adcBuf != NULL && adcBufLen >= 8U) {
+				putHeaderOnTx(dataTx, GETADCVALUES, 17);
+				for (uint8_t i = 0; i < 8U; i++)
+					putU16OnTx(dataTx, p_adcBuf[i]);
+			} else {
+				putHeaderOnTx(dataTx, GETADCVALUES, 2);
+				putByteOnTx(dataTx, UNKNOWN);
+			}
 			putByteOnTx(dataTx, dataTx->chk);
         	break;
         case GETMPU6050VALUES:
-        	putHeaderOnTx(dataTx, GETMPU6050VALUES, 13);
-
-			myWord.ui16[0] =  (int16_t)*p_ax; 	// Envio datos de aceleracion
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)*p_ay;
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)*p_az;
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-
-			myWord.ui16[0] =  (int16_t)*p_gx; 	// Envio datos de giroscopio
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)*p_gy;
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)*p_gz;
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-
+			if (p_ax && p_ay && p_az && p_gx && p_gy && p_gz) {
+				putHeaderOnTx(dataTx, GETMPU6050VALUES, 13);
+				putU16OnTx(dataTx, (uint16_t)*p_ax);
+				putU16OnTx(dataTx, (uint16_t)*p_ay);
+				putU16OnTx(dataTx, (uint16_t)*p_az);
+				putU16OnTx(dataTx, (uint16_t)*p_gx);
+				putU16OnTx(dataTx, (uint16_t)*p_gy);
+				putU16OnTx(dataTx, (uint16_t)*p_gz);
+			} else {
+				putHeaderOnTx(dataTx, GETMPU6050VALUES, 2);
+				putByteOnTx(dataTx, UNKNOWN);
+			}
 			putByteOnTx(dataTx, dataTx->chk);
         	break;
         case GETANGLE:
         	if (p_roll && p_pitch) {
         		putHeaderOnTx(dataTx, GETANGLE, 9); // 1 byte cmd + 2*4 bytes for float angles
 
-				myWord.f32 = *p_roll; 	// Envio datos de INCLINACION
-				putByteOnTx(dataTx, myWord.ui8[0] );
-				putByteOnTx(dataTx, myWord.ui8[1] );
-				putByteOnTx(dataTx, myWord.ui8[2] );
-				putByteOnTx(dataTx, myWord.ui8[3] );
-				myWord.f32 = *p_pitch;
-				putByteOnTx(dataTx, myWord.ui8[0] );
-				putByteOnTx(dataTx, myWord.ui8[1] );
-				putByteOnTx(dataTx, myWord.ui8[2] );
-				putByteOnTx(dataTx, myWord.ui8[3] );
+				putF32OnTx(dataTx, *p_roll);
+				putF32OnTx(dataTx, *p_pitch);
 
 				putByteOnTx(dataTx, dataTx->chk);
 			} else {
@@ -362,111 +374,42 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			putHeaderOnTx(dataTx, SETMOTORSPEED, 2);
 			putByteOnTx(dataTx, ACK );
 			putByteOnTx(dataTx, dataTx->chk);
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			int16_t vLeft = myWord.i32;
-			// clamp al rango [-100, +100]
-			if      (vLeft >  100) vLeft =  100;
-			else if (vLeft < -100) vLeft = -100;
+			int32_t requestedLeft = getI32FromRx(dataRx);
+			int16_t vLeft = (requestedLeft > 100) ? 100 :
+			                (requestedLeft < -100) ? -100 : (int16_t)requestedLeft;
 			// sólo si el puntero está registrado
 			if (p_motorLeftVel) *p_motorLeftVel = vLeft;
 
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			int16_t vRight = myWord.i32;
-			if      (vRight >  100) vRight =  100;
-			else if (vRight < -100) vRight = -100;
+			int32_t requestedRight = getI32FromRx(dataRx);
+			int16_t vRight = (requestedRight > 100) ? 100 :
+			                 (requestedRight < -100) ? -100 : (int16_t)requestedRight;
 			if (p_motorRightVel) *p_motorRightVel = vRight;
 		break;
 
         case MODIFYKP:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0); // Extraigo datos de KP
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			float new_KP = myWord.f32;
+			float new_KP = getF32FromRx(dataRx);
 			if (p_KP) *p_KP = new_KP;
 
 			putHeaderOnTx(dataTx, MODIFYKP, 13);
-			myWord.f32 = *p_KP; 	// Envio datos de KP
-			putByteOnTx(dataTx, myWord.ui8[0]);
-			putByteOnTx(dataTx, myWord.ui8[1]);
-			putByteOnTx(dataTx, myWord.ui8[2]);
-			putByteOnTx(dataTx, myWord.ui8[3]);
-
-			myWord.f32 = *p_KD; 	// Envio datos de KD
-			putByteOnTx(dataTx, myWord.ui8[0]);
-			putByteOnTx(dataTx, myWord.ui8[1]);
-			putByteOnTx(dataTx, myWord.ui8[2]);
-			putByteOnTx(dataTx, myWord.ui8[3]);
-
-			myWord.f32 = *p_KI; 	// Envio datos de KI
-			putByteOnTx(dataTx, myWord.ui8[0]);
-			putByteOnTx(dataTx, myWord.ui8[1]);
-			putByteOnTx(dataTx, myWord.ui8[2]);
-			putByteOnTx(dataTx, myWord.ui8[3]);
+			putPidValuesOnTx(dataTx);
 			putByteOnTx(dataTx, dataTx->chk);
         break;
 
         case MODIFYKD:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			float new_KD = myWord.f32;
+			float new_KD = getF32FromRx(dataRx);
 			if (p_KD) *p_KD = new_KD;
 
 			putHeaderOnTx(dataTx, MODIFYKD, 13);
-			myWord.f32 = *p_KP; 	// Envio datos de KP
-			putByteOnTx(dataTx, myWord.ui8[0]);
-			putByteOnTx(dataTx, myWord.ui8[1]);
-			putByteOnTx(dataTx, myWord.ui8[2]);
-			putByteOnTx(dataTx, myWord.ui8[3]);
-
-			myWord.f32 = *p_KD; 	// Envio datos de KD
-			putByteOnTx(dataTx, myWord.ui8[0]);
-			putByteOnTx(dataTx, myWord.ui8[1]);
-			putByteOnTx(dataTx, myWord.ui8[2]);
-			putByteOnTx(dataTx, myWord.ui8[3]);
-
-			myWord.f32 = *p_KI; 	// Envio datos de KI
-			putByteOnTx(dataTx, myWord.ui8[0]);
-			putByteOnTx(dataTx, myWord.ui8[1]);
-			putByteOnTx(dataTx, myWord.ui8[2]);
-			putByteOnTx(dataTx, myWord.ui8[3]);
+			putPidValuesOnTx(dataTx);
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case MODIFYKI:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			float new_KI = myWord.f32;
+			float new_KI = getF32FromRx(dataRx);
 			if (p_KI) *p_KI = new_KI;
 
 			putHeaderOnTx(dataTx, MODIFYKI, 13);
-			myWord.f32 = *p_KP; 	// Envio datos de KP
-			putByteOnTx(dataTx, myWord.ui8[0]);
-			putByteOnTx(dataTx, myWord.ui8[1]);
-			putByteOnTx(dataTx, myWord.ui8[2]);
-			putByteOnTx(dataTx, myWord.ui8[3]);
-
-			myWord.f32 = *p_KD; 	// Envio datos de KD
-			putByteOnTx(dataTx, myWord.ui8[0]);
-			putByteOnTx(dataTx, myWord.ui8[1]);
-			putByteOnTx(dataTx, myWord.ui8[2]);
-			putByteOnTx(dataTx, myWord.ui8[3]);
-
-			myWord.f32 = *p_KI; 	// Envio datos de KI
-			putByteOnTx(dataTx, myWord.ui8[0]);
-			putByteOnTx(dataTx, myWord.ui8[1]);
-			putByteOnTx(dataTx, myWord.ui8[2]);
-			putByteOnTx(dataTx, myWord.ui8[3]);
+			putPidValuesOnTx(dataTx);
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
@@ -485,32 +428,12 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
         case GETPIDVALUES:
         	putHeaderOnTx(dataTx, GETPIDVALUES, 13); // 1 byte cmd + 2*4 bytes for float values
-
-			myWord.f32 = *p_KP; 	// Envio datos de INCLINACION
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			putByteOnTx(dataTx, myWord.ui8[2] );
-			putByteOnTx(dataTx, myWord.ui8[3] );
-			myWord.f32 = *p_KD;
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			putByteOnTx(dataTx, myWord.ui8[2] );
-			putByteOnTx(dataTx, myWord.ui8[3] );
-			myWord.f32 = *p_KI;
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			putByteOnTx(dataTx, myWord.ui8[2] );
-			putByteOnTx(dataTx, myWord.ui8[3] );
-
+			putPidValuesOnTx(dataTx);
 			putByteOnTx(dataTx, dataTx->chk);
         break;
 
         case MODIFYSTEERING:
-            myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-            myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-            myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-            myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-            if (p_steering) *p_steering = myWord.f32;
+            if (p_steering) *p_steering = getF32FromRx(dataRx);
             putHeaderOnTx(dataTx, MODIFYSTEERING, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);
@@ -544,11 +467,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MODIFY_BETA_G:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			float new_BETA_G = myWord.f32;
+			float new_BETA_G = getF32FromRx(dataRx);
 			if (p_BETA_G) *p_BETA_G = new_BETA_G;
 
 			putHeaderOnTx(dataTx, MODIFY_BETA_G, 2);
@@ -557,11 +476,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 		break;
 
         case MODIFY_BETA_A:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			float new_BETA_A = myWord.f32;
+			float new_BETA_A = getF32FromRx(dataRx);
 			if (p_BETA_A) *p_BETA_A = new_BETA_A;
 
 			putHeaderOnTx(dataTx, MODIFY_BETA_A, 2);
@@ -580,55 +495,35 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MODIFY_KP_LINE:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			if (p_KP_LINE) *p_KP_LINE = myWord.f32;
+			if (p_KP_LINE) *p_KP_LINE = getF32FromRx(dataRx);
 			putHeaderOnTx(dataTx, MODIFY_KP_LINE, 2);
 			putByteOnTx(dataTx, ACK);
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case MODIFY_KD_LINE:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			if (p_KD_LINE) *p_KD_LINE = myWord.f32;
+			if (p_KD_LINE) *p_KD_LINE = getF32FromRx(dataRx);
 			putHeaderOnTx(dataTx, MODIFY_KD_LINE, 2);
 			putByteOnTx(dataTx, ACK);
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case MODIFY_KI_LINE:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			if (p_KI_LINE) *p_KI_LINE = myWord.f32;
+			if (p_KI_LINE) *p_KI_LINE = getF32FromRx(dataRx);
 			putHeaderOnTx(dataTx, MODIFY_KI_LINE, 2);
 			putByteOnTx(dataTx, ACK);
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case MODIFY_LINE_THRES:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			if (p_LINE_THRES) *p_LINE_THRES = myWord.f32;
+			if (p_LINE_THRES) *p_LINE_THRES = getF32FromRx(dataRx);
 			putHeaderOnTx(dataTx, MODIFY_LINE_THRES, 2);
 			putByteOnTx(dataTx, ACK);
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case MODIFY_LINE_SPEED:
-			myWord.ui8[0]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[1]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[2]=getByteFromRx(dataRx,1,0);
-			myWord.ui8[3]=getByteFromRx(dataRx,1,0);
-			if (p_LINE_SPEED) *p_LINE_SPEED = myWord.f32;
+			if (p_LINE_SPEED) *p_LINE_SPEED = getF32FromRx(dataRx);
 			putHeaderOnTx(dataTx, MODIFY_LINE_SPEED, 2);
 			putByteOnTx(dataTx, ACK);
 			putByteOnTx(dataTx, dataTx->chk);
@@ -794,12 +689,9 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
                 // Leído con getByteFromRx como el resto de los comandos — la
                 // versión anterior indexaba desde indexR (que acá apunta al
                 // checksum) y caía fuera del frame: leía basura.
-                myWord.ui8[0] = getByteFromRx(dataRx, 1, 0);
-                myWord.ui8[1] = getByteFromRx(dataRx, 1, 0);
-                myWord.ui8[2] = getByteFromRx(dataRx, 1, 0);
-                myWord.ui8[3] = getByteFromRx(dataRx, 1, 0);
-                if (myWord.f32 != 0.0f) {
-                    *p_rot_target_deg = myWord.f32;
+                float requested_rotation = getF32FromRx(dataRx);
+                if (requested_rotation != 0.0f) {
+                    *p_rot_target_deg = requested_rotation;
                     *p_rot_trigger    = 1;
                 }
             }
@@ -811,86 +703,22 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 
         case SENDALLSENSORS:
         	sendAllSensorsFlag = !sendAllSensorsFlag;	// Si esta activa desactivo, y sino, activo
-
-        	putHeaderOnTx(dataTx, SENDALLSENSORS, 37); // 1 cmd + 16 ADC + 12 MPU + 8 Angle
-
-			myWord.ui16[0] =  (int16_t)p_adcBuf[0]; 		// ADC 1
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[1];			// ADC 2
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[2];			// ADC 3
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[3];			// ADC 4
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[4];			// ADC 5
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[5];			// ADC 6
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[6];			// ADC 7
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)p_adcBuf[7];			// ADC 8
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-
-			myWord.ui16[0] =  (int16_t)*p_ax; 	// Envio datos de aceleracion
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)*p_ay;
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)*p_az;
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-
-			myWord.ui16[0] =  (int16_t)*p_gx; 	// Envio datos de giroscopio
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)*p_gy;
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			myWord.ui16[0] =  (int16_t)*p_gz;
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-
-			myWord.f32 = *p_roll; 	// Envio datos de INCLINACION
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			putByteOnTx(dataTx, myWord.ui8[2] );
-			putByteOnTx(dataTx, myWord.ui8[3] );
-			myWord.f32 = *p_pitch;
-			putByteOnTx(dataTx, myWord.ui8[0] );
-			putByteOnTx(dataTx, myWord.ui8[1] );
-			putByteOnTx(dataTx, myWord.ui8[2] );
-			putByteOnTx(dataTx, myWord.ui8[3] );
-
+			if (sensorsAreRegistered()) {
+				putHeaderOnTx(dataTx, SENDALLSENSORS, 37);
+				putAllSensorsOnTx(dataTx);
+			} else {
+				putHeaderOnTx(dataTx, SENDALLSENSORS, 2);
+				putByteOnTx(dataTx, UNKNOWN);
+			}
 			putByteOnTx(dataTx, dataTx->chk);
         	break;
         case GET_ODOMETRY:
             if (p_odom_x && p_odom_y && p_odom_theta) {
                 putHeaderOnTx(dataTx, GET_ODOMETRY, 13); // 1 cmd + 3 floats
 
-                myWord.f32 = *p_odom_x;      // X [m] (+ = adelante respecto al origen)
-                putByteOnTx(dataTx, myWord.ui8[0]);
-                putByteOnTx(dataTx, myWord.ui8[1]);
-                putByteOnTx(dataTx, myWord.ui8[2]);
-                putByteOnTx(dataTx, myWord.ui8[3]);
-                myWord.f32 = *p_odom_y;      // Y [m] (lateral)
-                putByteOnTx(dataTx, myWord.ui8[0]);
-                putByteOnTx(dataTx, myWord.ui8[1]);
-                putByteOnTx(dataTx, myWord.ui8[2]);
-                putByteOnTx(dataTx, myWord.ui8[3]);
-                myWord.f32 = *p_odom_theta;  // theta [°] (-180..180]
-                putByteOnTx(dataTx, myWord.ui8[0]);
-                putByteOnTx(dataTx, myWord.ui8[1]);
-                putByteOnTx(dataTx, myWord.ui8[2]);
-                putByteOnTx(dataTx, myWord.ui8[3]);
+                putF32OnTx(dataTx, *p_odom_x);
+                putF32OnTx(dataTx, *p_odom_y);
+                putF32OnTx(dataTx, *p_odom_theta);
 
                 putByteOnTx(dataTx, dataTx->chk);
             } else {
@@ -910,11 +738,7 @@ void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MODIFY_SETPOINT:
-            myWord.ui8[0] = getByteFromRx(dataRx, 1, 0);
-            myWord.ui8[1] = getByteFromRx(dataRx, 1, 0);
-            myWord.ui8[2] = getByteFromRx(dataRx, 1, 0);
-            myWord.ui8[3] = getByteFromRx(dataRx, 1, 0);
-            if (p_setpoint_trim) *p_setpoint_trim = myWord.f32;
+            if (p_setpoint_trim) *p_setpoint_trim = getF32FromRx(dataRx);
             putHeaderOnTx(dataTx, MODIFY_SETPOINT, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);
@@ -954,71 +778,11 @@ void UNER_SendAlive(void) {
 }
 
 void UNER_SendAllSensors(void) {
-	if (ESP01_IsSending())
-	        return;
+	if (ESP01_IsSending() || !sensorsAreRegistered()) return;
 
-	// (ya no se resetean indexW/indexR: pisaba respuestas de comandos pendientes;
-	// el envío maneja el wrap del ring correctamente)
-	putHeaderOnTx(unerTx, SENDALLSENSORS, 37); // 1 cmd + 16 ADC + 12 MPU + 8 Angle
-
-	myWord.ui16[0] =  (int16_t)p_adcBuf[0]; 		// ADC 1
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)p_adcBuf[1];			// ADC 2
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)p_adcBuf[2];			// ADC 3
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)p_adcBuf[3];			// ADC 4
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)p_adcBuf[4];			// ADC 5
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)p_adcBuf[5];			// ADC 6
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)p_adcBuf[6];			// ADC 7
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)p_adcBuf[7];			// ADC 8
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-
-	myWord.ui16[0] =  (int16_t)*p_ax; 	// Envio datos de aceleracion
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)*p_ay;
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)*p_az;
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-
-	myWord.ui16[0] =  (int16_t)*p_gx; 	// Envio datos de giroscopio
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)*p_gy;
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	myWord.ui16[0] =  (int16_t)*p_gz;
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-
-	myWord.f32 = *p_roll; 	// Envio datos de INCLINACION
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	putByteOnTx(unerTx, myWord.ui8[2] );
-	putByteOnTx(unerTx, myWord.ui8[3] );
-	myWord.f32 = *p_pitch;
-	putByteOnTx(unerTx, myWord.ui8[0] );
-	putByteOnTx(unerTx, myWord.ui8[1] );
-	putByteOnTx(unerTx, myWord.ui8[2] );
-	putByteOnTx(unerTx, myWord.ui8[3] );
-
+	putHeaderOnTx(unerTx, SENDALLSENSORS, 37);
+	putAllSensorsOnTx(unerTx);
 	putByteOnTx(unerTx, unerTx->chk);
-
 	UNER_SendData();
 }
 
@@ -1026,86 +790,42 @@ uint8_t UNER_ShouldSendAllSensors(void) {
     return sendAllSensorsFlag;
 }
 
-void UNER_RegisterADCBuffer(uint16_t *buf, uint8_t len) {
-    p_adcBuf   = buf;
-    adcBufLen  = len;
-}
+void UNER_RegisterBindings(const UNER_Bindings_t *b) {
+    if (b == NULL) return;
 
-void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr) {
-    p_motorRightVel = rightPtr;
-    p_motorLeftVel  = leftPtr;
-}
-
-void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *KV_BRAKE_Ptr) {
-    p_KP  = kpPtr;
-    p_KD  = kdPtr;
-    p_KI  = kiPtr;
-	p_KV_BRAKE = KV_BRAKE_Ptr;
-}
-
-void UNER_RegisterAngle(float *rollPtr, float *pitchPtr)
-{
-    p_roll  = rollPtr;
-    p_pitch = pitchPtr;
-}
-
-void UNER_RegisterSteering(float *steeringPtr) {
-    p_steering = steeringPtr;
-}
-
-void UNER_RegisterRobotState(uint8_t *robotStatePtr) {
-    p_robot_state = robotStatePtr;
-}
-
-void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4, uint8_t *flagPtr5) {
-    p_resetMassCenter_flag = flagPtr2;
-    p_send_csv_log_flag = flagPtr3;
-    p_send_wifi_log_flag = flagPtr4;
-    p_change_display = flagPtr5;
-}
-
-void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLinePtr, float *thresPtr, float *speedPtr, uint8_t *lineFollowFlagPtr) {
-    p_KP_LINE = kpLinePtr;
-    p_KD_LINE = kdLinePtr;
-    p_KI_LINE = kiLinePtr;
-    p_LINE_THRES = thresPtr;
-    p_LINE_SPEED = speedPtr;
-}
-
-void UNER_RegisterManualControl(float *spCmdPtr, float *stCmdPtr, uint32_t *tmoPtr) {
-    p_manual_sp_cmd = spCmdPtr;
-    p_manual_st_cmd = stCmdPtr;
-    p_manual_tmo = tmoPtr;
-}
-
-void UNER_RegisterRotationCmd(float *rotDegPtr, uint8_t *rotTriggerPtr) {
-    p_rot_target_deg = rotDegPtr;
-    p_rot_trigger    = rotTriggerPtr;
-}
-
-void UNER_RegisterOdometry(float *xPtr, float *yPtr, float *thetaPtr) {
-    p_odom_x     = xPtr;
-    p_odom_y     = yPtr;
-    p_odom_theta = thetaPtr;
-}
-
-void UNER_RegisterSetpointTrim(float *trimPtr) {
-    p_setpoint_trim = trimPtr;
+    p_adcBuf = b->adc; adcBufLen = b->adc_len;
+    p_motorRightVel = b->motor_right_velocity; p_motorLeftVel = b->motor_left_velocity;
+    p_ax = b->ax; p_ay = b->ay; p_az = b->az;
+    p_gx = b->gx; p_gy = b->gy; p_gz = b->gz;
+    p_roll = b->roll; p_pitch = b->pitch;
+    p_KP = b->kp; p_KD = b->kd; p_KI = b->ki; p_KV_BRAKE = b->kv_brake;
+    p_BETA_G = b->beta_g; p_BETA_A = b->beta_a;
+    p_steering = b->steering; p_robot_state = b->robot_state;
+    p_resetMassCenter_flag = b->reset_mass_center;
+    p_send_csv_log_flag = b->send_csv_log; p_send_wifi_log_flag = b->send_wifi_log;
+    p_change_display = b->change_display;
+    p_KP_LINE = b->kp_line; p_KD_LINE = b->kd_line; p_KI_LINE = b->ki_line;
+    p_LINE_THRES = b->line_threshold; p_LINE_SPEED = b->line_speed;
+    p_manual_sp_cmd = b->manual_setpoint; p_manual_st_cmd = b->manual_steering;
+    p_manual_tmo = b->manual_timeout_ms;
+    p_rot_target_deg = b->rotation_target_deg; p_rot_trigger = b->rotation_trigger;
+    p_odom_x = b->odom_x; p_odom_y = b->odom_y; p_odom_theta = b->odom_theta;
+    p_setpoint_trim = b->setpoint_trim;
 }
 
 // Envía el ring-buffer por USB y por UDP
-void UNER_SendData(void) {
+static void UNER_SendData(void) {
     uint16_t len = (unerTx->indexW + unerTx->mask + 1 - unerTx->indexR) & unerTx->mask;
     if (!len) return;
 
     // USB CDC — copiar con wrap: la trama puede cruzar el final del ring buffer,
-    // enviar &buff[indexR] lineal mandaba bytes viejos en vez de la parte envuelta.
+    // pero ambas partes se reservan juntas para no encolar media trama.
     if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED) {
-        uint8_t tmp[TXBUFSIZE];
-        for (uint16_t i = 0; i < len; i++) {
-            tmp[i] = unerTx->buff[(unerTx->indexR + i) & unerTx->mask];
-        }
-        usb_enqueue_tx(tmp, len);
+        uint16_t first_len = (uint16_t)(TXBUFSIZE - unerTx->indexR);
+        if (first_len > len) first_len = len;
+        uint16_t second_len = (uint16_t)(len - first_len);
+        usb_enqueue_tx_segments(&unerTx->buff[unerTx->indexR], first_len,
+                                unerTx->buff, second_len);
     }
 
     // UDP (ESP01)
@@ -1117,43 +837,26 @@ void UNER_SendData(void) {
     unerTx->indexR = (unerTx->indexR + len) & unerTx->mask;
 }
 
-void UNER_SendWifiLogData(WifiLogData_t *data) {
+static void UNER_SendWifiStruct(_eCmd command, const void *data, uint8_t payloadLen) {
+    if (data == NULL || payloadLen == 0U)
+        return;
+
     if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending()) {
         return;
     }
 
-    // sizeof(WifiLogData_t) bytes de payload + 1 byte CMD
-    uint8_t payloadLen = sizeof(WifiLogData_t);
-
-    putHeaderOnTx(unerTx, CMD_WIFI_LOG_DATA, payloadLen + 1);
-
-    uint8_t *p = (uint8_t*)data;
-    for (uint8_t i = 0; i < payloadLen; i++) {
-        putByteOnTx(unerTx, p[i]);
-    }
-
+    putHeaderOnTx(unerTx, command, (uint8_t)(payloadLen + 1U));
+    putBytesOnTx(unerTx, data, payloadLen);
     putByteOnTx(unerTx, unerTx->chk);
-
     UNER_SendData();
 }
 
+void UNER_SendWifiLogData(WifiLogData_t *data) {
+    UNER_SendWifiStruct(CMD_WIFI_LOG_DATA, data, (uint8_t)sizeof(*data));
+}
+
 void UNER_SendWifiOdomData(WifiOdomData_t *data) {
-    if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending()) {
-        return;
-    }
-
-    uint8_t payloadLen = sizeof(WifiOdomData_t);
-
-    putHeaderOnTx(unerTx, CMD_WIFI_ODOM_DATA, payloadLen + 1);
-
-    uint8_t *p = (uint8_t*)data;
-    for (uint8_t i = 0; i < payloadLen; i++) {
-        putByteOnTx(unerTx, p[i]);
-    }
-
-    putByteOnTx(unerTx, unerTx->chk);
-
-    UNER_SendData();
+    UNER_SendWifiStruct(CMD_WIFI_ODOM_DATA, data, (uint8_t)sizeof(*data));
 }
 
 uint8_t UNER_GetLastManualCmd(void) { return last_manual_cmd; }

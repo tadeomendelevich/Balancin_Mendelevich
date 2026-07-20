@@ -9,7 +9,7 @@ static volatile uint8_t q_tail = 0;
 static volatile uint8_t i2c_busy = 0;
 static I2C_Request_t current_req;
 static volatile uint8_t current_valid = 0;
-volatile uint8_t i2c_process_pending = 0;
+static volatile uint8_t i2c_process_pending = 0;
 
 static uint8_t queue_is_full(void)
 {
@@ -27,6 +27,7 @@ void I2C_Manager_Init(void)
     q_tail = 0;
     i2c_busy = 0;
     current_valid = 0;
+    i2c_process_pending = 0;
     memset(&current_req, 0, sizeof(current_req));
 }
 
@@ -38,14 +39,19 @@ uint8_t I2C_Manager_IsBusy(void)
 uint8_t I2C_Manager_Enqueue(const I2C_Request_t *req)
 {
     uint8_t ok = 0;
+    uint32_t primask;
 
+    if (req == NULL) return 0;
+
+    primask = __get_PRIMASK();
     __disable_irq();
     if (!queue_is_full()) {
         queue[q_head] = *req;
         q_head = (uint8_t)((q_head + 1) % I2C_MANAGER_QUEUE_SIZE);
+        i2c_process_pending = 1;
         ok = 1;
     }
-    __enable_irq();
+    if (!primask) __enable_irq();
 
     return ok;
 }
@@ -53,15 +59,27 @@ uint8_t I2C_Manager_Enqueue(const I2C_Request_t *req)
 uint8_t I2C_Manager_EnqueuePriority(const I2C_Request_t *req)
 {
     uint8_t ok = 0;
+    uint32_t primask;
 
+    if (req == NULL) return 0;
+
+    primask = __get_PRIMASK();
     __disable_irq();
-    uint8_t new_tail = (uint8_t)((q_tail + I2C_MANAGER_QUEUE_SIZE - 1) % I2C_MANAGER_QUEUE_SIZE);
-    if (new_tail != q_head) {
-        q_tail = new_tail;
+    if (!queue_is_full() && !i2c_busy) {
+        q_tail = (uint8_t)((q_tail + I2C_MANAGER_QUEUE_SIZE - 1U) % I2C_MANAGER_QUEUE_SIZE);
         queue[q_tail] = *req;
+        i2c_process_pending = 1;
+        ok = 1;
+    } else if (!queue_is_full()) {
+        // No mover q_tail mientras una petición está activa: complete_current()
+        // lo usa para retirar exactamente esa petición. En ese caso se encola
+        // normalmente; se conserva la integridad aunque no pueda adelantarse.
+        queue[q_head] = *req;
+        q_head = (uint8_t)((q_head + 1U) % I2C_MANAGER_QUEUE_SIZE);
+        i2c_process_pending = 1;
         ok = 1;
     }
-    __enable_irq();
+    if (!primask) __enable_irq();
 
     return ok;
 }
@@ -111,23 +129,21 @@ void I2C_Manager_Process(void)
     }
 
     if (st != HAL_OK) {
+        I2C_ManagerCallback_t cb = NULL;
+        void *ctx = NULL;
+
         __disable_irq();
         i2c_busy = 0;
-
-        if (current_valid && current_req.callback) {
-            I2C_ManagerCallback_t cb = current_req.callback;
-            void *ctx = current_req.context;
+        if (current_valid) {
+            cb = current_req.callback;
+            ctx = current_req.context;
             q_tail = (uint8_t)((q_tail + 1) % I2C_MANAGER_QUEUE_SIZE);
             current_valid = 0;
-            __enable_irq();
-            cb(ctx, st);
-        } else {
-            q_tail = (uint8_t)((q_tail + 1) % I2C_MANAGER_QUEUE_SIZE);
-            current_valid = 0;
-            __enable_irq();
         }
+        i2c_process_pending = !queue_is_empty();
+        __enable_irq();
 
-        I2C_Manager_Process();
+        if (cb) cb(ctx, st);
         return;
     }
 
@@ -158,8 +174,7 @@ static void complete_current(I2C_HandleTypeDef *hi2c, HAL_StatusTypeDef status)
         cb(ctx, status);  // el callback puede encolar más requests
     }
 
-    // En vez de llamar Process() recursivamente, marcar pending
-    i2c_process_pending = 1;
+    i2c_process_pending = !queue_is_empty();
 }
 
 void I2C_Manager_OnMemRxCplt(I2C_HandleTypeDef *hi2c)
@@ -175,13 +190,6 @@ void I2C_Manager_OnMasterTxCplt(I2C_HandleTypeDef *hi2c)
 void I2C_Manager_OnError(I2C_HandleTypeDef *hi2c)
 {
     complete_current(hi2c, HAL_ERROR);
-}
-
-void I2C_Manager_ProcessFromISR(void)
-{
-    // Solo marca el pending, no ejecuta
-    // (el loop principal llama I2C_Manager_Process)
-    i2c_process_pending = 1;
 }
 
 uint8_t I2C_Manager_IsProcessPending(void) {

@@ -109,8 +109,6 @@ typedef enum {
 #define M_PI 3.14159265358979323846f
 #endif
 
-#define ESP_USB_BUF_SIZE	512
-
 // PID
 #define KP     		4.0f   // Ganancia proporcional en PWM directo
 #define KD     		0.12f   // Ganancia derivativa en PWM/(deg/s)
@@ -495,15 +493,12 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 uint8_t is250us, tmo100ms, is10ms, is2ms;
 
-uint8_t BufUSBTx[256], nBytesTx;
 extern USBD_HandleTypeDef hUsbDeviceFS;
-char usbBuffer[128];
-uint8_t  espUSBBuf[ESP_USB_BUF_SIZE];
-volatile uint16_t espUSBBufIw, espUSBBufIr;
 static uint8_t usb_tx_buf[USB_TX_BUF_SIZE];
 static volatile uint16_t tx_head = 0;
 static volatile uint16_t tx_tail = 0;
 static volatile uint8_t usb_tx_busy = 0;
+static volatile uint32_t usb_tx_dropped = 0;
 static const char HEX_DIGITS[] = "0123456789ABCDEF";	// Tabla de dígitos hex para USB
 
 //static uint8_t ema_initialized = 0;
@@ -837,13 +832,13 @@ static void MX_USART1_UART_Init(void);
 static void MX_TIM5_Init(void);
 /* USER CODE BEGIN PFP */
 void USBRxData(uint8_t *buf, int len);
-void USB_BufferPush(uint8_t b);
 void USB_DebugSend(const uint8_t *data, uint16_t len);
 void USB_DebugStr(const char *s);	// Envía una cadena C terminada en '\0' por USB.
 void USB_DebugHex(uint8_t b);	// Envía un byte representado en dos dígitos hexadecimales ASCII.
-void USB_DebugUInt(unsigned int v);		// Envía un entero sin signo en formato decimal ASCII.
 void USB_Debug(const char *fmt, ...);	// Mini-printf para debug: soporta %s, %c, %d/%u, %X y %%.
 uint8_t usb_enqueue_tx(const uint8_t *data, uint16_t len);
+uint8_t usb_enqueue_tx_segments(const uint8_t *first, uint16_t first_len,
+                                const uint8_t *second, uint16_t second_len);
 void usb_service_tx(void);
 static int  uart_send_byte(uint8_t byte);
 
@@ -1027,117 +1022,147 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
     }
 }
 
-void USB_BufferPush(uint8_t b){
-    espUSBBuf[espUSBBufIw++] = b;
-    espUSBBufIw &= (ESP_USB_BUF_SIZE - 1);
-}
-
 void USBRxData(uint8_t *buf, int len) {
-    for (int i = 0; i < len; i++) {
-        //UNER_PushByte(buf[i]);
-    }
+    if (buf == NULL || len <= 0) return;
+
+    for (int i = 0; i < len; i++)
+        UNER_PushByte(buf[i]);
 }
 
-// Envío “atómico” por USB (fragmenta en trozos de ≤64 bytes)
+// Encola el mensaje completo; usb_service_tx lo transmite en paquetes de hasta 64 bytes.
 void USB_DebugSend(const uint8_t *data, uint16_t len) {
-    // Fragmenta en trozos ≤64B y encolarlos sin bloquear
-    while (len) {
-        uint16_t chunk = (len > 64 ? 64 : len);
-        usb_enqueue_tx(data, chunk);
-        data  += chunk;
-        len   -= chunk;
-    }
+    if (data != NULL && len != 0U)
+        (void)usb_enqueue_tx(data, len);
 }
 
 // Envía una cadena literal
 void USB_DebugStr(const char *s) {
-    USB_DebugSend((uint8_t*)s, (uint16_t)strlen(s));
+    if (s != NULL)
+        USB_DebugSend((const uint8_t *)s, (uint16_t)strlen(s));
 }
 
 // Envía un byte como dos dígitos hex ASCII
 void USB_DebugHex(uint8_t b) {
     char h[2] = { HEX_DIGITS[b >> 4], HEX_DIGITS[b & 0xF] };
-    USB_DebugSend((uint8_t*)h, 2);
+    USB_DebugSend((const uint8_t *)h, sizeof(h));
 }
 
-// Envía un entero sin signo en decimal
-void USB_DebugUInt(unsigned int v) {
-    char buf[10];
-    int  pos = 0;
-    if (v == 0) {
-        USB_DebugSend((uint8_t*)"0", 1);
-        return;
-    }
-    while (v) {
-        buf[pos++] = '0' + (v % 10);
-        v /= 10;
-    }
-    // buf[] está al revés
-    for (int i = pos - 1; i >= 0; i--) {
-        USB_DebugSend((uint8_t*)&buf[i], 1);
-    }
+static uint16_t USB_AppendUInt(char *dst, uint16_t pos, uint16_t capacity,
+                               unsigned int value, unsigned int base) {
+    char reversed[10];
+    uint8_t count = 0;
+
+    do {
+        reversed[count++] = HEX_DIGITS[value % base];
+        value /= base;
+    } while (value != 0U && count < sizeof(reversed));
+
+    while (count != 0U && pos < capacity)
+        dst[pos++] = reversed[--count];
+
+    return pos;
 }
 
-// La nueva USB_Debug sin vsnprintf:
+// Mini-printf acotado: construye cada log completo antes de encolarlo.
 void USB_Debug(const char *fmt, ...) {
+    char out[192];
+    uint16_t pos = 0;
     va_list ap;
+
+    if (fmt == NULL) return;
     va_start(ap, fmt);
 
-    while (*fmt) {
+    while (*fmt && pos < sizeof(out)) {
         if (*fmt == '%') {
             fmt++;
-            if (*fmt == '\0') break; // '%' al final: no leer más allá del string
+            if (*fmt == '\0') break;
             switch (*fmt) {
-                case 's': { // cadena
-                    char *s = va_arg(ap, char*);
-                    USB_DebugStr(s);
+                case 's': {
+                    const char *s = va_arg(ap, const char *);
+                    if (s == NULL) s = "(null)";
+                    while (*s && pos < sizeof(out)) out[pos++] = *s++;
                     break;
                 }
-                case 'c': { // caracter
-                    char c = (char)va_arg(ap, int);
-                    USB_DebugSend((uint8_t*)&c, 1);
+                case 'c': {
+                    out[pos++] = (char)va_arg(ap, int);
                     break;
                 }
-                case 'u': // entero sin signo
-                case 'd': { // entero con signo (le damos igual)
-                    unsigned int v = va_arg(ap, unsigned int);
-                    USB_DebugUInt(v);
+                case 'u': {
+                    pos = USB_AppendUInt(out, pos, sizeof(out),
+                                         va_arg(ap, unsigned int), 10U);
                     break;
                 }
-                case 'X': { // hex byte
-                    uint8_t b = (uint8_t)va_arg(ap, unsigned int);
-                    USB_DebugHex(b);
+                case 'd': {
+                    int value = va_arg(ap, int);
+                    unsigned int magnitude;
+                    if (value < 0) {
+                        if (pos < sizeof(out)) out[pos++] = '-';
+                        magnitude = 0U - (unsigned int)value;
+                    } else {
+                        magnitude = (unsigned int)value;
+                    }
+                    pos = USB_AppendUInt(out, pos, sizeof(out), magnitude, 10U);
                     break;
                 }
-                case '%': { // literal ‘%’
-                    USB_DebugSend((uint8_t*)"%", 1);
+                case 'X': {
+                    pos = USB_AppendUInt(out, pos, sizeof(out),
+                                         va_arg(ap, unsigned int), 16U);
                     break;
                 }
-                default: // desconocido, lo imprimimos tal cual
-                    USB_DebugSend((uint8_t*)fmt, 1);
+                case '%':
+                    out[pos++] = '%';
+                    break;
+                default:
+                    if (pos < sizeof(out)) out[pos++] = '%';
+                    if (pos < sizeof(out)) out[pos++] = *fmt;
+                    break;
             }
         } else {
-            // carácter normal
-            USB_DebugSend((uint8_t*)fmt, 1);
+            out[pos++] = *fmt;
         }
         fmt++;
     }
 
     va_end(ap);
+    USB_DebugSend((const uint8_t *)out, pos);
 }
 
 
 uint8_t usb_enqueue_tx(const uint8_t *data, uint16_t len) {
-    uint16_t next;
-    for (uint16_t i = 0; i < len; i++) {
-        next = (tx_head + 1) & USB_TX_BUF_MASK;
-        if (next == tx_tail) {
-            // buffer lleno
-            return 0;
-        }
-        usb_tx_buf[tx_head] = data[i];
-        tx_head = next;
+    return usb_enqueue_tx_segments(data, len, NULL, 0U);
+}
+
+uint8_t usb_enqueue_tx_segments(const uint8_t *first, uint16_t first_len,
+                                const uint8_t *second, uint16_t second_len) {
+    uint32_t primask;
+    uint16_t used;
+    uint16_t free_space;
+    uint16_t total_len = (uint16_t)(first_len + second_len);
+
+    if (total_len == 0U) return 1;
+    if ((first_len != 0U && first == NULL) || (second_len != 0U && second == NULL))
+        return 0;
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    used = (uint16_t)((tx_head - tx_tail) & USB_TX_BUF_MASK);
+    free_space = (uint16_t)(USB_TX_BUF_MASK - used);
+    if (total_len > free_space) {
+        usb_tx_dropped++;
+        if (!primask) __enable_irq();
+        return 0;
     }
+
+    for (uint16_t i = 0; i < first_len; i++) {
+        usb_tx_buf[tx_head] = first[i];
+        tx_head = (uint16_t)((tx_head + 1U) & USB_TX_BUF_MASK);
+    }
+    for (uint16_t i = 0; i < second_len; i++) {
+        usb_tx_buf[tx_head] = second[i];
+        tx_head = (uint16_t)((tx_head + 1U) & USB_TX_BUF_MASK);
+    }
+    if (!primask) __enable_irq();
+
     if (usb_tx_busy == 0) {
         usb_service_tx();
     }
@@ -1147,7 +1172,9 @@ uint8_t usb_enqueue_tx(const uint8_t *data, uint16_t len) {
 void usb_service_tx(void) {
     USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
 
-    // 1) Si antes estábamos “busy” y el driver ya terminó, liberamos la bandera
+    if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED || hcdc == NULL)
+        return;
+
     if (usb_tx_busy && hcdc->TxState == 0) {
         usb_tx_busy = 0;
     }
@@ -1162,13 +1189,16 @@ void usb_service_tx(void) {
     // después de retornar — un buffer de stack ya liberado corrompería los datos.
     static uint8_t chunk[64];
     uint16_t cnt = 0;
-    while (cnt < 64 && tx_tail != tx_head) {
-        chunk[cnt++] = usb_tx_buf[tx_tail];
-        tx_tail = (tx_tail + 1) & USB_TX_BUF_MASK;
+    uint16_t read_index = tx_tail;
+    while (cnt < sizeof(chunk) && read_index != tx_head) {
+        chunk[cnt++] = usb_tx_buf[read_index];
+        read_index = (uint16_t)((read_index + 1U) & USB_TX_BUF_MASK);
     }
-    if (cnt) {
+
+    // Solo consumir bytes si el driver aceptó realmente la transferencia.
+    if (cnt && CDC_Transmit_FS(chunk, cnt) == USBD_OK) {
+        tx_tail = read_index;
         usb_tx_busy = 1;
-        CDC_Transmit_FS(chunk, cnt);
     }
 }
 
@@ -1402,7 +1432,6 @@ static void mpu_dma_done_cb(void *context, HAL_StatusTypeDef status)
     } else {
         mpu_errorCb(mpuPlat.ctx, status);
     }
-    i2c_process_pending = 1;
 }
 
 int mpu_readRegDMA(void *ctx,
@@ -1423,14 +1452,7 @@ int mpu_readRegDMA(void *ctx,
         .context    = NULL
     };
 
-    __disable_irq();
-    uint8_t enqueued;
-    if (I2C_Manager_IsBusy()) {
-        enqueued = I2C_Manager_Enqueue(&req);
-    } else {
-        enqueued = I2C_Manager_EnqueuePriority(&req);
-    }
-    __enable_irq();
+    uint8_t enqueued = I2C_Manager_EnqueuePriority(&req);
 
     if (!enqueued) {
         mpu_req_pending = 0;
@@ -1439,8 +1461,6 @@ int mpu_readRegDMA(void *ctx,
 
     // NO llamar Process() acá — solo marcar pending
     // El main loop lo va a llamar
-    i2c_process_pending = 1;
-
     i2c1_tx_busy = I2C_Manager_IsBusy();
     return 0;
 }
@@ -6115,7 +6135,6 @@ int main(void)
   wifiIp       = wifiProfiles[WIFI_PROFILE_ACTIVE].ip;
 
   CDC_Attach_Rx(USBRxData);
-  nBytesTx = 0;
   HAL_UART_Receive_IT(&huart1, &dataRx, 1);
 
   if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcValues, 8) != HAL_OK) {
@@ -6148,19 +6167,32 @@ int main(void)
   unerRx.mask = RXBUFSIZE - 1;
   unerTx.buff = unerTxBuffer;
   unerTx.mask = TXBUFSIZE - 1;
-  UNER_Init(&unerRx, &unerTx, &ax, &ay, &az, &gx, &gy, &gz);
-  UNER_RegisterADCBuffer(adcAvg, 8);  // promedios coherentes de los 8 canales
-  UNER_RegisterMotorSpeed(&motorRightVelocity, &motorLeftVelocity);
-  UNER_RegisterAngle(&roll_deg, &pitch_deg);
-  UNER_RegisterProportionalControl(&KP_value, &KD_value, &KI_value, &KV_brake_value);
-  UNER_RegisterSteering(&steering_adjustment);
-  UNER_RegisterFlags(NULL, &f_resetMassCenter, &f_send_csv_log, &f_send_wifi_log, &f_change_display);
-  UNER_RegisterLineControl(&KP_LINE, &KD_LINE, &KI_LINE, &LINE_THRESHOLD, &LINE_SPEED_TARGET, NULL);
-  UNER_RegisterManualControl(&manual_setpoint_cmd, &manual_steering_cmd, &manual_cmd_last_ms);
-  // Comandos ROTATE_90/180/CUSTOM desde Qt quedan sin efecto (no-op seguro en UNER.c)
-  UNER_RegisterSetpointTrim(&setpoint_trim);
-  UNER_RegisterRobotState(&robot_state);
-  UNER_RegisterOdometry(&odom_x_m, &odom_y_m, &odom_theta_deg);
+  UNER_Init(&unerRx, &unerTx);
+  static const UNER_Bindings_t unerBindings = {
+      .adc = adcAvg, .adc_len = 8,
+      .motor_right_velocity = &motorRightVelocity,
+      .motor_left_velocity = &motorLeftVelocity,
+      .ax = &ax, .ay = &ay, .az = &az,
+      .gx = &gx, .gy = &gy, .gz = &gz,
+      .roll = &roll_deg, .pitch = &pitch_deg,
+      .kp = &KP_value, .kd = &KD_value, .ki = &KI_value,
+      .kv_brake = &KV_brake_value,
+      .steering = &steering_adjustment,
+      .robot_state = &robot_state,
+      .reset_mass_center = &f_resetMassCenter,
+      .send_csv_log = &f_send_csv_log,
+      .send_wifi_log = &f_send_wifi_log,
+      .change_display = &f_change_display,
+      .kp_line = &KP_LINE, .kd_line = &KD_LINE, .ki_line = &KI_LINE,
+      .line_threshold = &LINE_THRESHOLD, .line_speed = &LINE_SPEED_TARGET,
+      .manual_setpoint = &manual_setpoint_cmd,
+      .manual_steering = &manual_steering_cmd,
+      .manual_timeout_ms = &manual_cmd_last_ms,
+      // rotation_target_deg/rotation_trigger quedan NULL: comandos de giro remoto no-op.
+      .odom_x = &odom_x_m, .odom_y = &odom_y_m, .odom_theta = &odom_theta_deg,
+      .setpoint_trim = &setpoint_trim,
+  };
+  UNER_RegisterBindings(&unerBindings);
 
   SSD1306_RegisterPlatform(&SSD1306_plat);
   SSD1306_Init();
@@ -6263,8 +6295,7 @@ int main(void)
 	      }
 	  }
 
-	  if (i2c_process_pending) {
-	      i2c_process_pending = 0;
+	  if (I2C_Manager_IsProcessPending()) {
 	      I2C_Manager_Process();
 	  }
 
@@ -6395,8 +6426,7 @@ int main(void)
 	  UNER_Task(); 		// Procesa tramas UNER recibidas
 	  usb_service_tx();
 
-	  if (i2c_process_pending) {
-	      i2c_process_pending = 0;  // limpiar ANTES de llamar Process
+	  if (I2C_Manager_IsProcessPending()) {
 	      I2C_Manager_Process();
 	  }
 	  i2c1_tx_busy = I2C_Manager_IsBusy();

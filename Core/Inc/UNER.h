@@ -29,8 +29,6 @@
 #define RXBUFSIZE  256
 #define TXBUFSIZE  256
 
-extern uint16_t globalIndex;
-
 // Estructura para la recepción de datos
 typedef struct {
     volatile uint8_t *buff;
@@ -53,6 +51,49 @@ typedef struct {
     uint8_t mask;
     uint8_t chk;	// EL CHECKSUM SE AGREGA SOLO COMO SUMA LUEGO DEL CALCULO DEL PAYLOAD
 } _sTx;
+
+// Todas las variables de aplicación que el protocolo puede consultar/modificar.
+// Se registran juntas para evitar una larga serie de funciones Register*.
+typedef struct {
+    uint16_t *adc;
+    uint8_t adc_len;
+    int16_t *motor_right_velocity;
+    int16_t *motor_left_velocity;
+    int16_t *ax;
+    int16_t *ay;
+    int16_t *az;
+    int16_t *gx;
+    int16_t *gy;
+    int16_t *gz;
+    float *roll;
+    float *pitch;
+    float *kp;
+    float *kd;
+    float *ki;
+    float *kv_brake;
+    float *beta_g;
+    float *beta_a;
+    float *steering;
+    uint8_t *robot_state;
+    uint8_t *reset_mass_center;
+    uint8_t *send_csv_log;
+    uint8_t *send_wifi_log;
+    uint8_t *change_display;
+    float *kp_line;
+    float *kd_line;
+    float *ki_line;
+    float *line_threshold;
+    float *line_speed;
+    float *manual_setpoint;
+    float *manual_steering;
+    uint32_t *manual_timeout_ms;
+    float *rotation_target_deg;
+    uint8_t *rotation_trigger;
+    float *odom_x;
+    float *odom_y;
+    float *odom_theta;
+    float *setpoint_trim;
+} UNER_Bindings_t;
 
 // Enums para el estado de parsing
 enum { HEADER_U, HEADER_N, HEADER_E, HEADER_R, NBYTES, TOKEN, PAYLOAD };
@@ -187,23 +228,13 @@ typedef struct __attribute__((packed)) {
                                // acelerómetro con EMA — tercer eje de la Vista 3D de Qt (2026-07-10)
 } WifiOdomData_t;
 
-void UNER_Init(_sRx *rx, _sTx *tx, int16_t *ax_ptr, int16_t *ay_ptr, int16_t *az_ptr, int16_t *gx_ptr, int16_t *gy_ptr, int16_t *gz_ptr);
+void UNER_Init(_sRx *rx, _sTx *tx);
+
+void UNER_RegisterBindings(const UNER_Bindings_t *bindings);
 
 void UNER_PushByte(uint8_t byte);
 
 void UNER_Task(void);
-
-void UNER_Send(uint8_t cmd, const uint8_t *payload, uint8_t length);
-
-uint8_t putHeaderOnTx(_sTx  *dataTx, _eCmd ID, uint8_t frameLength);
-
-uint8_t putByteOnTx(_sTx *dataTx, uint8_t byte);
-
-uint8_t putStrOntx(_sTx *dataTx, const char *str);
-
-uint8_t getByteFromRx(_sRx *dataRx, uint8_t iniPos, uint8_t finalPos);
-
-void decodeCommand(_sRx *dataRx, _sTx *dataTx);
 
 void UNER_SendAlive(void);
 
@@ -212,46 +243,9 @@ void UNER_SendAllSensors(void);
 uint8_t UNER_ShouldSendAllSensors(void);
 
 
-/**
- * Registra el buffer de valores ADC para que UNER pueda leerlos.
- * @param buf  Puntero al array de uint16_t con las lecturas ADC.
- * @param len  Número de elementos (p. ej. 8).
- */
-void UNER_RegisterADCBuffer(uint16_t *buf, uint8_t len);
-
-/**< Registra dónde escribir la velocidad de los motores */
-void UNER_RegisterMotorSpeed(int16_t *rightPtr, int16_t *leftPtr);
-
-void UNER_RegisterAngle(float *rollPtr, float *pitchPtr);
-
-void UNER_RegisterProportionalControl(float *kpPtr, float *kdPtr, float *kiPtr, float *KV_BRAKE_Ptr);
-
-void UNER_RegisterSteering(float *steeringPtr);
-
-void UNER_RegisterFlags(uint8_t *flagPtr1, uint8_t *flagPtr2, uint8_t *flagPtr3, uint8_t *flagPtr4, uint8_t *flagPtr5);
-
-void UNER_RegisterLineControl(float *kpLinePtr, float *kdLinePtr, float *kiLinePtr, float *thresPtr, float *speedPtr, uint8_t *lineFollowFlagPtr);
-
-void UNER_RegisterManualControl(float *spCmdPtr, float *stCmdPtr, uint32_t *tmoPtr);
-
-void UNER_RegisterRotationCmd(float *rotDegPtr, uint8_t *rotTriggerPtr);
-
-/**
- * @brief Registra los punteros a la pose odométrica (x[m], y[m], theta[°]) de main.c
- *        para los comandos GET_ODOMETRY / RESET_ODOMETRY.
- */
-void UNER_RegisterOdometry(float *xPtr, float *yPtr, float *thetaPtr);
-
-void UNER_RegisterSetpointTrim(float *trimPtr);
-
-void UNER_RegisterRobotState(uint8_t *robotStatePtr);
-
-
 void UNER_SendWifiLogData(WifiLogData_t *data);
 
 void UNER_SendWifiOdomData(WifiOdomData_t *data);
-
-void UNER_SendData(void);
 
 uint8_t UNER_GetLastManualCmd(void);
 
