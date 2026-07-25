@@ -93,6 +93,11 @@ typedef struct {
     float *odom_y;
     float *odom_theta;
     float *setpoint_trim;
+    // GETSPEED (0xA4): velocidad global [m/s, convención interna: negativo =
+    // adelante] y velocidad de cada rueda [rps] desde los encoders.
+    float *velocity_mps;
+    float *wheel_right_rps;
+    float *wheel_left_rps;
 } UNER_Bindings_t;
 
 // Enums para el estado de parsing
@@ -135,7 +140,7 @@ typedef enum{
     ALIVE = 0xF0,
     FIRMWARE = 0xF1,
     SETMOTORSPEED = 0xA1,
-    GETSPEED = 0xA4,
+    GETSPEED = 0xA4,            // respuesta: 3 floats LE = vel [m/s, + = adelante], rueda derecha [rps], rueda izquierda [rps]
 	GETADCVALUES = 0xA5,
 	GETMPU6050VALUES = 0xA6,
 	GETANGLE = 0XA7,
@@ -160,7 +165,7 @@ typedef enum{
     MODIFY_KD_LINE = 0xC1,
     MODIFY_KI_LINE = 0xC2,
     MODIFY_LINE_THRES = 0xC3,
-    MODIFY_LINE_SPEED = 0xC4,
+    MODIFY_LINE_SPEED = 0xC4,       // float32 m/s, limitado en STM32 a 0.20..4.00
     ACTIVATE_LINE_FOLLOWING = 0xC5,
     ACTIVATE_POS_MAINTENANCE = 0xC6,
     ACTIVATE_MANUAL_CONTROL = 0xC7,

@@ -8,6 +8,7 @@
 #include "UNER.h"
 #include <stddef.h>
 #include <string.h>
+#include <math.h>
 #include "ESP01.h"
 #include "usbd_core.h"    // para USBD_HandleTypeDef, USBD_STATE_CONFIGURED
 
@@ -76,6 +77,28 @@ static float *p_KI_LINE = NULL;
 static float *p_LINE_THRES = NULL;
 static float *p_LINE_SPEED = NULL;
 
+// Limites de operacion para el objetivo de velocidad recibido desde Qt.
+// El corte de emergencia (10 m/s) sigue siendo una proteccion independiente;
+// este rango es deliberadamente mas conservador para el comando de usuario.
+#define LINE_SPEED_CMD_MIN_MPS  0.20f
+#define LINE_SPEED_CMD_MAX_MPS  4.00f
+
+// Limite del trim de setpoint recibido desde Qt (0xC8). El spinbox de Qt
+// permite +-180 grados; mas alla de unos pocos grados el robot no puede
+// sostener el equilibrio (zona muerta de motores arranca en 35 grados).
+#define SETPOINT_TRIM_MAX_DEG   10.0f
+
+// Limite para KV_BRAKE recibido desde Qt (0xBF); el dialogo de Qt ofrece 0..100.
+#define KV_BRAKE_CMD_MAX        100.0f
+
+// Limites de sanidad para el resto de los comandos de tuning. Generosos a
+// proposito (un orden de magnitud sobre los valores de trabajo): filtran NaN,
+// Inf y disparates, no molestan al tuneo real.
+#define PID_GAIN_CMD_MAX        200.0f   // KP/KI/KD balance y linea (valores de trabajo: 0.1..10)
+#define LINE_THRES_CMD_MAX      4095.0f  // umbral sobre cuentas crudas del ADC de 12 bits
+#define STEERING_CMD_MAX        60.0f    // diferencial de PWM (el seguidor de linea se limita solo a +-20)
+#define ROTATE_CUSTOM_MAX_DEG   360.0f   // giro remoto: una vuelta completa como techo
+
 static float *p_manual_sp_cmd = NULL;
 static float *p_manual_st_cmd = NULL;
 static uint32_t *p_manual_tmo = NULL;
@@ -88,6 +111,10 @@ static float *p_odom_y     = NULL;
 static float *p_odom_theta = NULL;
 
 static float *p_setpoint_trim = NULL;
+
+static float *p_velocity_mps   = NULL;   // velocidad global encoders (m/s, interno: negativo = adelante)
+static float *p_wheel_right_rps = NULL;  // velocidad rueda derecha (rps)
+static float *p_wheel_left_rps  = NULL;  // velocidad rueda izquierda (rps)
 
 static uint8_t last_manual_cmd = 0;
 static volatile uint32_t rx_overflow_count = 0;
@@ -277,6 +304,21 @@ static float getF32FromRx(_sRx *dataRx)
     return word.f32;
 }
 
+// Lee un float del payload y lo valida: NaN/Inf se rechaza (devuelve 0 y no
+// toca *out), un valor fuera de [lo, hi] se recorta al borde. Centraliza la
+// sanidad de TODOS los comandos de tuning: sin esto, un frame corrupto que
+// pasara el checksum (o un bug en la UI) podía meter NaN en una ganancia PID
+// y voltear el robot sin diagnóstico posible.
+static uint8_t getF32BoundedFromRx(_sRx *dataRx, float *out, float lo, float hi)
+{
+    float v = getF32FromRx(dataRx);
+    if (!isfinite(v)) return 0;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    *out = v;
+    return 1;
+}
+
 static int32_t getI32FromRx(_sRx *dataRx)
 {
     _uWord word;
@@ -325,7 +367,10 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
             putByteOnTx(dataTx, dataTx->chk);	// EL CHECKSUM SE AGREGA SOLO COMO SUMA LUEGO DEL CALCULO DEL PAYLOAD
         break;
         case FIRMWARE:
-            putHeaderOnTx(dataTx, FIRMWARE, 12);
+            // frameLength = cmd (1) + strlen(firmware); sizeof-1 lo calcula solo.
+            // El 12 hardcodeado declaraba 2 bytes de mas y desincronizaba al
+            // parser de Qt (la trama real era mas corta que su encabezado).
+            putHeaderOnTx(dataTx, FIRMWARE, (uint8_t)(1U + sizeof(firmware) - 1U));
             putStrOntx(dataTx, firmware);
             putByteOnTx(dataTx, dataTx->chk);
         break;
@@ -370,6 +415,24 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 				putByteOnTx(dataTx, dataTx->chk);
 			}
         	break;
+        case GETSPEED:
+            // Implementado 2026-07-24 (antes caia en default → UNKNOWN).
+            // Respuesta: 3 floats LE = velocidad global [m/s], rueda derecha
+            // [rps], rueda izquierda [rps]. La convencion interna del firmware
+            // es "negativo = adelante" (ver vel_enc en main.c); para la UI se
+            // envia con signo invertido: positivo = avanzando.
+            if (p_velocity_mps && p_wheel_right_rps && p_wheel_left_rps) {
+                putHeaderOnTx(dataTx, GETSPEED, 13); // 1 cmd + 3 floats
+                putF32OnTx(dataTx, -(*p_velocity_mps));
+                putF32OnTx(dataTx, *p_wheel_right_rps);
+                putF32OnTx(dataTx, *p_wheel_left_rps);
+            } else {
+                putHeaderOnTx(dataTx, GETSPEED, 2);
+                putByteOnTx(dataTx, UNKNOWN);
+            }
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
         case SETMOTORSPEED:
 			putHeaderOnTx(dataTx, SETMOTORSPEED, 2);
 			putByteOnTx(dataTx, ACK );
@@ -387,8 +450,9 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 		break;
 
         case MODIFYKP:
-			float new_KP = getF32FromRx(dataRx);
-			if (p_KP) *p_KP = new_KP;
+			float new_KP;
+			if (p_KP && getF32BoundedFromRx(dataRx, &new_KP, 0.0f, PID_GAIN_CMD_MAX))
+				*p_KP = new_KP;
 
 			putHeaderOnTx(dataTx, MODIFYKP, 13);
 			putPidValuesOnTx(dataTx);
@@ -396,8 +460,9 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MODIFYKD:
-			float new_KD = getF32FromRx(dataRx);
-			if (p_KD) *p_KD = new_KD;
+			float new_KD;
+			if (p_KD && getF32BoundedFromRx(dataRx, &new_KD, 0.0f, PID_GAIN_CMD_MAX))
+				*p_KD = new_KD;
 
 			putHeaderOnTx(dataTx, MODIFYKD, 13);
 			putPidValuesOnTx(dataTx);
@@ -405,8 +470,9 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 		break;
 
         case MODIFYKI:
-			float new_KI = getF32FromRx(dataRx);
-			if (p_KI) *p_KI = new_KI;
+			float new_KI;
+			if (p_KI && getF32BoundedFromRx(dataRx, &new_KI, 0.0f, PID_GAIN_CMD_MAX))
+				*p_KI = new_KI;
 
 			putHeaderOnTx(dataTx, MODIFYKI, 13);
 			putPidValuesOnTx(dataTx);
@@ -433,7 +499,11 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MODIFYSTEERING:
-            if (p_steering) *p_steering = getF32FromRx(dataRx);
+            if (p_steering) {
+                float new_steer;
+                if (getF32BoundedFromRx(dataRx, &new_steer, -STEERING_CMD_MAX, STEERING_CMD_MAX))
+                    *p_steering = new_steer;
+            }
             putHeaderOnTx(dataTx, MODIFYSTEERING, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);
@@ -466,23 +536,51 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
             }
         break;
 
+        // Los betas de los filtros EMA hoy son defines fijos en main.c y estos
+        // punteros no se registran (NULL): en vez de un ACK mentiroso se
+        // responde UNKNOWN para que Qt muestre que el comando no aplica.
+        // Si algun dia vuelven a ser variables, registrarlas en unerBindings
+        // y el ACK vuelve solo. Rango valido de un beta EMA: 0..1.
         case MODIFY_BETA_G:
-			float new_BETA_G = getF32FromRx(dataRx);
-			if (p_BETA_G) *p_BETA_G = new_BETA_G;
-
-			putHeaderOnTx(dataTx, MODIFY_BETA_G, 2);
-			putByteOnTx(dataTx, ACK);
+			if (p_BETA_G) {
+				float new_BETA_G;
+				if (getF32BoundedFromRx(dataRx, &new_BETA_G, 0.0f, 1.0f))
+					*p_BETA_G = new_BETA_G;
+				putHeaderOnTx(dataTx, MODIFY_BETA_G, 2);
+				putByteOnTx(dataTx, ACK);
+			} else {
+				putHeaderOnTx(dataTx, MODIFY_BETA_G, 2);
+				putByteOnTx(dataTx, UNKNOWN);
+			}
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case MODIFY_BETA_A:
-			float new_BETA_A = getF32FromRx(dataRx);
-			if (p_BETA_A) *p_BETA_A = new_BETA_A;
-
-			putHeaderOnTx(dataTx, MODIFY_BETA_A, 2);
-			putByteOnTx(dataTx, ACK);
+			if (p_BETA_A) {
+				float new_BETA_A;
+				if (getF32BoundedFromRx(dataRx, &new_BETA_A, 0.0f, 1.0f))
+					*p_BETA_A = new_BETA_A;
+				putHeaderOnTx(dataTx, MODIFY_BETA_A, 2);
+				putByteOnTx(dataTx, ACK);
+			} else {
+				putHeaderOnTx(dataTx, MODIFY_BETA_A, 2);
+				putByteOnTx(dataTx, UNKNOWN);
+			}
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
+
+        case MODIFY_KV_BRAKE:
+            // Hasta 2026-07-24 este comando NO tenia case: Qt lo enviaba y el
+            // firmware respondia UNKNOWN sin tocar KV_brake_value.
+            if (p_KV_BRAKE) {
+                float new_KV;
+                if (getF32BoundedFromRx(dataRx, &new_KV, 0.0f, KV_BRAKE_CMD_MAX))
+                    *p_KV_BRAKE = new_KV;
+            }
+            putHeaderOnTx(dataTx, MODIFY_KV_BRAKE, 2);
+            putByteOnTx(dataTx, ACK);
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
 
         case CHANGE_DISPLAY:
             if (p_change_display != NULL) {
@@ -495,35 +593,56 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MODIFY_KP_LINE:
-			if (p_KP_LINE) *p_KP_LINE = getF32FromRx(dataRx);
+			if (p_KP_LINE) {
+				float new_kp_line;
+				if (getF32BoundedFromRx(dataRx, &new_kp_line, 0.0f, PID_GAIN_CMD_MAX))
+					*p_KP_LINE = new_kp_line;
+			}
 			putHeaderOnTx(dataTx, MODIFY_KP_LINE, 2);
 			putByteOnTx(dataTx, ACK);
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case MODIFY_KD_LINE:
-			if (p_KD_LINE) *p_KD_LINE = getF32FromRx(dataRx);
+			if (p_KD_LINE) {
+				float new_kd_line;
+				if (getF32BoundedFromRx(dataRx, &new_kd_line, 0.0f, PID_GAIN_CMD_MAX))
+					*p_KD_LINE = new_kd_line;
+			}
 			putHeaderOnTx(dataTx, MODIFY_KD_LINE, 2);
 			putByteOnTx(dataTx, ACK);
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case MODIFY_KI_LINE:
-			if (p_KI_LINE) *p_KI_LINE = getF32FromRx(dataRx);
+			if (p_KI_LINE) {
+				float new_ki_line;
+				if (getF32BoundedFromRx(dataRx, &new_ki_line, 0.0f, PID_GAIN_CMD_MAX))
+					*p_KI_LINE = new_ki_line;
+			}
 			putHeaderOnTx(dataTx, MODIFY_KI_LINE, 2);
 			putByteOnTx(dataTx, ACK);
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case MODIFY_LINE_THRES:
-			if (p_LINE_THRES) *p_LINE_THRES = getF32FromRx(dataRx);
+			if (p_LINE_THRES) {
+				float new_thres;
+				if (getF32BoundedFromRx(dataRx, &new_thres, 0.0f, LINE_THRES_CMD_MAX))
+					*p_LINE_THRES = new_thres;
+			}
 			putHeaderOnTx(dataTx, MODIFY_LINE_THRES, 2);
 			putByteOnTx(dataTx, ACK);
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
         case MODIFY_LINE_SPEED:
-			if (p_LINE_SPEED) *p_LINE_SPEED = getF32FromRx(dataRx);
+			if (p_LINE_SPEED) {
+				float requested_speed;
+				if (getF32BoundedFromRx(dataRx, &requested_speed,
+				                        LINE_SPEED_CMD_MIN_MPS, LINE_SPEED_CMD_MAX_MPS))
+					*p_LINE_SPEED = requested_speed;
+			}
 			putHeaderOnTx(dataTx, MODIFY_LINE_SPEED, 2);
 			putByteOnTx(dataTx, ACK);
 			putByteOnTx(dataTx, dataTx->chk);
@@ -689,8 +808,10 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
                 // Leído con getByteFromRx como el resto de los comandos — la
                 // versión anterior indexaba desde indexR (que acá apunta al
                 // checksum) y caía fuera del frame: leía basura.
-                float requested_rotation = getF32FromRx(dataRx);
-                if (requested_rotation != 0.0f) {
+                float requested_rotation;
+                if (getF32BoundedFromRx(dataRx, &requested_rotation,
+                                        -ROTATE_CUSTOM_MAX_DEG, ROTATE_CUSTOM_MAX_DEG) &&
+                    requested_rotation != 0.0f) {
                     *p_rot_target_deg = requested_rotation;
                     *p_rot_trigger    = 1;
                 }
@@ -738,7 +859,14 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
         break;
 
         case MODIFY_SETPOINT:
-            if (p_setpoint_trim) *p_setpoint_trim = getF32FromRx(dataRx);
+            // El spinbox de Qt permite +-180 grados: sin este clamp un valor
+            // grande se aplicaba directo al setpoint y volteaba el robot.
+            if (p_setpoint_trim) {
+                float new_trim;
+                if (getF32BoundedFromRx(dataRx, &new_trim,
+                                        -SETPOINT_TRIM_MAX_DEG, SETPOINT_TRIM_MAX_DEG))
+                    *p_setpoint_trim = new_trim;
+            }
             putHeaderOnTx(dataTx, MODIFY_SETPOINT, 2);
             putByteOnTx(dataTx, ACK);
             putByteOnTx(dataTx, dataTx->chk);
@@ -811,6 +939,8 @@ void UNER_RegisterBindings(const UNER_Bindings_t *b) {
     p_rot_target_deg = b->rotation_target_deg; p_rot_trigger = b->rotation_trigger;
     p_odom_x = b->odom_x; p_odom_y = b->odom_y; p_odom_theta = b->odom_theta;
     p_setpoint_trim = b->setpoint_trim;
+    p_velocity_mps = b->velocity_mps;
+    p_wheel_right_rps = b->wheel_right_rps; p_wheel_left_rps = b->wheel_left_rps;
 }
 
 // Envía el ring-buffer por USB y por UDP

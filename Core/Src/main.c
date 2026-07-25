@@ -698,6 +698,18 @@ static float line_vel_integral      = 0.0f;  // integral del PI de velocidad (id
 static float line_steer_fb_int      = 0.0f;  // integral del inner steering PI (idea 2)
 static float speed_right_rps_s      = 0.0f;  // velocidad rueda derecha, accesible fuera del bloque encoder
 static float speed_left_rps_s       = 0.0f;  // velocidad rueda izquierda, accesible fuera del bloque encoder
+// ── Estación por rueda (Opción A, 2026-07-21) ──
+// Cada rueda tiene un lazo PROPIO que mantiene su POSICIÓN (no su
+// velocidad): corrige la deriva NETA acumulada de esa rueda. Trabaja ENCIMA
+// del balance común (pwm_sat), no lo reemplaza. Regular posición —y no
+// velocidad— es lo que evita pelear con el vaivén del balance (que va y
+// vuelve → desplazamiento neto ~0). Ver Ctrl_MotoresBalance.
+static uint8_t wheel_pi_enabled     = 1;  // kill-switch: 0 → comportamiento V26 exacto
+static uint8_t wheel_pos_armed      = 0;  // 0 → recapturar el ancla de posición en el próximo ciclo
+static int32_t wheel_pos_anchor_r   = 0;  // conteo de encoder de referencia, rueda DERECHA
+static int32_t wheel_pos_anchor_l   = 0;  // conteo de encoder de referencia, rueda IZQUIERDA
+static float   wheel_spd_r_f        = 0.0f; // velocidad rueda DERECHA filtrada (EMA) — amortiguación
+static float   wheel_spd_l_f        = 0.0f; // velocidad rueda IZQUIERDA filtrada (EMA) — amortiguación
 static uint32_t wheel_r_last_tick_ms = 0;    // último tick de encoder derecho (deadband cinético/estático)
 static uint32_t wheel_l_last_tick_ms = 0;    // ídem izquierdo
 // Velocidad LENTA (tau ~0.5s) SOLO para el freno traslacional: meciéndose en el
@@ -2746,7 +2758,7 @@ static void Ctrl_LatchesPared(void)
         // hasta 6s y dispararía el timeout en plena maniobra válida).
         if (obj_wall_rev_latch ||
             (float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD) {
-            obj_wall_missing_since_ms = 0;
+            obj_wall_missing_since_ms = 10;
         } else {
             if (obj_wall_missing_since_ms == 0) {
                 obj_wall_missing_since_ms = HAL_GetTick();
@@ -5998,8 +6010,87 @@ static void Ctrl_MotoresBalance(void)
                      ? steer_correction
                      : (-apply_deadbandf((float)gz / 100.0f, GZ_YAW_ASSIST_DB) * 0.23f);
 
-    float mR = pwm_sat + correction;
-    float mL = pwm_sat - correction;
+    // ── Estación por rueda (Opción A, 2026-07-21) ─────────────────────
+    // pwm_sat es el esfuerzo de balance COMÚN (feedforward, autoridad
+    // principal — NO se toca acá). Encima, un lazo PD mantiene la POSICIÓN
+    // del robot (deriva neta de los encoders respecto de un ancla), topeado
+    // a ±8% para no dominar nunca al balance. Regular POSICIÓN —y no
+    // velocidad— es lo que evita pelear con el vaivén del balance (que va y
+    // vuelve → posición neta ≈ 0, invisible al lazo).
+    //
+    // Se controla en DOS EJES DESACOPLADOS (mismo patrón que pwm_sat común +
+    // correction diferencial): TRASLACIÓN (promedio de las ruedas: el robot
+    // rodó de lugar) y ROTACIÓN (semidiferencia: el robot giró). Van con
+    // zonas muertas DISTINTAS a propósito:
+    //   • Traslación: banda ANCHA (±WHEEL_TRANS_DB≈6 cm) → ignora los meneos
+    //     chicos que no afectan; en el punto dulce el trim es 0 exacto (cero
+    //     vibración, el balance manda solo).
+    //   • Rotación: banda ANGOSTA (±WHEEL_ROT_DB) → un giro se nota MUCHO más
+    //     que un corrimiento chico, así que se ataja antes. Sin esto, la banda
+    //     ancha por rueda dejaba rotar libre dentro de ±DB y el robot giraba
+    //     lento y constante (la asistencia de rumbo por gyro amortigua la
+    //     velocidad de giro pero no sostiene el rumbo).
+    // Cada eje es un PD: P sobre el EXCESO fuera de su zona (arranca en 0 en
+    // el borde, sin escalón) + D de amortiguación (velocidad filtrada, sin la
+    // cual el resorte sobrepasa y oscila). El signo '+' se VERIFICÓ en el
+    // robot; la descomposición es LINEAL, así que ambos ejes heredan ese
+    // mismo signo correcto sin re-verificar.
+    //
+    // ⚠️ Mapeo físico — nombres CRUZADOS en la salida: la rueda DERECHA la
+    // mueve mL y la IZQUIERDA mR. La derecha ve (trans+rot) y la izquierda
+    // (trans−rot), igual que drift_r/drift_l.
+    #define WHEEL_TRANS_KP   0.15f  // %PWM por count de traslación (resorte suave)
+    #define WHEEL_TRANS_KD   0.60f  // %PWM por rps de traslación (amortiguación)
+    #define WHEEL_TRANS_DB   10     // zona muerta traslación [counts] (~6 cm): ANCHA
+    #define WHEEL_ROT_KP     0.15f  // %PWM por count de rotación
+    #define WHEEL_ROT_KD     0.60f  // %PWM por rps de rotación
+    #define WHEEL_ROT_DB     3      // zona muerta rotación [counts]: ANGOSTA (ataja el giro)
+    #define WHEEL_TRIM_MAX   8.0f   // tope del trim por rueda: nunca domina a pwm_sat
+    #define WHEEL_SPD_BETA   0.20f  // EMA de velocidad por rueda (τ≈50ms): D sin ruido de cuantización
+    float wheel_trim_r = 0.0f;   // para la rueda DERECHA  (se suma a mL)
+    float wheel_trim_l = 0.0f;   // para la rueda IZQUIERDA (se suma a mR)
+    // Velocidad filtrada de cada rueda (para los términos D): un count aislado
+    // (3.57 rps) entra como ~0.7 y se desvanece, en vez de un escalón.
+    wheel_spd_r_f += WHEEL_SPD_BETA * (speed_right_rps_s - wheel_spd_r_f);
+    wheel_spd_l_f += WHEEL_SPD_BETA * (speed_left_rps_s  - wheel_spd_l_f);
+    if (wheel_pi_enabled) {
+        // Recaptura el ancla al (re)entrar a balance: la pose actual pasa a
+        // ser el "cero" (posición y rumbo) que el lazo intenta sostener.
+        if (!wheel_pos_armed) {
+            wheel_pos_anchor_r = enc_r;
+            wheel_pos_anchor_l = enc_l;
+            wheel_pos_armed    = 1;
+        }
+        int32_t drift_r = enc_r - wheel_pos_anchor_r;   // deriva neta rueda derecha [counts]
+        int32_t drift_l = enc_l - wheel_pos_anchor_l;   // deriva neta rueda izquierda
+        // Descomposición común/diferencial.
+        float trans   = 0.5f * (float)(drift_r + drift_l);  // [counts] el robot rodó
+        float rot     = 0.5f * (float)(drift_r - drift_l);  // [counts] el robot giró
+        float v_trans = 0.5f * (wheel_spd_r_f + wheel_spd_l_f); // [rps]
+        float v_rot   = 0.5f * (wheel_spd_r_f - wheel_spd_l_f); // [rps]
+        // Exceso fuera de cada zona muerta (continuo en el borde: 0 adentro).
+        float trans_exc = 0.0f, rot_exc = 0.0f;
+        if      (trans >  WHEEL_TRANS_DB) trans_exc = trans - WHEEL_TRANS_DB;
+        else if (trans < -WHEEL_TRANS_DB) trans_exc = trans + WHEEL_TRANS_DB;
+        if      (rot   >  WHEEL_ROT_DB)   rot_exc   = rot   - WHEEL_ROT_DB;
+        else if (rot   < -WHEEL_ROT_DB)   rot_exc   = rot   + WHEEL_ROT_DB;
+        // PD por eje. La D solo entra cuando el eje está activo (fuera de su
+        // zona), así el punto dulce no recibe amortiguación que pelee con el
+        // balance. Signo '+' (ver arriba).
+        float trans_trim = 0.0f, rot_trim = 0.0f;
+        if (trans_exc != 0.0f) trans_trim = WHEEL_TRANS_KP*trans_exc + WHEEL_TRANS_KD*v_trans;
+        if (rot_exc   != 0.0f) rot_trim   = WHEEL_ROT_KP*rot_exc     + WHEEL_ROT_KD*v_rot;
+        // Recomposición: derecha = trans+rot, izquierda = trans−rot.
+        wheel_trim_r = clampf_local(trans_trim + rot_trim, -WHEEL_TRIM_MAX, WHEEL_TRIM_MAX);
+        wheel_trim_l = clampf_local(trans_trim - rot_trim, -WHEEL_TRIM_MAX, WHEEL_TRIM_MAX);
+        // Si alguna vez SE ALEJA del ancla en vez de volver, es el signo:
+        // poné '−' delante de trans_trim y rot_trim.
+    } else {
+        wheel_pos_armed = 0;
+    }
+
+    float mR = pwm_sat + correction + wheel_trim_l;   // mR mueve la rueda IZQUIERDA
+    float mL = pwm_sat - correction + wheel_trim_r;   // mL mueve la rueda DERECHA
 
     if (mR >  100.0f) mR =  100.0f;
     if (mR < -100.0f) mR = -100.0f;
@@ -6398,6 +6489,11 @@ int main(void)
       // rotation_target_deg/rotation_trigger quedan NULL: comandos de giro remoto no-op.
       .odom_x = &odom_x_m, .odom_y = &odom_y_m, .odom_theta = &odom_theta_deg,
       .setpoint_trim = &setpoint_trim,
+      // GETSPEED (0xA4): velocidad global filtrada (m/s, interno negativo =
+      // adelante — UNER.c invierte el signo al responder) y rps por rueda.
+      .velocity_mps = &velocity_est_f,
+      .wheel_right_rps = &speed_right_rps_s,
+      .wheel_left_rps = &speed_left_rps_s,
   };
   UNER_RegisterBindings(&unerBindings);
 
