@@ -577,7 +577,7 @@ static const WifiProfile_t wifiProfiles[] = {
     /* 3 */ { "Wifi Habitaciones",         "toyotakia",             "192.168.1.48",  "Wifi Habitaciones" },
 };
 
-#define WIFI_PROFILE_ACTIVE  0        /* <<< NUMERO DE RED ELEGIDA >>> */
+#define WIFI_PROFILE_ACTIVE  1   	        /* <<< NUMERO DE RED ELEGIDA >>> */
 
 const char *wifiSSID;
 const char *wifiPassword;
@@ -623,8 +623,13 @@ static uint8_t f_fallen = 0;   // 1 = caído, motores apagados
 static uint8_t speed_limit_fault = 0; // caída forzada por exceso de velocidad
 static float speed_limit_trip_velocity = 0.0f; // magnitud de velocidad que produjo el corte
 static uint32_t speed_limit_arm_after_ms = 0;  // instante desde el cual se habilita el corte
-#define FALL_ALERT_DISPLAY_MS 5000U
+#define FALL_ALERT_DISPLAY_MS 3000U
 static uint32_t fall_alert_until_ms = 0; // 0/expirado: la alarma ya no toma la pantalla
+// La pantalla de caída recién se habilita cuando el usuario entra a algún modo
+// distinto de IDLE (2026-07-26): al encender, el robot suele estar acostado y
+// la alarma tomaba el display de entrada — feo y sin información útil. Queda
+// armada para siempre tras el primer modo activo.
+static uint8_t fall_alert_armed = 0;
 // Foto congelada del último ciclo anterior al corte de motores por caída.
 static eFallReason fall_trip_reason = FALL_REASON_NONE;
 static float fall_trip_angle = 0.0f;
@@ -708,6 +713,9 @@ static uint8_t wheel_pi_enabled     = 1;  // kill-switch: 0 → comportamiento V
 static uint8_t wheel_pos_armed      = 0;  // 0 → recapturar el ancla de posición en el próximo ciclo
 static int32_t wheel_pos_anchor_r   = 0;  // conteo de encoder de referencia, rueda DERECHA
 static int32_t wheel_pos_anchor_l   = 0;  // conteo de encoder de referencia, rueda IZQUIERDA
+static float   wheel_yaw_deg        = 0.0f; // rumbo integrado del gyro Z desde el ancla [°] — heading-hold
+static float   wheel_yaw_int        = 0.0f; // integral del exceso de rumbo [°·s] — anula perturbación constante
+static float   wheel_yaw_bias_dps   = 0.0f; // bias residual del gyro Z, medido SOLO en reposo real (ver Ctrl_VelocidadEncoders)
 static float   wheel_spd_r_f        = 0.0f; // velocidad rueda DERECHA filtrada (EMA) — amortiguación
 static float   wheel_spd_l_f        = 0.0f; // velocidad rueda IZQUIERDA filtrada (EMA) — amortiguación
 static uint32_t wheel_r_last_tick_ms = 0;    // último tick de encoder derecho (deadband cinético/estático)
@@ -2681,6 +2689,31 @@ static void Ctrl_VelocidadEncoders(void)
     speed_left_rps_s  = speed_left_rps;
     if (delta_right != 0) wheel_r_last_tick_ms = HAL_GetTick();
     if (delta_left  != 0) wheel_l_last_tick_ms = HAL_GetTick();
+
+    // Calibración del bias residual del gyro Z para el heading-hold de la
+    // estación (2026-07-26, 3er intento — "desde la base"). SOLO se aprende
+    // en reposo REAL: motores apagados (IDLE o caído) y encoders sin un solo
+    // count en el ciclo — ahí todo lo que marque el gyro ES bias, por
+    // definición. Aprender durante la estación (intento anterior) era
+    // indistinguible de un giro real lento: la EMA absorbía el giro y el
+    // hold lo dejaba pasar — por eso el robot "nunca terminaba de girar".
+    // Convergencia en dos etapas (2026-07-26, pedido: poder salir de IDLE
+    // casi al instante): los primeros 100 ciclos en reposo usan una EMA
+    // rápida (β=0.08, converge en ~0.3–0.5s) y después pasa a la lenta
+    // (β=0.005, τ≈2s) que solo refina. El gate de 5°/s descarta que lo
+    // estén moviendo en la mano; gz==0 exacto se ignora (IMU aún sin datos
+    // al arrancar, para no gastar el warmup en ceros). Durante balance el
+    // bias queda CONGELADO.
+    if ((robot_state == ROBOT_STATE_IDLE || f_fallen) &&
+        delta_right == 0 && delta_left == 0 && gz != 0) {
+        static uint16_t yaw_bias_warmup = 0;
+        float gz_dps_cal = (float)gz / 100.0f;
+        if (fabsf(gz_dps_cal - wheel_yaw_bias_dps) < 5.0f) {
+            wheel_yaw_bias_dps += ((yaw_bias_warmup < 100) ? 0.08f : 0.005f)
+                                * (gz_dps_cal - wheel_yaw_bias_dps);
+            if (yaw_bias_warmup < 100) yaw_bias_warmup++;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -3414,6 +3447,7 @@ static void Ctrl_CambiosDeEstado(void)
     if (robot_state == ROBOT_STATE_IDLE && prev_robot_state != ROBOT_STATE_IDLE) {
         integral            = 0.0f;
         pwm_sat_prev        = 0.0f;
+        wheel_pos_armed     = 0;   // estación por rueda: ancla nueva al entrar
         dynamic_setpoint    = SETPOINT_ANGLE + setpoint_trim;
         dynamic_setpoint_f  = SETPOINT_ANGLE + setpoint_trim;
         base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
@@ -3436,6 +3470,9 @@ static void Ctrl_CambiosDeEstado(void)
         base_setpoint_f     = SETPOINT_ANGLE + setpoint_trim;
         brake_setpoint_f    = 0.0f;
         pwm_sat_prev        = 0.0f;
+        wheel_pos_armed     = 0;   // estación por rueda: ancla nueva al entrar
+                                   // (sin esto quedaba el ancla del modo anterior
+                                   // y la estación intentaba "volver" allá)
 
         odom_x_m       = 0.0f;   // odometría: origen = punto de entrada al modo
         odom_y_m       = 0.0f;
@@ -3455,7 +3492,64 @@ static void Ctrl_CambiosDeEstado(void)
         speed_limit_arm_after_ms = HAL_GetTick() + LINE_SPEED_EMERGENCY_ARM_MS;
     }
 
+    // Primer modo activo (cualquiera que no sea IDLE) → habilita la pantalla
+    // de caída de una vez y para siempre (ver fall_alert_armed).
+    if (robot_state != ROBOT_STATE_IDLE)
+        fall_alert_armed = 1;
+
     prev_robot_state = robot_state;
+}
+
+// ── Estación por rueda — eje de TRASLACIÓN por SETPOINT (2026-07-26) ──
+// El primer diseño (2026-07-21) corregía la traslación con trim de PWM
+// directo a las ruedas, igual que la rotación. En el robot falló asimétrico:
+// la deriva hacia adelante NUNCA frenaba (y hacia atrás corregía mal). Causa:
+// en un balancín el PWM de rueda es el actuador EQUIVOCADO para posición —
+// frenar las ruedas inclina el cuerpo hacia adelante y el PID de balance
+// responde acelerando: el trim (topeado a ±8%) pelea contra el balance y
+// pierde. El actuador correcto es el SETPOINT de inclinación: para volver
+// atrás, inclinarse hacia atrás y dejar que el balance haga el resto. Es el
+// mismo patrón ya validado en los holds de PAUSA_GIRO y PERP_SETTLE
+// (OBJ_PAUSA_POS_*), con la misma ganancia y el mismo signo:
+// counts positivos = avance → corrección NEGATIVA (inclina hacia atrás).
+// La ROTACIÓN sí queda en PWM diferencial (ver Ctrl_MotoresBalance): girar
+// las ruedas en sentidos opuestos no afecta el pitch, ahí el trim no pelea
+// con el balance.
+#define WHEEL_STATION_ANG_KP   0.06f  // ° por count de exceso (= OBJ_PAUSA_POS_KP, ≈1° cada 10 cm)
+#define WHEEL_STATION_DAMP     0.45f  // ° por rps de velocidad de traslación (0.25→0.45 el
+                                      // 2026-07-26: con 0.25 el vaivén no crecía pero tampoco
+                                      // moría — ciclo límite por stick-slip de motores; si
+                                      // aparece jitter en el punto dulce, bajar de a 0.05)
+#define WHEEL_STATION_ANG_MAX  2.0f   // tope de la corrección (°)
+#define WHEEL_TRANS_DB         10     // zona muerta traslación [counts] (~6 cm): ANCHA,
+                                      // adentro el resorte (P) es 0 exacto
+
+// Corrección de setpoint para mantener la estación (solo BALANCE/IDLE).
+// Gate con wheel_pos_armed: el ancla se estampa en Ctrl_MotoresBalance
+// (que corre DESPUÉS en el ciclo) — el primer ciclo no corrige, mismo
+// patrón que el hold de PAUSA_GIRO. PD:
+//   • P sobre el EXCESO fuera de la zona muerta (continuo en el borde).
+//   • D SIEMPRE activa (2026-07-26): sin amortiguación propia el resorte,
+//     a través del retardo del balance, bombeaba un vaivén adelante/atrás
+//     de amplitud CRECIENTE (reportado en el robot: "comienza quieto y
+//     termina moviéndose muchos centímetros"). El freno de
+//     ComputeBrakeSetpointTarget no sirve acá: su deadband de 0.35 m/s
+//     está por encima de estas velocidades. Se amortigua con la velocidad
+//     EMA por rueda (wheel_spd_*_f, actualizada en Ctrl_MotoresBalance el
+//     ciclo anterior), que sí ve movimientos chicos. + = avance, mismo
+//     signo que el P (mapa lineal del diseño PWM verificado).
+static float WheelStation_AngleCorr(void)
+{
+    if (!wheel_pi_enabled || !wheel_pos_armed) return 0.0f;
+    float trans = 0.5f * (float)((enc_r - wheel_pos_anchor_r) +
+                                 (enc_l - wheel_pos_anchor_l));
+    float exc = 0.0f;
+    if      (trans >  WHEEL_TRANS_DB) exc = trans - WHEEL_TRANS_DB;
+    else if (trans < -WHEEL_TRANS_DB) exc = trans + WHEEL_TRANS_DB;
+    float v_trans = 0.5f * (wheel_spd_r_f + wheel_spd_l_f);   // [rps]
+    return clampf_local(-(WHEEL_STATION_ANG_KP * exc +
+                          WHEEL_STATION_DAMP   * v_trans),
+                        -WHEEL_STATION_ANG_MAX, WHEEL_STATION_ANG_MAX);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -3951,10 +4045,14 @@ static void Ctrl_SetpointDinamico(void)
         base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
     } else if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
         // BALANCE_ONLY: tilt setpoint against velocity to brake post-push drift
-        base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+        // + estación por rueda: inclinación proporcional a la deriva de
+        // posición para volver al ancla (ver WheelStation_AngleCorr arriba).
+        base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim + WheelStation_AngleCorr();
         brake_setpoint_target = ComputeBrakeSetpointTarget(robot_state);
     } else {
-        base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
+        // IDLE-activo balancea con Ctrl_MotoresBalance → misma estación.
+        // (MOTOR_TEST también cae acá pero su setpoint no llega a motores.)
+        base_setpoint_target = SETPOINT_ANGLE + setpoint_trim + WheelStation_AngleCorr();
     }
 
     // Clamp global de setpoint. MANUAL_CONTROL necesita su propia excepción
@@ -4126,7 +4224,10 @@ static void Ctrl_DeteccionCaida(void)
             fall_trip_gyro     = gyro_f;
             fall_trip_velocity = velocity_est_f;
             fall_trip_pwm      = pwm_sat_prev;
-            fall_alert_until_ms = HAL_GetTick() + FALL_ALERT_DISPLAY_MS;
+            // Sin modo activo previo (arranque en IDLE) la pantalla de caída
+            // no se muestra; la foto (fall_trip_*) se estampa igual.
+            fall_alert_until_ms = fall_alert_armed
+                                ? HAL_GetTick() + FALL_ALERT_DISPLAY_MS : 0;
             f_fallen = 1;
             integral            = 0.0f;
             balance_hold_active = 0;
@@ -4237,6 +4338,7 @@ static void Ctrl_DeteccionCaida(void)
             dead_zone_count     = 0;
             pwm_sat_prev        = 0.0f;
             prev_error          = 0.0f;
+            wheel_pos_armed     = 0;   // estación por rueda: ancla nueva tras la caída
         } else {
             motorRightVelocity = 0;
             motorLeftVelocity  = 0;
@@ -6010,81 +6112,105 @@ static void Ctrl_MotoresBalance(void)
                      ? steer_correction
                      : (-apply_deadbandf((float)gz / 100.0f, GZ_YAW_ASSIST_DB) * 0.23f);
 
-    // ── Estación por rueda (Opción A, 2026-07-21) ─────────────────────
+    // ── Estación por rueda (Opción A, 2026-07-21 / rediseño 2026-07-26) ──
     // pwm_sat es el esfuerzo de balance COMÚN (feedforward, autoridad
-    // principal — NO se toca acá). Encima, un lazo PD mantiene la POSICIÓN
-    // del robot (deriva neta de los encoders respecto de un ancla), topeado
-    // a ±8% para no dominar nunca al balance. Regular POSICIÓN —y no
-    // velocidad— es lo que evita pelear con el vaivén del balance (que va y
-    // vuelve → posición neta ≈ 0, invisible al lazo).
-    //
-    // Se controla en DOS EJES DESACOPLADOS (mismo patrón que pwm_sat común +
-    // correction diferencial): TRASLACIÓN (promedio de las ruedas: el robot
-    // rodó de lugar) y ROTACIÓN (semidiferencia: el robot giró). Van con
-    // zonas muertas DISTINTAS a propósito:
-    //   • Traslación: banda ANCHA (±WHEEL_TRANS_DB≈6 cm) → ignora los meneos
-    //     chicos que no afectan; en el punto dulce el trim es 0 exacto (cero
-    //     vibración, el balance manda solo).
-    //   • Rotación: banda ANGOSTA (±WHEEL_ROT_DB) → un giro se nota MUCHO más
-    //     que un corrimiento chico, así que se ataja antes. Sin esto, la banda
-    //     ancha por rueda dejaba rotar libre dentro de ±DB y el robot giraba
-    //     lento y constante (la asistencia de rumbo por gyro amortigua la
-    //     velocidad de giro pero no sostiene el rumbo).
-    // Cada eje es un PD: P sobre el EXCESO fuera de su zona (arranca en 0 en
-    // el borde, sin escalón) + D de amortiguación (velocidad filtrada, sin la
-    // cual el resorte sobrepasa y oscila). El signo '+' se VERIFICÓ en el
-    // robot; la descomposición es LINEAL, así que ambos ejes heredan ese
-    // mismo signo correcto sin re-verificar.
+    // principal — NO se toca acá). La estación se controla en DOS EJES
+    // DESACOPLADOS, cada uno con SU actuador:
+    //   • TRASLACIÓN (promedio de deriva de las ruedas): via SETPOINT de
+    //     inclinación — ver WheelStation_AngleCorr() en la etapa 12. El
+    //     primer diseño la corregía acá con trim de PWM y en el robot la
+    //     deriva hacia adelante nunca frenaba: frenar las ruedas inclina el
+    //     cuerpo y el balance responde acelerando — el trim pelea con el
+    //     balance y pierde. Acá solo queda estampar el ancla común.
+    //   • ROTACIÓN (semidiferencia): SÍ va con trim de PWM diferencial —
+    //     girar las ruedas en sentidos opuestos no afecta el pitch, así que
+    //     no pelea con el balance. Banda ANGOSTA (±WHEEL_ROT_DB): un giro se
+    //     nota mucho más que un corrimiento chico. PD: P sobre el EXCESO
+    //     fuera de la zona (arranca en 0 en el borde, sin escalón) + D de
+    //     amortiguación (velocidad filtrada, sin la cual el resorte
+    //     sobrepasa y oscila). El signo '+' se VERIFICÓ en el robot
+    //     (2026-07-21; la descomposición es lineal → hereda el signo).
     //
     // ⚠️ Mapeo físico — nombres CRUZADOS en la salida: la rueda DERECHA la
-    // mueve mL y la IZQUIERDA mR. La derecha ve (trans+rot) y la izquierda
-    // (trans−rot), igual que drift_r/drift_l.
-    #define WHEEL_TRANS_KP   0.15f  // %PWM por count de traslación (resorte suave)
-    #define WHEEL_TRANS_KD   0.60f  // %PWM por rps de traslación (amortiguación)
-    #define WHEEL_TRANS_DB   10     // zona muerta traslación [counts] (~6 cm): ANCHA
-    #define WHEEL_ROT_KP     0.15f  // %PWM por count de rotación
-    #define WHEEL_ROT_KD     0.60f  // %PWM por rps de rotación
-    #define WHEEL_ROT_DB     3      // zona muerta rotación [counts]: ANGOSTA (ataja el giro)
+    // mueve mL y la IZQUIERDA mR. La derecha ve (+rot) y la izquierda (−rot),
+    // igual que drift_r/drift_l.
+    #define WHEEL_ROT_KP     0.25f  // %PWM por count de rotación (0.15→0.25 el 2026-07-26: quedaba giro lento residual)
+    #define WHEEL_ROT_KD     0.60f  // %PWM por rps de rotación (subir a 1.0 si aparece temblor al corregir el giro)
+    #define WHEEL_ROT_DB     2      // zona muerta rotación [counts]: ANGOSTA (3→2 el 2026-07-26, ataja el giro antes)
+    // Heading-hold por gyro Z (2026-07-26): el lazo de rotación por encoders
+    // NO ve el giro por micro-patinaje (el cuerpo rota sin diferencia neta de
+    // counts) y el yaw-assist tiene zona muerta de 3°/s — un giro lento pasa
+    // por debajo de ambos. Se integra el rumbo desde el ancla (mismo gz/100
+    // del assist) y se corrige en el MISMO canal y signo que el assist: como
+    // el rumbo es la integral de gz, la realimentación hereda la polaridad ya
+    // validada del assist — no hay signo nuevo que verificar en el robot.
+    //
+    // Bias del gyro: medido SOLO en reposo real (motores off + encoders
+    // quietos, ver Ctrl_VelocidadEncoders) y CONGELADO durante la estación.
+    // El intento anterior (aprenderlo durante la estación) no podía
+    // distinguir bias de giro real lento y terminaba dejando pasar el giro.
+    //
+    // PI (2026-07-26, "desde la base"): P solo alcanza si la perturbación es
+    // chica — con una asimetría constante de motores el P satura y el robot
+    // sigue girando en equilibrio. El término I acumula el PWM diferencial
+    // EXACTO que anula la perturbación → el giro termina en cero, no en un
+    // "empate girando". La I se congela dentro de WHEEL_YAW_DB (conserva el
+    // contra-torque encontrado) y se resetea al rearmar el ancla.
+    #define WHEEL_YAW_KP        2.0f    // (°/s eq) por ° de rumbo acumulado
+    #define WHEEL_YAW_KI        0.8f    // (°/s eq) por °·s de exceso integrado
+    #define WHEEL_YAW_DB        1.0f    // ° de rumbo sin corregir (tolerancia a ruido)
+    #define WHEEL_YAW_MAX       20.0f   // tope del P en °/s eq (12→20 el 2026-07-26: ×0.23 → ~4.6% PWM dif.)
+    #define WHEEL_YAW_INT_MAX   15.0f   // tope del I en °/s eq (~3.5% PWM diferencial)
     #define WHEEL_TRIM_MAX   8.0f   // tope del trim por rueda: nunca domina a pwm_sat
     #define WHEEL_SPD_BETA   0.20f  // EMA de velocidad por rueda (τ≈50ms): D sin ruido de cuantización
     float wheel_trim_r = 0.0f;   // para la rueda DERECHA  (se suma a mL)
     float wheel_trim_l = 0.0f;   // para la rueda IZQUIERDA (se suma a mR)
-    // Velocidad filtrada de cada rueda (para los términos D): un count aislado
+    // Velocidad filtrada de cada rueda (para el término D): un count aislado
     // (3.57 rps) entra como ~0.7 y se desvanece, en vez de un escalón.
     wheel_spd_r_f += WHEEL_SPD_BETA * (speed_right_rps_s - wheel_spd_r_f);
     wheel_spd_l_f += WHEEL_SPD_BETA * (speed_left_rps_s  - wheel_spd_l_f);
     if (wheel_pi_enabled) {
         // Recaptura el ancla al (re)entrar a balance: la pose actual pasa a
-        // ser el "cero" (posición y rumbo) que el lazo intenta sostener.
+        // ser el "cero" (posición y rumbo) que la estación intenta sostener.
+        // El eje de traslación (etapa 12) usa esta MISMA ancla.
         if (!wheel_pos_armed) {
             wheel_pos_anchor_r = enc_r;
             wheel_pos_anchor_l = enc_l;
+            wheel_yaw_deg      = 0.0f;   // rumbo del ancla = 0
+            wheel_yaw_int      = 0.0f;   // contra-torque acumulado también a 0
             wheel_pos_armed    = 1;
         }
+        // Heading-hold PI: rumbo acumulado desde el ancla (gz menos el bias
+        // medido en reposo) → P sobre el exceso fuera de WHEEL_YAW_DB + I
+        // que acumula ese exceso, ambos al canal del yaw-assist (misma
+        // escala 0.23 y mismo signo → polaridad heredada, ya validada).
+        wheel_yaw_deg += (((float)gz / 100.0f) - wheel_yaw_bias_dps) * dt_ctrl;
+        float yaw_exc = apply_deadbandf(wheel_yaw_deg, WHEEL_YAW_DB);
+        if (yaw_exc != 0.0f) {
+            wheel_yaw_int = clampf_local(wheel_yaw_int + yaw_exc * dt_ctrl,
+                                         -WHEEL_YAW_INT_MAX / WHEEL_YAW_KI,
+                                          WHEEL_YAW_INT_MAX / WHEEL_YAW_KI);
+        }
+        float yaw_hold = clampf_local(WHEEL_YAW_KP * yaw_exc, -WHEEL_YAW_MAX, WHEEL_YAW_MAX)
+                       + WHEEL_YAW_KI * wheel_yaw_int;
+        correction += -yaw_hold * 0.23f;
         int32_t drift_r = enc_r - wheel_pos_anchor_r;   // deriva neta rueda derecha [counts]
         int32_t drift_l = enc_l - wheel_pos_anchor_l;   // deriva neta rueda izquierda
-        // Descomposición común/diferencial.
-        float trans   = 0.5f * (float)(drift_r + drift_l);  // [counts] el robot rodó
-        float rot     = 0.5f * (float)(drift_r - drift_l);  // [counts] el robot giró
-        float v_trans = 0.5f * (wheel_spd_r_f + wheel_spd_l_f); // [rps]
-        float v_rot   = 0.5f * (wheel_spd_r_f - wheel_spd_l_f); // [rps]
-        // Exceso fuera de cada zona muerta (continuo en el borde: 0 adentro).
-        float trans_exc = 0.0f, rot_exc = 0.0f;
-        if      (trans >  WHEEL_TRANS_DB) trans_exc = trans - WHEEL_TRANS_DB;
-        else if (trans < -WHEEL_TRANS_DB) trans_exc = trans + WHEEL_TRANS_DB;
-        if      (rot   >  WHEEL_ROT_DB)   rot_exc   = rot   - WHEEL_ROT_DB;
-        else if (rot   < -WHEEL_ROT_DB)   rot_exc   = rot   + WHEEL_ROT_DB;
-        // PD por eje. La D solo entra cuando el eje está activo (fuera de su
-        // zona), así el punto dulce no recibe amortiguación que pelee con el
-        // balance. Signo '+' (ver arriba).
-        float trans_trim = 0.0f, rot_trim = 0.0f;
-        if (trans_exc != 0.0f) trans_trim = WHEEL_TRANS_KP*trans_exc + WHEEL_TRANS_KD*v_trans;
-        if (rot_exc   != 0.0f) rot_trim   = WHEEL_ROT_KP*rot_exc     + WHEEL_ROT_KD*v_rot;
-        // Recomposición: derecha = trans+rot, izquierda = trans−rot.
-        wheel_trim_r = clampf_local(trans_trim + rot_trim, -WHEEL_TRIM_MAX, WHEEL_TRIM_MAX);
-        wheel_trim_l = clampf_local(trans_trim - rot_trim, -WHEEL_TRIM_MAX, WHEEL_TRIM_MAX);
-        // Si alguna vez SE ALEJA del ancla en vez de volver, es el signo:
-        // poné '−' delante de trans_trim y rot_trim.
+        float rot   = 0.5f * (float)(drift_r - drift_l);        // [counts] el robot giró
+        float v_rot = 0.5f * (wheel_spd_r_f - wheel_spd_l_f);   // [rps]
+        // Exceso fuera de la zona muerta (continuo en el borde: 0 adentro).
+        float rot_exc = 0.0f;
+        if      (rot >  WHEEL_ROT_DB) rot_exc = rot - WHEEL_ROT_DB;
+        else if (rot < -WHEEL_ROT_DB) rot_exc = rot + WHEEL_ROT_DB;
+        // PD: la D solo entra con el eje activo (fuera de la zona), así el
+        // punto dulce no recibe amortiguación que pelee con el balance.
+        float rot_trim = 0.0f;
+        if (rot_exc != 0.0f) rot_trim = WHEEL_ROT_KP*rot_exc + WHEEL_ROT_KD*v_rot;
+        // Recomposición: derecha = +rot, izquierda = −rot.
+        wheel_trim_r = clampf_local( rot_trim, -WHEEL_TRIM_MAX, WHEEL_TRIM_MAX);
+        wheel_trim_l = clampf_local(-rot_trim, -WHEEL_TRIM_MAX, WHEEL_TRIM_MAX);
+        // Si alguna vez el giro SE AMPLIFICA en vez de corregirse, es el
+        // signo: negá rot_trim en las 2 líneas de arriba.
     } else {
         wheel_pos_armed = 0;
     }
