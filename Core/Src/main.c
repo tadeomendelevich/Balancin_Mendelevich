@@ -223,6 +223,14 @@ typedef enum {
 // el bamboleo lento que la zona ancha podía causar en 2026-07-10 hoy lo
 // atajan el hold + la siesta. Si aparece bamboleo lento, volver a 3.
 #define MOTOR_CMD_NEUTRAL     	4
+// Zona neutra para los modos DINÁMICOS (línea/manual/speed) (2026-07-27): la
+// zona ancha (4) + la rampa del offset son un requisito del punto dulce de
+// BALANCE_ONLY (quietud para la siesta) — pero en los otros modos debilitaban
+// los comandos medianos (5-11 PWM: un cmd 5 pasó de salir 13 a salir 6) y la
+// recuperación dinámica quedaba sub-amortiguada: bamboleo tras el giro de 90°
+// del esquive de objeto. Los modos dinámicos conservan la salida histórica:
+// zona neutra angosta y offset completo de golpe (pre-2026-07-27).
+#define MOTOR_CMD_NEUTRAL_DYN 	2
 // Rampa de la compensación de deadband (2026-07-27): apenas por encima de la
 // zona neutra el offset NO entra completo de golpe (relé de ±(cmd+db) contra
 // robot quieto = la "brusquedad" del punto dulce) sino proporcional al exceso:
@@ -2831,9 +2839,16 @@ static void Ctrl_LatchesPared(void)
         // Durante la reversa de pared el timer no corre: retroceder aleja
         // la pared de la vista del lateral a propósito (la de escape dura
         // hasta 6s y dispararía el timeout en plena maniobra válida).
+        // El reset DEBE ser 0: es el valor que la rama de abajo interpreta
+        // como "timer no arrancado". Entre el 2026-07-24 (commit 165f1ac) y
+        // el 2026-07-27 acá decía 10 — un valor no-nulo que salteaba el
+        // arranque del timer, así que al perder la pared se evaluaba
+        // HAL_GetTick()-10 (≈ el uptime) contra los 5s y el GIVEN_UP saltaba
+        // INSTANTÁNEAMENTE, en vez de dar los 5s de gracia para girar a
+        // buscarla.
         if (obj_wall_rev_latch ||
             (float)adcAvg[OBJ_WALL_ADC_IDX] < OBJ_WALL_THRESHOLD) {
-            obj_wall_missing_since_ms = 10;
+            obj_wall_missing_since_ms = 0;
         } else {
             if (obj_wall_missing_since_ms == 0) {
                 obj_wall_missing_since_ms = HAL_GetTick();
@@ -4278,11 +4293,18 @@ static void Ctrl_SetpointDinamico(void)
     // contabilidad del freno queda intacta.
     {
         static float wheel_station_corr_f = 0.0f;
-        float ws_delta = wheel_station_corr - wheel_station_corr_f;
-        const float WS_STEP = 0.4f;
-        if (ws_delta >  WS_STEP) ws_delta =  WS_STEP;
-        if (ws_delta < -WS_STEP) ws_delta = -WS_STEP;
-        wheel_station_corr_f += ws_delta;
+        if (!wheel_pos_armed) {
+            // Estación desarmada (cambio de modo/caída): sin residuo — el
+            // slew no debe arrastrar corrección vieja al setpoint del modo
+            // nuevo (línea/manual) ni a la re-entrada a balance.
+            wheel_station_corr_f = 0.0f;
+        } else {
+            float ws_delta = wheel_station_corr - wheel_station_corr_f;
+            const float WS_STEP = 0.4f;
+            if (ws_delta >  WS_STEP) ws_delta =  WS_STEP;
+            if (ws_delta < -WS_STEP) ws_delta = -WS_STEP;
+            wheel_station_corr_f += ws_delta;
+        }
         dynamic_setpoint_f = clampf_local(dynamic_setpoint_f + wheel_station_corr_f,
                                           -sp_limit, sp_limit);
     }
@@ -6339,7 +6361,12 @@ static void Ctrl_MotoresBalance(void)
     // (3.57 rps) entra como ~0.7 y se desvanece, en vez de un escalón.
     wheel_spd_r_f += WHEEL_SPD_BETA * (speed_right_rps_s - wheel_spd_r_f);
     wheel_spd_l_f += WHEEL_SPD_BETA * (speed_left_rps_s  - wheel_spd_l_f);
-    if (wheel_pi_enabled) {
+    // Gate de modo (2026-07-27): Ctrl_MotoresBalance también atiende
+    // BALANCE_AND_SPEED, pero la estación es SOLO de BALANCE_ONLY/IDLE
+    // (igual que su eje de traslación en la etapa 12) — en SPEED anclaría
+    // el rumbo a la pose de entrada y pelearía contra la maniobra.
+    if (wheel_pi_enabled && (robot_state == ROBOT_STATE_BALANCE_ONLY ||
+                             robot_state == ROBOT_STATE_IDLE)) {
         // Recaptura el ancla al (re)entrar a balance: la pose actual pasa a
         // ser el "cero" (posición y rumbo) que la estación intenta sostener.
         // El eje de traslación (etapa 12) usa esta MISMA ancla.
@@ -6573,25 +6600,37 @@ static void Ctrl_SalidaMotores(void)
         int16_t dbL = (now_db - wheel_l_last_tick_ms < WHEEL_MOVING_WINDOW_MS)
                     ? MOTOR_DEADBAND_KINETIC : MOTOR_LEFT_DEADBAND;
 
+        // Salida suave (zona neutra ancha + offset rampeado) SOLO en
+        // BALANCE_ONLY — ver MOTOR_CMD_NEUTRAL_DYN. En los modos dinámicos
+        // la compensación entra completa de golpe, como siempre.
+        uint8_t out_soft = (robot_state == ROBOT_STATE_BALANCE_ONLY);
+        int16_t neutral  = out_soft ? MOTOR_CMD_NEUTRAL : MOTOR_CMD_NEUTRAL_DYN;
+
         int16_t mR_comp = motorRightVelocity;
-        if (mR_comp >= -MOTOR_CMD_NEUTRAL && mR_comp <= MOTOR_CMD_NEUTRAL) mR_comp = 0;
+        if (mR_comp >= -neutral && mR_comp <= neutral) mR_comp = 0;
         if (mR_comp != 0) {
             // Offset rampeado (ver MOTOR_DB_RAMP_GAIN): proporcional al exceso
             // sobre la zona neutra, con techo en el deadband de la rueda.
-            int16_t magR = (int16_t)((mR_comp > 0 ? mR_comp : -mR_comp) - MOTOR_CMD_NEUTRAL);
-            int16_t cR   = (int16_t)(magR * MOTOR_DB_RAMP_GAIN);
-            if (cR > dbR) cR = dbR;
+            int16_t cR = dbR;
+            if (out_soft) {
+                int16_t magR = (int16_t)((mR_comp > 0 ? mR_comp : -mR_comp) - neutral);
+                cR = (int16_t)(magR * MOTOR_DB_RAMP_GAIN);
+                if (cR > dbR) cR = dbR;
+            }
             mR_comp = (mR_comp > 0) ? (int16_t)(mR_comp + cR) : (int16_t)(mR_comp - cR);
         }
         if (mR_comp >  100) mR_comp =  100;
         if (mR_comp < -100) mR_comp = -100;
 
         int16_t mL_comp = -motorLeftVelocity;
-        if (mL_comp >= -MOTOR_CMD_NEUTRAL && mL_comp <= MOTOR_CMD_NEUTRAL) mL_comp = 0;
+        if (mL_comp >= -neutral && mL_comp <= neutral) mL_comp = 0;
         if (mL_comp != 0) {
-            int16_t magL = (int16_t)((mL_comp > 0 ? mL_comp : -mL_comp) - MOTOR_CMD_NEUTRAL);
-            int16_t cL   = (int16_t)(magL * MOTOR_DB_RAMP_GAIN);
-            if (cL > dbL) cL = dbL;
+            int16_t cL = dbL;
+            if (out_soft) {
+                int16_t magL = (int16_t)((mL_comp > 0 ? mL_comp : -mL_comp) - neutral);
+                cL = (int16_t)(magL * MOTOR_DB_RAMP_GAIN);
+                if (cL > dbL) cL = dbL;
+            }
             mL_comp = (mL_comp > 0) ? (int16_t)(mL_comp + cL) : (int16_t)(mL_comp - cL);
         }
         if (mL_comp >  100) mL_comp =  100;
