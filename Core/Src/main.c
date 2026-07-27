@@ -141,6 +141,32 @@ typedef enum {
 #define BALANCE_HOLD_EXIT_ANGLE_DEG   0.45f  // sale de hold si |error| >= este valor
 #define BALANCE_HOLD_ENTER_GYRO_DPS   2.0f   // entra en hold si |gyro| <= este valor
 #define BALANCE_HOLD_EXIT_GYRO_DPS    6.0f   // sale de hold si |gyro| >= este valor
+// Siesta de motores en el punto dulce (2026-07-26, solo BALANCE_ONLY): un
+// nivel MÁS profundo que el hold — con el hold activo, el comando ya chico y
+// los encoders quietos un rato, el PWM va a 0 REAL (ni siquiera el salto de
+// deadband): cero desgaste, cero vibración, el robot se sostiene por
+// equilibrio mecánico. Despierta al INSTANTE con cualquiera de: salida del
+// hold (error>=0.45° / gyro>=6°/s), un solo tick de encoder (te empujaron) o
+// gyro >= WAKE_GYRO (te estás cayendo — umbral MÁS fino que el exit del hold
+// para recuperar autoridad antes). La lección del 2026-07-10 (matar motores
+// en zona ancha => bamboleo) se respeta: la siesta requiere condiciones mucho
+// más estrictas que aquel hold viejo y se despierta con más sensibilidad.
+// 2ª forma (2026-07-26): la 1ª exigía hold activo + 250ms sin UN tick +
+// |pwm|<=4 — la propia vibración de las correcciones impedía cumplirlo
+// (círculo vicioso: no duerme porque vibra, vibra porque no duerme) y si el
+// robot paraba con 0.3-0.5° de error residual el hold nunca entraba. Ahora la
+// siesta tiene ventana PROPIA (desacoplada del hold) y más generosa.
+// 3ª pasada de permisividad (2026-07-26): la siesta funciona ADEMÁS como
+// asentador del vaivén final — en cada extremo de la oscilación la velocidad
+// pasa por ~0; si la siesta lo pesca ahí (ventanas cortas), corta motores y
+// la fricción estática mata la oscilación en 2-3 cruces en vez de ~15.
+#define MOTOR_SLEEP_ANG_ENTER     0.80f  // ° de error: adentro puede dormir (aunque el hold no haya entrado)
+#define MOTOR_SLEEP_GYRO_ENTER    5.0f   // °/s: casi sin rotar para dormir (3→4→5: entrar más fácil)
+#define MOTOR_SLEEP_ENTER_MS      80     // condiciones sostenidas este tiempo → dormir (200→150→80)
+#define MOTOR_SLEEP_CMD_MAX       15.0f  // |pwm_sat| <= esto se considera "sin trabajo real" (8→12→15)
+#define MOTOR_SLEEP_ENC_QUIET_MS  60     // sin ticks de encoder en esta ventana (120→100→60)
+#define MOTOR_SLEEP_WAKE_GYRO     4.0f   // °/s: se está cayendo → despertar
+#define MOTOR_SLEEP_ANG_WAKE      1.0f   // ° de error: derivó demasiado → despertar
 
 // Complementary Filter / PID timing
 #define ALPHA 0.98f
@@ -3515,40 +3541,74 @@ static void Ctrl_CambiosDeEstado(void)
 // La ROTACIÓN sí queda en PWM diferencial (ver Ctrl_MotoresBalance): girar
 // las ruedas en sentidos opuestos no afecta el pitch, ahí el trim no pelea
 // con el balance.
-#define WHEEL_STATION_ANG_KP   0.06f  // ° por count de exceso (= OBJ_PAUSA_POS_KP, ≈1° cada 10 cm)
-#define WHEEL_STATION_DAMP     0.45f  // ° por rps de velocidad de traslación (0.25→0.45 el
-                                      // 2026-07-26: con 0.25 el vaivén no crecía pero tampoco
-                                      // moría — ciclo límite por stick-slip de motores; si
-                                      // aparece jitter en el punto dulce, bajar de a 0.05)
-#define WHEEL_STATION_ANG_MAX  2.0f   // tope de la corrección (°)
-#define WHEEL_TRANS_DB         10     // zona muerta traslación [counts] (~6 cm): ANCHA,
-                                      // adentro el resorte (P) es 0 exacto
+#define WHEEL_STATION_ANG_KP   0.05f  // ° por count de desplazamiento reciente (0.08→0.05 el
+                                      // 2026-07-26: el resorte fuerte + D ciega en chico = vaivén
+                                      // perpetuo; resorte blando inyecta menos energía)
+#define WHEEL_STATION_DAMP     1.00f  // ° por rps de velocidad de traslación (1.20→1.00 el
+                                      // 2026-07-27: con 1.20 + V_DB 0.15 el pico de un count
+                                      // suelto generaba ~0.66° de salto de setpoint → el robot
+                                      // nunca se quedaba quieto ni entraba a la siesta; los ~15
+                                      // cruces los asienta la siesta, no hace falta tanta D)
+#define WHEEL_STATION_ANG_MAX  2.5f   // tope de la corrección (2.0→2.5: más autoridad de frenado)
+#define WHEEL_TRANS_DB         3      // counts de desplazamiento reciente sin corregir (ruido)
+#define WHEEL_V_DB_RPS         0.25f  // rps sin corregir (0.15→0.25 el 2026-07-27, vuelve al valor
+                                      // validado del 2026-07-26): con 0.15 el pico de ~0.7 rps de
+                                      // un count suelto pasaba casi entero por la zona muerta y la
+                                      // D lo convertía en un pateo de setpoint — el robot nunca
+                                      // juntaba los 140ms de quietud que pide la siesta (círculo
+                                      // vicioso: cada tick → corrección → movimiento → más ticks).
+                                      // Con 0.25 el pico residual (0.45 rps) genera ≤0.45° breve
+                                      // y el vaivén real (0.3-0.7 rps) sigue cubierto
+#define WHEEL_DISP_LEAK        0.998f // fuga del desplazamiento: τ≈5s a 100 Hz (0.995→0.998 el
+                                      // 2026-07-27): con τ≈2s una deriva lenta <1.5 counts/s
+                                      // (~5 mm/s) NUNCA acumulaba más que WHEEL_TRANS_DB — la
+                                      // fuga drenaba más rápido de lo que la deriva sumaba y el
+                                      // robot "se iba de a poco" sin corrección. Con τ≈5s el
+                                      // umbral de deriva invisible baja a ~0.6 counts/s (~2 mm/s)
 
 // Corrección de setpoint para mantener la estación (solo BALANCE/IDLE).
 // Gate con wheel_pos_armed: el ancla se estampa en Ctrl_MotoresBalance
 // (que corre DESPUÉS en el ciclo) — el primer ciclo no corrige, mismo
 // patrón que el hold de PAUSA_GIRO. PD:
 //   • P sobre el EXCESO fuera de la zona muerta (continuo en el borde).
-//   • D SIEMPRE activa (2026-07-26): sin amortiguación propia el resorte,
-//     a través del retardo del balance, bombeaba un vaivén adelante/atrás
-//     de amplitud CRECIENTE (reportado en el robot: "comienza quieto y
-//     termina moviéndose muchos centímetros"). El freno de
+//   • D activa mientras el robot se mueve (2026-07-26): sin amortiguación
+//     propia el resorte, a través del retardo del balance, bombeaba un
+//     vaivén adelante/atrás de amplitud CRECIENTE. El freno de
 //     ComputeBrakeSetpointTarget no sirve acá: su deadband de 0.35 m/s
 //     está por encima de estas velocidades. Se amortigua con la velocidad
 //     EMA por rueda (wheel_spd_*_f, actualizada en Ctrl_MotoresBalance el
 //     ciclo anterior), que sí ve movimientos chicos. + = avance, mismo
 //     signo que el P (mapa lineal del diseño PWM verificado).
+//   • Sin I, a propósito: un integrador de posición acumularía durante el
+//     vaivén natural del balance y pelearía contra él (el modo de falla
+//     del primer diseño por velocidad). El único I de la estación está en
+//     el heading-hold de yaw, donde sí corresponde.
+//   • SIN ANCLA (2026-07-26, rediseño final): el objetivo NO es volver a
+//     un lugar — es VELOCIDAD CERO donde sea ("quedate quieto donde
+//     estés"). Los diseños con ancla fija + zona muerta + latch generaban
+//     el dilema resorte-vs-vaivén y nunca asentaban bien. Ahora:
+//       - D: amortigua la velocidad EMA, con zona muerta de 0.8 rps para
+//         que el pico de ~0.7 rps de un count suelto NO genere corrección
+//         (cero temblor en reposo). Es quien mata los empujones.
+//       - "P": desplazamiento RECIENTE con fuga (τ≈2s) — un ancla FLOTANTE
+//         que sigue al robot. Frena el arrastre lento que se escapa por
+//         debajo de la zona muerta de la D, pero se olvida del lugar: tras
+//         un empujón el robot queda donde la velocidad murió, sin insistir
+//         en volver al punto original. En reposo la fuga lo lleva a 0 y la
+//         corrección desaparece sola (equilibrio mecánico, sin latch).
 static float WheelStation_AngleCorr(void)
 {
-    if (!wheel_pi_enabled || !wheel_pos_armed) return 0.0f;
-    float trans = 0.5f * (float)((enc_r - wheel_pos_anchor_r) +
-                                 (enc_l - wheel_pos_anchor_l));
-    float exc = 0.0f;
-    if      (trans >  WHEEL_TRANS_DB) exc = trans - WHEEL_TRANS_DB;
-    else if (trans < -WHEEL_TRANS_DB) exc = trans + WHEEL_TRANS_DB;
+    static float wheel_disp_f = 0.0f;   // desplazamiento reciente con fuga [counts]
+    if (!wheel_pi_enabled || !wheel_pos_armed) { wheel_disp_f = 0.0f; return 0.0f; }
+
+    wheel_disp_f = wheel_disp_f * WHEEL_DISP_LEAK
+                 + 0.5f * (float)(delta_right + delta_left);
     float v_trans = 0.5f * (wheel_spd_r_f + wheel_spd_l_f);   // [rps]
-    return clampf_local(-(WHEEL_STATION_ANG_KP * exc +
-                          WHEEL_STATION_DAMP   * v_trans),
+
+    float v_act = apply_deadbandf(v_trans, WHEEL_V_DB_RPS);
+    float d_act = apply_deadbandf(wheel_disp_f, (float)WHEEL_TRANS_DB);
+    return clampf_local(-(WHEEL_STATION_ANG_KP * d_act +
+                          WHEEL_STATION_DAMP   * v_act),
                         -WHEEL_STATION_ANG_MAX, WHEEL_STATION_ANG_MAX);
 }
 
@@ -3562,6 +3622,7 @@ static void Ctrl_SetpointDinamico(void)
 {
     float base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
     float brake_setpoint_target = 0.0f;
+    float wheel_station_corr    = 0.0f;  // estación por rueda: se aplica POST-rampa (ver el final)
 
     if (robot_state == ROBOT_STATE_LINE_FOLLOWING && !manual_line_override) {
         if (line_state == LINE_STATE_FOLLOWING && line_detected_raw) {
@@ -4045,14 +4106,16 @@ static void Ctrl_SetpointDinamico(void)
         base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
     } else if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
         // BALANCE_ONLY: tilt setpoint against velocity to brake post-push drift
-        // + estación por rueda: inclinación proporcional a la deriva de
-        // posición para volver al ancla (ver WheelStation_AngleCorr arriba).
-        base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim + WheelStation_AngleCorr();
+        // + estación por rueda: inclinación contra deriva/velocidad, aplicada
+        // POST-rampa al final de la función (ver ahí por qué).
+        base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
+        wheel_station_corr    = WheelStation_AngleCorr();
         brake_setpoint_target = ComputeBrakeSetpointTarget(robot_state);
     } else {
         // IDLE-activo balancea con Ctrl_MotoresBalance → misma estación.
         // (MOTOR_TEST también cae acá pero su setpoint no llega a motores.)
-        base_setpoint_target = SETPOINT_ANGLE + setpoint_trim + WheelStation_AngleCorr();
+        base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
+        wheel_station_corr   = WheelStation_AngleCorr();
     }
 
     // Clamp global de setpoint. MANUAL_CONTROL necesita su propia excepción
@@ -4127,6 +4190,26 @@ static void Ctrl_SetpointDinamico(void)
             dynamic_setpoint_f = -LINE_BRAKE_ANGLE_MAX;
     }
     brake_setpoint_f   = dynamic_setpoint_f - base_setpoint_f;
+
+    // Estación por rueda: corrección POST-rampa (2026-07-27). Antes viajaba
+    // dentro de base_setpoint_target y quedaba sometida a la rampa de
+    // sp_step_max=0.1°/ciclo: una corrección de 1° tardaba 100ms en llegar
+    // (+~50ms de la EMA de velocidad) — la D llegaba con el vaivén ya
+    // invertido de fase y en vez de amortiguar BOMBEABA (el "reacciona
+    // tarde"). Slew propio 4x más rápido (0.4°/ciclo): sigue el movimiento
+    // real casi sin retraso y solo recorta el escalón instantáneo que mete
+    // un count suelto de encoder. No toca base/brake_setpoint_f: la
+    // contabilidad del freno queda intacta.
+    {
+        static float wheel_station_corr_f = 0.0f;
+        float ws_delta = wheel_station_corr - wheel_station_corr_f;
+        const float WS_STEP = 0.4f;
+        if (ws_delta >  WS_STEP) ws_delta =  WS_STEP;
+        if (ws_delta < -WS_STEP) ws_delta = -WS_STEP;
+        wheel_station_corr_f += ws_delta;
+        dynamic_setpoint_f = clampf_local(dynamic_setpoint_f + wheel_station_corr_f,
+                                          -sp_limit, sp_limit);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -6410,6 +6493,42 @@ static void Ctrl_SalidaMotores(void)
         else if (mL_comp < 0)  mL_comp = (int16_t)( mL_comp - dbL);
         if (mL_comp >  100) mL_comp =  100;
         if (mL_comp < -100) mL_comp = -100;
+
+        // ── Siesta de motores en el punto dulce (ver MOTOR_SLEEP_*) ──────
+        {
+            static uint8_t  motor_sleep_active      = 0;
+            static uint32_t motor_sleep_ok_since_ms = 0;
+            uint8_t enc_quiet =
+                (now_db - wheel_r_last_tick_ms > MOTOR_SLEEP_ENC_QUIET_MS) &&
+                (now_db - wheel_l_last_tick_ms > MOTOR_SLEEP_ENC_QUIET_MS);
+
+            if (motor_sleep_active) {
+                // Despertar: cualquier señal de movimiento o caída.
+                if (robot_state != ROBOT_STATE_BALANCE_ONLY ||
+                    !enc_quiet ||                  // un tick = alguien lo movió
+                    fabsf(gyro_f) >= MOTOR_SLEEP_WAKE_GYRO ||
+                    fabsf(error)  >= MOTOR_SLEEP_ANG_WAKE) {
+                    motor_sleep_active      = 0;
+                    motor_sleep_ok_since_ms = 0;
+                }
+            } else if (robot_state == ROBOT_STATE_BALANCE_ONLY &&
+                       fabsf(error)  <= MOTOR_SLEEP_ANG_ENTER &&
+                       fabsf(gyro_f) <= MOTOR_SLEEP_GYRO_ENTER &&
+                       enc_quiet &&
+                       fabsf(pwm_sat) <= MOTOR_SLEEP_CMD_MAX) {
+                if (motor_sleep_ok_since_ms == 0)
+                    motor_sleep_ok_since_ms = now_db;
+                else if (now_db - motor_sleep_ok_since_ms >= MOTOR_SLEEP_ENTER_MS)
+                    motor_sleep_active = 1;
+            } else {
+                motor_sleep_ok_since_ms = 0;
+            }
+
+            if (motor_sleep_active) {
+                mR_comp = 0;
+                mL_comp = 0;
+            }
+        }
 
         MotorControl(mR_comp, mL_comp);
     } else {
