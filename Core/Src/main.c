@@ -160,7 +160,7 @@ typedef enum {
 // asentador del vaivén final — en cada extremo de la oscilación la velocidad
 // pasa por ~0; si la siesta lo pesca ahí (ventanas cortas), corta motores y
 // la fricción estática mata la oscilación en 2-3 cruces en vez de ~15.
-#define MOTOR_SLEEP_ANG_ENTER     0.80f  // ° de error: adentro puede dormir (aunque el hold no haya entrado)
+#define MOTOR_SLEEP_ANG_ENTER     1.6f  // ° de error: adentro puede dormir (aunque el hold no haya entrado)
 #define MOTOR_SLEEP_GYRO_ENTER    5.0f   // °/s: casi sin rotar para dormir (3→4→5: entrar más fácil)
 #define MOTOR_SLEEP_ENTER_MS      80     // condiciones sostenidas este tiempo → dormir (200→150→80)
 #define MOTOR_SLEEP_CMD_MAX       15.0f  // |pwm_sat| <= esto se considera "sin trabajo real" (8→12→15)
@@ -216,7 +216,23 @@ typedef enum {
 // deadband amplifica el ruido) — el "temblor" en balance. Subir de a 1 si sigue
 // temblando; demasiado alto y el robot bambolea lento (el PID pierde autoridad
 // fina cerca del equilibrio y corrige recién con error más grande).
-#define MOTOR_CMD_NEUTRAL     	2
+// 2026-07-27: 2→4. En el punto dulce el PID emite comandos de 3-6 PWM que con
+// la rueda parada saltaban a 11-14 (patada de fricción estática) → sacudida →
+// gyro>5°/s + ticks → la ventana de la siesta se reseteaba SIEMPRE. Con 4, ese
+// chatter va a 0 real (motores quietos, sin ticks) y la siesta puede entrar;
+// el bamboleo lento que la zona ancha podía causar en 2026-07-10 hoy lo
+// atajan el hold + la siesta. Si aparece bamboleo lento, volver a 3.
+#define MOTOR_CMD_NEUTRAL     	4
+// Rampa de la compensación de deadband (2026-07-27): apenas por encima de la
+// zona neutra el offset NO entra completo de golpe (relé de ±(cmd+db) contra
+// robot quieto = la "brusquedad" del punto dulce) sino proporcional al exceso:
+// comp = min(db, (|cmd|-NEUTRAL) × RAMP_GAIN). Con gain 1 y db estático 8, el
+// offset completo recién entra con |cmd| ≥ NEUTRAL+8 (=12) — toda la franja de
+// correcciones chicas del punto dulce empuja suave en vez de patear. Comandos
+// grandes (empujón real) no cambian. (2→1 el 2026-07-27: validado con 2
+// "quedó mucho mejor", el usuario pidió aún más suavidad; si quedara flojo
+// para arrancar la rueda en correcciones medianas, volver a 2.)
+#define MOTOR_DB_RAMP_GAIN    	1
 #define KV_BRAKE                0.8f  // ganancia base del freno traslacional
 #define KV_BRAKE_STRONG         6.0f  // ganancia extra por encima del umbral
 #define BRAKE_VEL_THRESHOLD     1.0f  // velocidad a partir de la cual se aplica el freno fuerte
@@ -3549,7 +3565,24 @@ static void Ctrl_CambiosDeEstado(void)
                                       // suelto generaba ~0.66° de salto de setpoint → el robot
                                       // nunca se quedaba quieto ni entraba a la siesta; los ~15
                                       // cruces los asienta la siesta, no hace falta tanta D)
-#define WHEEL_STATION_ANG_MAX  2.5f   // tope de la corrección (2.0→2.5: más autoridad de frenado)
+#define WHEEL_STATION_ANG_MAX  1.5f   // tope de la corrección (2.5→1.5 el 2026-07-27): el freno de
+                                      // la D es proporcional a v (1°/rps) — la proporcionalidad se
+                                      // mantiene, solo baja el TECHO. Con 2.5° el empujón fuerte
+                                      // apilaba estación + freno clásico (ComputeBrakeSetpoint-
+                                      // Target) y el total volcaba al robot; con 1.5° el freno
+                                      // sigue firme pero el balance conserva margen para
+                                      // sobrevivir. Si aún vuelca con empujón fuerte → 1.5→1.2;
+                                      // si frena poco → 1.5→1.8
+#define WHEEL_STATION_P_MAX    0.5f   // tope PROPIO del término P (2026-07-27): tras un empujón el
+                                      // desplazamiento reciente llega enorme (~90 counts por 30cm
+                                      // × 0.05°/count = 4.5°) y saturaba el tope general de 2.5° —
+                                      // al frenar en el punto dulce la D muere pero ese P seguía
+                                      // empujando 2.5° de vuelta durante segundos (τ≈5s de la
+                                      // fuga): brusco, se pasaba del equilibrio y el error nunca
+                                      // bajaba de los 0.8° de la siesta. El P existe solo para
+                                      // frenar deriva LENTA (~mm/s) — con 0.5° alcanza y queda
+                                      // debajo del umbral de entrada de la siesta; la autoridad
+                                      // grande (2.5°) es de la D, que sí debe pegar en empujones
 #define WHEEL_TRANS_DB         3      // counts de desplazamiento reciente sin corregir (ruido)
 #define WHEEL_V_DB_RPS         0.25f  // rps sin corregir (0.15→0.25 el 2026-07-27, vuelve al valor
                                       // validado del 2026-07-26): con 0.15 el pico de ~0.7 rps de
@@ -3559,6 +3592,34 @@ static void Ctrl_CambiosDeEstado(void)
                                       // vicioso: cada tick → corrección → movimiento → más ticks).
                                       // Con 0.25 el pico residual (0.45 rps) genera ≤0.45° breve
                                       // y el vaivén real (0.3-0.7 rps) sigue cubierto
+// Factor de CALMA (2026-07-27, reemplaza a la rodilla WHEEL_V_SOFT_KNEE):
+// atenuación GLOBAL de toda la estación (P y D juntos) según cuánta
+// actividad real hay: calm = max(|gyro|/GYRO_REF, |v_trans|/V_REF),
+// clampeado a 1. Cuerpo quieto (gyro→0, v→0) → calm→0 → estación MUDA:
+// cero perturbación de setpoint en el punto dulce, el PID de balance +
+// hold + siesta son los dueños de esa zona. Un empujón dispara el gyro
+// al instante → estación entera sin retraso (el gyro no tiene la lag de
+// los encoders). Suavizar término por término (rodilla de la D, tope del
+// P, drenaje) no alcanzó: siempre quedaba alguno activo perturbando.
+// Knobs: sigue brusco en el punto dulce → subir REFs (más atenuación en
+// calma); no amortigua llegadas suaves → bajar GYRO_REF a 6.
+#define WHEEL_CALM_GYRO_REF    8.0f   // °/s a los que calm llega a 1 por gyro
+#define WHEEL_CALM_V_REF       1.0f   // rps a los que calm llega a 1 por velocidad
+// (El "fade de supervivencia" del 2026-07-27 se probó y se ELIMINÓ el mismo
+// día: gateaba por gyro>40°/s, pero cualquier recuperación normal de empujón
+// supera eso — la estación quedaba muda casi siempre y no frenaba nada. El
+// exceso en empujones fuertes se resuelve con el techo WHEEL_STATION_ANG_MAX,
+// no apagando el freno.)
+#define WHEEL_DISP_CALM_MS     150    // ms sin un tick en AMBAS ruedas (+ v bajo la zona muerta)
+                                      // para declarar reposo real y drenar rápido (2026-07-27)
+#define WHEEL_DISP_FAST_LEAK   0.90f  // fuga en reposo real: τ≈100ms — el residuo del P muere en
+                                      // ~0.3s de quietud. Sin esto, el residuo (hasta 0.5°) se
+                                      // drenaba con τ≈5s y mantenía al robot GATEANDO de vuelta:
+                                      // cada tick del gateo reseteaba la ventana de la siesta →
+                                      // no entraba nunca. La deriva lenta REAL (cuesta abajo,
+                                      // ~cm/s) tiquea cada <150ms y NO dispara el drenaje — el P
+                                      // anti-deriva sigue vivo ahí. Filosofía sin ancla: quieto de
+                                      // verdad = no hay ningún lado adonde volver
 #define WHEEL_DISP_LEAK        0.998f // fuga del desplazamiento: τ≈5s a 100 Hz (0.995→0.998 el
                                       // 2026-07-27): con τ≈2s una deriva lenta <1.5 counts/s
                                       // (~5 mm/s) NUNCA acumulaba más que WHEEL_TRANS_DB — la
@@ -3605,10 +3666,25 @@ static float WheelStation_AngleCorr(void)
                  + 0.5f * (float)(delta_right + delta_left);
     float v_trans = 0.5f * (wheel_spd_r_f + wheel_spd_l_f);   // [rps]
 
+    // Reposo real → drenaje rápido de la memoria (ver WHEEL_DISP_FAST_LEAK).
+    uint32_t now_ws = HAL_GetTick();
+    if (fabsf(v_trans) < WHEEL_V_DB_RPS &&
+        (now_ws - wheel_r_last_tick_ms) > WHEEL_DISP_CALM_MS &&
+        (now_ws - wheel_l_last_tick_ms) > WHEEL_DISP_CALM_MS) {
+        wheel_disp_f *= WHEEL_DISP_FAST_LEAK;
+    }
+
     float v_act = apply_deadbandf(v_trans, WHEEL_V_DB_RPS);
     float d_act = apply_deadbandf(wheel_disp_f, (float)WHEEL_TRANS_DB);
-    return clampf_local(-(WHEEL_STATION_ANG_KP * d_act +
-                          WHEEL_STATION_DAMP   * v_act),
+    // Factor de calma (ver WHEEL_CALM_*): 0 = quieto → estación muda.
+    float calm = fmaxf(fabsf(gyro_f)  / WHEEL_CALM_GYRO_REF,
+                       fabsf(v_trans) / WHEEL_CALM_V_REF);
+    if (calm > 1.0f) calm = 1.0f;
+    // P con tope propio chico (ver WHEEL_STATION_P_MAX): solo anti-deriva.
+    float p_term = clampf_local(WHEEL_STATION_ANG_KP * d_act,
+                                -WHEEL_STATION_P_MAX, WHEEL_STATION_P_MAX);
+    return clampf_local(-(p_term +
+                          WHEEL_STATION_DAMP * v_act) * calm,
                         -WHEEL_STATION_ANG_MAX, WHEEL_STATION_ANG_MAX);
 }
 
@@ -6244,6 +6320,17 @@ static void Ctrl_MotoresBalance(void)
     #define WHEEL_YAW_DB        1.0f    // ° de rumbo sin corregir (tolerancia a ruido)
     #define WHEEL_YAW_MAX       20.0f   // tope del P en °/s eq (12→20 el 2026-07-26: ×0.23 → ~4.6% PWM dif.)
     #define WHEEL_YAW_INT_MAX   15.0f   // tope del I en °/s eq (~3.5% PWM diferencial)
+    // Calma ROTACIONAL (2026-07-27, mismo patrón que WHEEL_CALM_* de la
+    // traslación): con el cuerpo sin girar de verdad, el canal diferencial
+    // entero (heading-hold PI + PD de rotación) se atenúa a ~0. Sin esto, el
+    // contra-torque del integrador de yaw (que se conserva a propósito) más
+    // el P de rotación quedaban empujando un diferencial CONSTANTE en el
+    // punto dulce: una rueda justo arriba de MOTOR_CMD_NEUTRAL moviéndose
+    // sin parar (la derecha) y la otra muda — rompía el equilibrio y la
+    // siesta. Girando de verdad (|yaw_rate| o |v_rot| altos) → canal entero.
+    #define WHEEL_ROTCALM_GYRO_REF  2.0f   // °/s de yaw a los que la calma llega a 1
+    #define WHEEL_ROTCALM_V_REF     0.5f   // rps de semidiferencia a los que llega a 1
+    #define WHEEL_ROTCALM_INT_GATE  0.3f   // el I solo acumula con calma > esto (anti-windup en reposo)
     #define WHEEL_TRIM_MAX   8.0f   // tope del trim por rueda: nunca domina a pwm_sat
     #define WHEEL_SPD_BETA   0.20f  // EMA de velocidad por rueda (τ≈50ms): D sin ruido de cuantización
     float wheel_trim_r = 0.0f;   // para la rueda DERECHA  (se suma a mL)
@@ -6263,24 +6350,30 @@ static void Ctrl_MotoresBalance(void)
             wheel_yaw_int      = 0.0f;   // contra-torque acumulado también a 0
             wheel_pos_armed    = 1;
         }
+        int32_t drift_r = enc_r - wheel_pos_anchor_r;   // deriva neta rueda derecha [counts]
+        int32_t drift_l = enc_l - wheel_pos_anchor_l;   // deriva neta rueda izquierda
+        float rot   = 0.5f * (float)(drift_r - drift_l);        // [counts] el robot giró
+        float v_rot = 0.5f * (wheel_spd_r_f - wheel_spd_l_f);   // [rps]
+        // Calma rotacional (ver WHEEL_ROTCALM_*): 0 = sin giro real → canal
+        // diferencial mudo; 1 = girando → autoridad completa.
+        float yaw_rate = ((float)gz / 100.0f) - wheel_yaw_bias_dps;   // [°/s]
+        float rot_calm = fmaxf(fabsf(yaw_rate) / WHEEL_ROTCALM_GYRO_REF,
+                               fabsf(v_rot)    / WHEEL_ROTCALM_V_REF);
+        if (rot_calm > 1.0f) rot_calm = 1.0f;
         // Heading-hold PI: rumbo acumulado desde el ancla (gz menos el bias
         // medido en reposo) → P sobre el exceso fuera de WHEEL_YAW_DB + I
         // que acumula ese exceso, ambos al canal del yaw-assist (misma
         // escala 0.23 y mismo signo → polaridad heredada, ya validada).
-        wheel_yaw_deg += (((float)gz / 100.0f) - wheel_yaw_bias_dps) * dt_ctrl;
+        wheel_yaw_deg += yaw_rate * dt_ctrl;
         float yaw_exc = apply_deadbandf(wheel_yaw_deg, WHEEL_YAW_DB);
-        if (yaw_exc != 0.0f) {
+        if (yaw_exc != 0.0f && rot_calm > WHEEL_ROTCALM_INT_GATE) {
             wheel_yaw_int = clampf_local(wheel_yaw_int + yaw_exc * dt_ctrl,
                                          -WHEEL_YAW_INT_MAX / WHEEL_YAW_KI,
                                           WHEEL_YAW_INT_MAX / WHEEL_YAW_KI);
         }
         float yaw_hold = clampf_local(WHEEL_YAW_KP * yaw_exc, -WHEEL_YAW_MAX, WHEEL_YAW_MAX)
                        + WHEEL_YAW_KI * wheel_yaw_int;
-        correction += -yaw_hold * 0.23f;
-        int32_t drift_r = enc_r - wheel_pos_anchor_r;   // deriva neta rueda derecha [counts]
-        int32_t drift_l = enc_l - wheel_pos_anchor_l;   // deriva neta rueda izquierda
-        float rot   = 0.5f * (float)(drift_r - drift_l);        // [counts] el robot giró
-        float v_rot = 0.5f * (wheel_spd_r_f - wheel_spd_l_f);   // [rps]
+        correction += -yaw_hold * 0.23f * rot_calm;
         // Exceso fuera de la zona muerta (continuo en el borde: 0 adentro).
         float rot_exc = 0.0f;
         if      (rot >  WHEEL_ROT_DB) rot_exc = rot - WHEEL_ROT_DB;
@@ -6288,7 +6381,7 @@ static void Ctrl_MotoresBalance(void)
         // PD: la D solo entra con el eje activo (fuera de la zona), así el
         // punto dulce no recibe amortiguación que pelee con el balance.
         float rot_trim = 0.0f;
-        if (rot_exc != 0.0f) rot_trim = WHEEL_ROT_KP*rot_exc + WHEEL_ROT_KD*v_rot;
+        if (rot_exc != 0.0f) rot_trim = (WHEEL_ROT_KP*rot_exc + WHEEL_ROT_KD*v_rot) * rot_calm;
         // Recomposición: derecha = +rot, izquierda = −rot.
         wheel_trim_r = clampf_local( rot_trim, -WHEEL_TRIM_MAX, WHEEL_TRIM_MAX);
         wheel_trim_l = clampf_local(-rot_trim, -WHEEL_TRIM_MAX, WHEEL_TRIM_MAX);
@@ -6482,15 +6575,25 @@ static void Ctrl_SalidaMotores(void)
 
         int16_t mR_comp = motorRightVelocity;
         if (mR_comp >= -MOTOR_CMD_NEUTRAL && mR_comp <= MOTOR_CMD_NEUTRAL) mR_comp = 0;
-        if      (mR_comp > 0)  mR_comp = (int16_t)( mR_comp + dbR);
-        else if (mR_comp < 0)  mR_comp = (int16_t)( mR_comp - dbR);
+        if (mR_comp != 0) {
+            // Offset rampeado (ver MOTOR_DB_RAMP_GAIN): proporcional al exceso
+            // sobre la zona neutra, con techo en el deadband de la rueda.
+            int16_t magR = (int16_t)((mR_comp > 0 ? mR_comp : -mR_comp) - MOTOR_CMD_NEUTRAL);
+            int16_t cR   = (int16_t)(magR * MOTOR_DB_RAMP_GAIN);
+            if (cR > dbR) cR = dbR;
+            mR_comp = (mR_comp > 0) ? (int16_t)(mR_comp + cR) : (int16_t)(mR_comp - cR);
+        }
         if (mR_comp >  100) mR_comp =  100;
         if (mR_comp < -100) mR_comp = -100;
 
         int16_t mL_comp = -motorLeftVelocity;
         if (mL_comp >= -MOTOR_CMD_NEUTRAL && mL_comp <= MOTOR_CMD_NEUTRAL) mL_comp = 0;
-        if      (mL_comp > 0)  mL_comp = (int16_t)( mL_comp + dbL);
-        else if (mL_comp < 0)  mL_comp = (int16_t)( mL_comp - dbL);
+        if (mL_comp != 0) {
+            int16_t magL = (int16_t)((mL_comp > 0 ? mL_comp : -mL_comp) - MOTOR_CMD_NEUTRAL);
+            int16_t cL   = (int16_t)(magL * MOTOR_DB_RAMP_GAIN);
+            if (cL > dbL) cL = dbL;
+            mL_comp = (mL_comp > 0) ? (int16_t)(mL_comp + cL) : (int16_t)(mL_comp - cL);
+        }
         if (mL_comp >  100) mL_comp =  100;
         if (mL_comp < -100) mL_comp = -100;
 
