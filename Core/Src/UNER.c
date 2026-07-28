@@ -76,12 +76,23 @@ static float *p_KD_LINE = NULL;
 static float *p_KI_LINE = NULL;
 static float *p_LINE_THRES = NULL;
 static float *p_LINE_SPEED = NULL;
+static float *p_SP_LIMIT = NULL;
 
 // Limites de operacion para el objetivo de velocidad recibido desde Qt.
 // El corte de emergencia (10 m/s) sigue siendo una proteccion independiente;
 // este rango es deliberadamente mas conservador para el comando de usuario.
 #define LINE_SPEED_CMD_MIN_MPS  0.20f
-#define LINE_SPEED_CMD_MAX_MPS  4.00f
+// 2026-07-27: 4.00 -> 8.00 a pedido del usuario (queria pasar de 4 m/s desde
+// Qt y el clamp del firmware lo recortaba en silencio). Sigue por debajo del
+// corte de emergencia de 10 m/s: pedir un objetivo >= a ese corte seria
+// autodestructivo (el robot cortaria motores al alcanzarlo).
+#define LINE_SPEED_CMD_MAX_MPS  8.00f
+
+// Limites del tope de inclinacion del setpoint dinamico (0xC9). Debajo de 1
+// grado el robot no puede avanzar; arriba de 15 la zona muerta de motores
+// (35 grados) todavia queda lejos pero el balance ya es muy agresivo.
+#define SP_LIMIT_CMD_MIN_DEG    1.00f
+#define SP_LIMIT_CMD_MAX_DEG    15.00f
 
 // Limite del trim de setpoint recibido desde Qt (0xC8). El spinbox de Qt
 // permite +-180 grados; mas alla de unos pocos grados el robot no puede
@@ -648,6 +659,25 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
+        // Tope de inclinacion del setpoint dinamico [grados] (2026-07-27).
+        // Es el "sp_limit" de Ctrl_SetpointDinamico: cuanto puede inclinarse
+        // el robot para acelerar o frenar. Responde UNKNOWN si no hay binding
+        // (mismo patron que MODIFY_BETA_*), no un ACK mentiroso.
+        case MODIFY_SP_LIMIT:
+            if (p_SP_LIMIT) {
+                float new_sp_limit;
+                if (getF32BoundedFromRx(dataRx, &new_sp_limit,
+                                        SP_LIMIT_CMD_MIN_DEG, SP_LIMIT_CMD_MAX_DEG))
+                    *p_SP_LIMIT = new_sp_limit;
+                putHeaderOnTx(dataTx, MODIFY_SP_LIMIT, 2);
+                putByteOnTx(dataTx, ACK);
+            } else {
+                putHeaderOnTx(dataTx, MODIFY_SP_LIMIT, 2);
+                putByteOnTx(dataTx, UNKNOWN);
+            }
+            putByteOnTx(dataTx, dataTx->chk);
+        break;
+
         case ACTIVATE_LINE_FOLLOWING:
 			if (p_robot_state != NULL) {
 				if (*p_robot_state == 3) { // ROBOT_STATE_LINE_FOLLOWING -> BALANCE_ONLY
@@ -934,6 +964,7 @@ void UNER_RegisterBindings(const UNER_Bindings_t *b) {
     p_change_display = b->change_display;
     p_KP_LINE = b->kp_line; p_KD_LINE = b->kd_line; p_KI_LINE = b->ki_line;
     p_LINE_THRES = b->line_threshold; p_LINE_SPEED = b->line_speed;
+    p_SP_LIMIT = b->sp_limit;
     p_manual_sp_cmd = b->manual_setpoint; p_manual_st_cmd = b->manual_steering;
     p_manual_tmo = b->manual_timeout_ms;
     p_rot_target_deg = b->rotation_target_deg; p_rot_trigger = b->rotation_trigger;

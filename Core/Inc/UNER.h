@@ -84,6 +84,7 @@ typedef struct {
     float *ki_line;
     float *line_threshold;
     float *line_speed;
+    float *sp_limit;        // tope del setpoint dinámico [°] — MODIFY_SP_LIMIT (0xC9)
     float *manual_setpoint;
     float *manual_steering;
     uint32_t *manual_timeout_ms;
@@ -165,11 +166,14 @@ typedef enum{
     MODIFY_KD_LINE = 0xC1,
     MODIFY_KI_LINE = 0xC2,
     MODIFY_LINE_THRES = 0xC3,
-    MODIFY_LINE_SPEED = 0xC4,       // float32 m/s, limitado en STM32 a 0.20..4.00
+    MODIFY_LINE_SPEED = 0xC4,       // float32 m/s, limitado en STM32 a 0.20..8.00 (era 4.00 hasta 2026-07-27)
     ACTIVATE_LINE_FOLLOWING = 0xC5,
     ACTIVATE_POS_MAINTENANCE = 0xC6,
     ACTIVATE_MANUAL_CONTROL = 0xC7,
     MODIFY_SETPOINT = 0xC8,
+    MODIFY_SP_LIMIT = 0xC9,         // float32 °: tope de inclinación del setpoint dinámico
+                                    // (el "sp_limit" de Ctrl_SetpointDinamico, default 5.0°;
+                                    // rige LINE_FOLLOWING/BALANCE_ONLY/IDLE). Limitado a 1..15°
     MOVE_FORWARD = 0xD0,
     MOVE_BACKWARD = 0xD1,
     MOVE_LEFT = 0xD2,

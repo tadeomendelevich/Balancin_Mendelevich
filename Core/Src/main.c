@@ -721,6 +721,13 @@ static float line_error_trim_f = 0.1f;
 // COMPLETAR con los valores medidos:
 static const float ADC_BASELINE[4] = { 2000.0f, 1550.0f, 1370.0f, 1730.0f };  // s0, s1, s2, s3 — calibrado sobre fondo blanco
 float LINE_SPEED_TARGET = 2.5f;  // m/s objetivo en seguimiento de línea (ajustable en runtime)
+// Tope de inclinación del setpoint dinámico [°] — ajustable desde Qt con
+// MODIFY_SP_LIMIT (0xC9), limitado allá a 1..15°. Es cuánto puede inclinarse
+// el robot para acelerar o frenar en LINE_FOLLOWING / BALANCE_ONLY / IDLE
+// (MANUAL y BALANCE_AND_SPEED conservan sus topes propios, ver
+// Ctrl_SetpointDinamico). Subirlo da más autoridad de freno a velocidades
+// altas; bajarlo hace al robot más conservador.
+float SP_LIMIT_DEG = 5.0f;
 float OBJ_DETECT_THRESHOLD_f = OBJ_DETECT_THRESHOLD_VAL;  // umbral objeto, ajustable en runtime
 
 static eLineState line_state       = LINE_STATE_FOLLOWING;
@@ -4214,7 +4221,7 @@ static void Ctrl_SetpointDinamico(void)
     // silencio el tope manual a 5.0 sin que el usuario se enterara.
     float sp_limit = (robot_state == ROBOT_STATE_BALANCE_AND_SPEED) ? 2.0f
                     : (robot_state == ROBOT_STATE_MANUAL_CONTROL || manual_line_override) ? 6.0f
-                    : 5.0f;
+                    : SP_LIMIT_DEG;   // ajustable desde Qt (0xC9), default 5.0°
     base_setpoint_target = clampf_local(base_setpoint_target,
                                         -sp_limit - brake_setpoint_target,
                                          sp_limit - brake_setpoint_target);
@@ -6870,6 +6877,7 @@ int main(void)
       .change_display = &f_change_display,
       .kp_line = &KP_LINE, .kd_line = &KD_LINE, .ki_line = &KI_LINE,
       .line_threshold = &LINE_THRESHOLD, .line_speed = &LINE_SPEED_TARGET,
+      .sp_limit = &SP_LIMIT_DEG,
       .manual_setpoint = &manual_setpoint_cmd,
       .manual_steering = &manual_steering_cmd,
       .manual_timeout_ms = &manual_cmd_last_ms,
