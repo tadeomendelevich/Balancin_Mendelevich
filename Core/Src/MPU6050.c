@@ -110,7 +110,7 @@ void MPU6050_GetGyro(int16_t *gx, int16_t *gy, int16_t *gz) {
 
 void MPU6050_ProcessDMA(void) {
     // --- Procesar Acelerómetro (bytes 0-5) ---
-    int16_t raw_ax = (int16_t)(mpu_dma_buffer[0] << 8 | mpu_dma_buffer[1]);
+    int16_t raw_ax = (int16_t)(mpu_dma_buffer[0] << 8 | mpu_dma_buffer[1]);   // Recomposicion big-endian: byte alto << 8 | byte bajo
     int16_t raw_ay = (int16_t)(mpu_dma_buffer[2] << 8 | mpu_dma_buffer[3]);
     int16_t raw_az = (int16_t)(mpu_dma_buffer[4] << 8 | mpu_dma_buffer[5]);
 
@@ -124,12 +124,12 @@ void MPU6050_ProcessDMA(void) {
     // ----------------------------
     // 1) Compensa bias Acelerómetro
     // ----------------------------
-    raw_ax -= (int16_t)bias_ax;
+    raw_ax -= (int16_t)bias_ax;   // Compensacion de offset: lectura menos el cero medido
     raw_ay -= (int16_t)bias_ay;
     raw_az -= (int16_t)bias_az;
 
     // X
-    ax_real = (raw_ax * ACCEL_SCALE_C) >> 14;
+    ax_real = (raw_ax * ACCEL_SCALE_C) >> 14;   // Punto fijo Q14: multiplicar y >>14 = multiplicar por (C/16384) sin usar float
     // Y
     ay_real = (raw_ay * ACCEL_SCALE_C) >> 14;
     // Z
@@ -138,12 +138,12 @@ void MPU6050_ProcessDMA(void) {
     // ----------------------------
     // 2) Compensa bias Giroscopio
     // ----------------------------
-    raw_gx -= (int16_t)bias_gx;
+    raw_gx -= (int16_t)bias_gx;   // Compensacion de offset (el gyro quieto no marca cero exacto)
     raw_gy -= (int16_t)bias_gy;
     raw_gz -= (int16_t)bias_gz;
 
     // X
-    gx_real = (raw_gx * GYRO_SCALE_C) / GYRO_SENS;
+    gx_real = (raw_gx * GYRO_SCALE_C) / GYRO_SENS;   // Escalado entero: LSB crudos / sensibilidad -> deg/s (x100)
     // Y
     gy_real = (raw_gy * GYRO_SCALE_C) / GYRO_SENS;
     // Z
@@ -175,9 +175,9 @@ void MPU6050_Calibrate(void) {
         sum_gz += raw_gz;
         _platform->delayMs(_platform->ctx, 1);
     }
-    bias_ax = sum_ax / CALIB_SAMPLES;
+    bias_ax = sum_ax / CALIB_SAMPLES;   // Promedio aritmetico: suma / cantidad de muestras
     bias_ay = sum_ay / CALIB_SAMPLES;
-    bias_az = sum_az / CALIB_SAMPLES - ACCEL_SENS;
+    bias_az = sum_az / CALIB_SAMPLES - ACCEL_SENS;   // En Z se resta 1g: quieto DEBE marcar la gravedad, no cero
     bias_gx = sum_gx / CALIB_SAMPLES;
     bias_gy = sum_gy / CALIB_SAMPLES;
     bias_gz = sum_gz / CALIB_SAMPLES;

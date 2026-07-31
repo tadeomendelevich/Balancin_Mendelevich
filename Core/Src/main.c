@@ -992,6 +992,9 @@ static inline uint32_t micros(void) {
 /* USER CODE BEGIN 0 */
 static void SampleEncoders250us(void)
 {
+    // Tabla de transiciones de cuadratura: indice = 4*estado_anterior + estado_actual
+    // (2 bits A:B cada uno). +1 = giro en un sentido, -1 = el otro, 0 = sin cambio
+    // o salto imposible (ruido). Sustituye a un if/else de 16 casos.
     static const int8_t quad_delta[16] = {
          0, -1, +1,  0,
         +1,  0,  0, -1,
@@ -1004,7 +1007,7 @@ static void SampleEncoders250us(void)
     uint8_t la = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14);
     uint8_t lb = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_15);
 
-    uint8_t right_state = (uint8_t)((ra << 1) | rb);
+    uint8_t right_state = (uint8_t)((ra << 1) | rb);   // Empaqueta A y B en un numero de 2 bits (0..3)
     uint8_t left_state  = (uint8_t)((la << 1) | lb);
 
     if (!encoder_sampler_initialized) {
@@ -1014,7 +1017,7 @@ static void SampleEncoders250us(void)
         return;
     }
 
-    uint8_t right_idx = (uint8_t)((encoder_right_prev_state << 2) | right_state);
+    uint8_t right_idx = (uint8_t)((encoder_right_prev_state << 2) | right_state);   // Indice de la tabla: anterior (bits 3-2) + actual (bits 1-0)
     uint8_t left_idx  = (uint8_t)((encoder_left_prev_state  << 2) | left_state);
 
     // Signo invertido a propósito: la tabla quad_delta da la convención opuesta
@@ -1364,7 +1367,7 @@ void MotorControl(int16_t setMotorRight, int16_t setMotorLeft)
     // cuenta de 0 a ARR (959) y el pin está en alto mientras cuenta < CCR, así
     // que duty% = CCR/(ARR+1). Despejando: CCR = (ARR+1)·duty/100.
     // Ej.: 50% → CCR=480 → pin en alto 480 de cada 960 ticks del timer.
-    uint32_t ccrR = ((arr3 + 1) * dutyR) / 100U;
+    uint32_t ccrR = ((arr3 + 1) * dutyR) / 100U;   // Regla de tres: % de duty -> cuentas del timer
     uint32_t ccrL = ((arr4 + 1) * dutyL) / 100U;
 
     if (ccrR > arr3) ccrR = arr3;
@@ -1605,13 +1608,13 @@ void calculate_tilt(int16_t ax, int16_t ay, int16_t az,
                     float *out_roll_deg, float *out_pitch_deg)
 {
     // roll = atan2( ay, az )
-    *out_roll_deg = atan2f(ay, az) * (180.0f / M_PI);
+    *out_roll_deg = atan2f(ay, az) * (180.0f / M_PI);   // Trigonometria: angulo de g (atan2 = 4 cuadrantes) + rad->grados
 
     // pitch = atan2( -ax, sqrt( ay² + az² ) )
     float ay_f = (float)ay;
     float az_f = (float)az;
-    float denom = sqrtf(ay_f*ay_f + az_f*az_f);
-    *out_pitch_deg = atan2f(-ax, denom) * (180.0f / M_PI);
+    float denom = sqrtf(ay_f*ay_f + az_f*az_f);   // Pitagoras: modulo de g en el plano YZ
+    *out_pitch_deg = atan2f(-ax, denom) * (180.0f / M_PI);   // Trigonometria: cateto opuesto (X) / adyacente (YZ)
 }
 
 void UpdateADC_MovingAverage(void) {
@@ -1643,7 +1646,7 @@ void UpdateADC_MovingAverage(void) {
             channel_samples[i] = history_copy[i][ch];
 
         // Insertion sort: n<=32, costo pequeño a 100Hz y sin memoria dinámica.
-        for (uint8_t i = 1; i < sample_count; ++i) {
+        for (uint8_t i = 1; i < sample_count; ++i) {   // Insertion sort: ordena de menor a mayor
             uint16_t key = channel_samples[i];
             int j = (int)i - 1;
             while (j >= 0 && channel_samples[j] > key) {
@@ -1653,8 +1656,8 @@ void UpdateADC_MovingAverage(void) {
             channel_samples[j + 1] = key;
         }
 
-        uint8_t mid = sample_count / 2U;
-        adcAvg[ch] = (sample_count & 1U)
+        uint8_t mid = sample_count / 2U;   // Mediana: valor del medio del vector ya ordenado
+        adcAvg[ch] = (sample_count & 1U)   // n par -> promedio de los dos centrales
                    ? channel_samples[mid]
                    : (uint16_t)(((uint32_t)channel_samples[mid - 1U] +
                                  (uint32_t)channel_samples[mid]) / 2U);
@@ -1699,14 +1702,14 @@ void ProcessEspRxLimited(void) {
 
 static float clampf_local(float value, float min_value, float max_value)
 {
-    if (value > max_value) return max_value;
+    if (value > max_value) return max_value;   // Saturacion (clamp): recorta a la banda [min,max]
     if (value < min_value) return min_value;
     return value;
 }
 
 static float apply_deadbandf(float value, float deadband)
 {
-    if (value > deadband) return value - deadband;
+    if (value > deadband) return value - deadband;   // Zona muerta: devuelve el EXCESO (continuo en el borde)
     if (value < -deadband) return value + deadband;
     return 0.0f;
 }
@@ -1746,7 +1749,7 @@ static float AntiStall_Tick(uint8_t tag, uint8_t wants_motion, float max_boost)
         if (as_still < 65535U) as_still++;
     } else {
         as_still  = 0;
-        as_boost *= ANTISTALL_DECAY;
+        as_boost *= ANTISTALL_DECAY;   // Decaimiento exponencial (multiplicativo por ciclo)
     }
     if (wants_motion && as_still >= ANTISTALL_WAIT_CYC)
         as_boost = fminf(as_boost + ANTISTALL_STEP, max_boost);
@@ -1759,9 +1762,9 @@ static float ComputeBrakeFromVelocity(float velocity, float brake_tilt_max)
     float vel_for_brake = apply_deadbandf(velocity, BRAKE_VEL_DEADBAND);
     vel_for_brake = clampf_local(vel_for_brake, -BRAKE_VEL_MAX, BRAKE_VEL_MAX);
     float abs_vel = fabsf(vel_for_brake);
-    float brake_mag = KV_BRAKE * abs_vel;
+    float brake_mag = KV_BRAKE * abs_vel;   // Freno viscoso: fuerza proporcional a la velocidad
     if (abs_vel > BRAKE_VEL_THRESHOLD)
-        brake_mag += KV_brake_value * (abs_vel - BRAKE_VEL_THRESHOLD);
+        brake_mag += KV_brake_value * (abs_vel - BRAKE_VEL_THRESHOLD);   // Tramo extra: 2da recta con mas pendiente pasado el umbral
 
     if (vel_for_brake < 0.0f)
         brake_mag = -brake_mag;
@@ -1797,20 +1800,20 @@ static void SteeringPID_Reset(void)
 // Convención de signo: positivo → rueda derecha más lenta → gira a la derecha.
 static float ComputeSteeringPID(float speed_r, float speed_l, float sp)
 {
-    float steer_err = sp - (speed_r - speed_l);
+    float steer_err = sp - (speed_r - speed_l);   // Error = referencia - medicion
 
-    float p = STEER_KP * steer_err;
+    float p = STEER_KP * steer_err;   // Termino P: proporcional al error de ahora
 
-    steer_pid_integral += steer_err * DT_CTRL_FIXED;
-    if (steer_pid_integral >  STEER_I_MAX) steer_pid_integral =  STEER_I_MAX;
+    steer_pid_integral += steer_err * DT_CTRL_FIXED;   // Integracion rectangular: I += e*dt (suma de Riemann)
+    if (steer_pid_integral >  STEER_I_MAX) steer_pid_integral =  STEER_I_MAX;   // Anti-windup: satura la integral
     if (steer_pid_integral < -STEER_I_MAX) steer_pid_integral = -STEER_I_MAX;
-    float i = STEER_KI * steer_pid_integral;
+    float i = STEER_KI * steer_pid_integral;   // Termino I: memoria del error pasado
 
-    float d = STEER_KD * (steer_err - steer_pid_prev_error) / DT_CTRL_FIXED;
+    float d = STEER_KD * (steer_err - steer_pid_prev_error) / DT_CTRL_FIXED;   // Termino D: derivada por diferencia finita (e_k - e_k-1)/dt
     steer_pid_prev_error = steer_err;
 
-    float out = p + i + d;
-    if (out >  STEER_OUT_MAX) out =  STEER_OUT_MAX;
+    float out = p + i + d;   // Salida PID = suma de los tres terminos
+    if (out >  STEER_OUT_MAX) out =  STEER_OUT_MAX;   // Saturacion de salida
     if (out < -STEER_OUT_MAX) out = -STEER_OUT_MAX;
     return out;
 }
@@ -1822,13 +1825,13 @@ static void FormatSignedFixed(char *buf, size_t buf_size, float value, uint8_t d
         scale *= 10;
     }
 
-    int32_t scaled = (value >= 0.0f)
-                   ? (int32_t)(value * (float)scale + 0.5f)
+    int32_t scaled = (value >= 0.0f)                       // Aritmetica de punto fijo: se corre la coma multiplicando por 10^decimales
+                   ? (int32_t)(value * (float)scale + 0.5f)  // El +/-0.5 antes de truncar = redondeo al entero mas cercano
                    : (int32_t)(value * (float)scale - 0.5f);
 
     uint32_t abs_scaled = (scaled < 0) ? (uint32_t)(-scaled) : (uint32_t)scaled;
-    uint32_t int_part   = abs_scaled / (uint32_t)scale;
-    uint32_t frac_part  = abs_scaled % (uint32_t)scale;
+    uint32_t int_part   = abs_scaled / (uint32_t)scale;   // Division entera: parte entera
+    uint32_t frac_part  = abs_scaled % (uint32_t)scale;   // Resto (modulo): parte decimal
     char sign           = (scaled < 0) ? '-' : '+';
 
     // Acotar rangos explícitamente: el valor mostrado nunca necesita más de
@@ -2065,7 +2068,7 @@ static void OLED_HBar(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
 {
     if (value > 4095) value = 4095;
     SSD1306_DrawRectangle(x, y, w, h, SSD1306_COLOR_WHITE);
-    uint16_t fill = (uint16_t)((uint32_t)value * (uint32_t)(w - 2) / 4095U);
+    uint16_t fill = (uint16_t)((uint32_t)value * (uint32_t)(w - 2) / 4095U);   // Regla de tres: cuentas de ADC -> pixeles de ancho
     if (fill > 0)
         SSD1306_DrawFilledRectangle(x + 1, y + 1, fill, h - 2, SSD1306_COLOR_WHITE);
     for (uint8_t i = 0; i < n_ticks; i++) {
@@ -2188,8 +2191,8 @@ void updateDisplay(void) {
             SSD1306_DrawLine(gx0 + gw / 2, gy0 - 2, gx0 + gw / 2, gy0 - 1, SSD1306_COLOR_WHITE);
             // marcador de roll actual (±15° a fondo de escala)
             float rr = clampf_local(filtered_roll_deg, -15.0f, 15.0f);
-            int16_t moff = (int16_t)(rr * (float)(gw / 2 - 3) / 15.0f);
-            uint16_t mx = (uint16_t)((int16_t)(gx0 + gw / 2) + moff);
+            int16_t moff = (int16_t)(rr * (float)(gw / 2 - 3) / 15.0f);   // Regla de tres: grados -> pixeles de desplazamiento
+            uint16_t mx = (uint16_t)((int16_t)(gx0 + gw / 2) + moff);   // Centro del marco + offset con signo
             SSD1306_DrawFilledRectangle(mx - 1, gy0 + 2, 3, gh - 4, SSD1306_COLOR_WHITE);
             // marcador del setpoint (tick corto debajo del marco)
             float ss = clampf_local(dynamic_setpoint_f, -15.0f, 15.0f);
@@ -2337,7 +2340,7 @@ void updateDisplay(void) {
 
         for (uint8_t i = 0; i < BAR_COUNT; i++) {
             uint16_t v  = adcAvg[i] > 4095 ? 4095 : adcAvg[i];
-            uint16_t h  = (uint32_t)v * bar_max_h / 4095;
+            uint16_t h  = (uint32_t)v * bar_max_h / 4095;   // Regla de tres: cuentas de ADC -> pixeles de alto
             uint16_t x0 = spacing + i * (bar_width + spacing);
             if (h > 0)
                 SSD1306_DrawFilledRectangle(x0, digit_y - 1 - h, bar_width, h, SSD1306_COLOR_WHITE);
@@ -2701,7 +2704,7 @@ static uint8_t Ctrl_LeerIMU(void)
     float accel_delta = fabsf((float)(ax - accel_prev_x)) +
                          fabsf((float)(ay - accel_prev_y)) +
                          fabsf((float)(az - accel_prev_z));
-    accel_motion_f += 0.30f * (accel_delta - accel_motion_f);
+    accel_motion_f += 0.30f * (accel_delta - accel_motion_f);   // Media movil exponencial (EMA)
     accel_prev_x = ax; accel_prev_y = ay; accel_prev_z = az;
     return 1;
 }
@@ -2731,17 +2734,17 @@ static void Ctrl_VelocidadEncoders(void)
     // Promedio de ambas ruedas = velocidad del centro del robot. El signo
     // negativo fija la convención global: AVANCE = velocity_est NEGATIVA
     // (los encoders cuentan al revés del sentido "adelante" del chasis).
-    float speed_right_rps = (float)delta_right / (ENC_CPR * DT_CTRL_FIXED);
+    float speed_right_rps = (float)delta_right / (ENC_CPR * DT_CTRL_FIXED);   // Analisis dimensional: counts -> vueltas/segundo
     float speed_left_rps  = (float)delta_left  / (ENC_CPR * DT_CTRL_FIXED);
-    float vel_enc = -((speed_right_rps + speed_left_rps) * 0.5f) * ENC_VEL_SCALE;
-    vel_enc = clampf_local(vel_enc, -20.0f, 20.0f);
+    float vel_enc = -((speed_right_rps + speed_left_rps) * 0.5f) * ENC_VEL_SCALE;   // Promedio de ambas ruedas x perimetro -> m/s
+    vel_enc = clampf_local(vel_enc, -20.0f, 20.0f);   // Saturacion: descarta valores fisicamente imposibles
     velocity_est    = vel_enc;
     // Filtro EMA (pasa-bajos de 1er orden): y += β·(x − y). Cada ciclo la
     // salida se acerca una fracción β al valor nuevo → constante de tiempo
     // τ ≈ dt/β. Con β=0.35 → τ≈29ms (rápido, para control); con β=0.02 →
     // τ≈0.5s (lento, para decisiones que no deben reaccionar a un tick suelto).
-    velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);
-    velocity_est_slow_f += VEL_SLOW_BETA * (velocity_est - velocity_est_slow_f);
+    velocity_est_f += VEL_LPF_BETA * (velocity_est - velocity_est_f);   // Media movil exponencial rapida (tau~29ms)
+    velocity_est_slow_f += VEL_SLOW_BETA * (velocity_est - velocity_est_slow_f);   // Media movil exponencial lenta (tau~0.5s)
     speed_right_rps_s = speed_right_rps;
     speed_left_rps_s  = speed_left_rps;
     if (delta_right != 0) wheel_r_last_tick_ms = HAL_GetTick();
@@ -2767,7 +2770,7 @@ static void Ctrl_VelocidadEncoders(void)
         float gz_dps_cal = (float)gz / 100.0f;
         if (fabsf(gz_dps_cal - wheel_yaw_bias_dps) < 5.0f) {
             wheel_yaw_bias_dps += ((yaw_bias_warmup < 100) ? 0.08f : 0.005f)
-                                * (gz_dps_cal - wheel_yaw_bias_dps);
+                                * (gz_dps_cal - wheel_yaw_bias_dps); // Media movil exponencial
             if (yaw_bias_warmup < 100) yaw_bias_warmup++;
         }
     }
@@ -2892,19 +2895,19 @@ static void Ctrl_Odometria(void)
             fabsf((float)gz - odom_gz_bias_f) < ODOM_GZ_STILL_LSB) {
             if (odom_still_cnt < 65535) odom_still_cnt++;
             if (odom_still_cnt >= ODOM_STILL_MIN_CYCLES) {
-                odom_gz_bias_f += ODOM_GZ_BIAS_ALPHA * ((float)gz - odom_gz_bias_f);
+                odom_gz_bias_f += ODOM_GZ_BIAS_ALPHA * ((float)gz - odom_gz_bias_f);   // Media movil exponencial (EMA lenta)
                 odom_gz_bias_f = clampf_local(odom_gz_bias_f,
                                               -ODOM_GZ_BIAS_MAX_LSB, ODOM_GZ_BIAS_MAX_LSB);
             }
         } else {
             odom_still_cnt = 0;
         }
-        float gz_odom_dps = ((float)gz - odom_gz_bias_f) / 100.0f;
+        float gz_odom_dps = ((float)gz - odom_gz_bias_f) / 100.0f;   // Lectura menos bias, dividido sensibilidad -> deg/s
 
         // Distancia recorrida este ciclo [m]: promedio de counts de ambas
         // ruedas (= avance del centro) ÷ counts/vuelta × metros/vuelta (2πr).
         // Misma conversión que la velocidad, pero sin dividir por dt.
-        float odom_d = ((float)(delta_right + delta_left) * 0.5f / ENC_CPR) * ENC_VEL_SCALE;
+        float odom_d = ((float)(delta_right + delta_left) * 0.5f / ENC_CPR) * ENC_VEL_SCALE;   // Analisis dimensional: counts -> vueltas -> metros
 
         // Gating de pivot: rotando en el lugar, el avance neto de ±1 count por
         // ciclo es ruido de cuantización/timing, no traslación real — integrarlo
@@ -2923,12 +2926,12 @@ static void Ctrl_Odometria(void)
         // dónde apuntaba el robot. Usar el rumbo del MEDIO del paso equivale
         // a la regla del trapecio: en una curva, ni el rumbo viejo ni el
         // nuevo son representativos del arco — el promedio sí.
-        float odom_dth = ODOM_THETA_SIGN * gz_odom_dps * DT_CTRL_FIXED;
-        float odom_th_mid_rad = (odom_theta_deg + 0.5f * odom_dth) * (M_PI / 180.0f);
+        float odom_dth = ODOM_THETA_SIGN * gz_odom_dps * DT_CTRL_FIXED;   // Integracion de Euler: d(angulo) = velocidad angular * dt
+        float odom_th_mid_rad = (odom_theta_deg + 0.5f * odom_dth) * (M_PI / 180.0f);   // Regla del trapecio: rumbo del MEDIO del paso
         odom_theta_deg += odom_dth;
-        if      (odom_theta_deg >  180.0f) odom_theta_deg -= 360.0f;
+        if      (odom_theta_deg >  180.0f) odom_theta_deg -= 360.0f;   // Wrap del angulo al rango [-180,180]
         else if (odom_theta_deg < -180.0f) odom_theta_deg += 360.0f;
-        odom_x_m += odom_d * cosf(odom_th_mid_rad);
+        odom_x_m += odom_d * cosf(odom_th_mid_rad);   // Descomposicion del paso en componentes (polar -> cartesiano)
         odom_y_m += odom_d * sinf(odom_th_mid_rad);
     }
 }
@@ -2966,7 +2969,7 @@ static uint8_t Ctrl_TimingDt(void)
     uint32_t diff_us = sample_us - last_mpu_us;
     last_mpu_us = sample_us;
 
-    dt_real = (float)diff_us * 1e-6f;
+    dt_real = (float)diff_us * 1e-6f;   // Conversion de unidades: microsegundos -> segundos
     // micros() envuelve cada ~44.7 s (CYCCNT/96 no es potencia de 2): en el ciclo
     // del wrap diff_us da basura enorme. Solo afecta telemetría (dt_ctrl es fijo).
     if (dt_real > 1.0f) dt_real = DT_CTRL_FIXED;
@@ -2986,7 +2989,7 @@ static void Ctrl_FiltroIMU(void)
     // fondo de escala configurado sería 131 (±250 dps), pero 100 es el que
     // quedó calibrado empíricamente contra giros reales medidos en el robot
     // (ver Registro 2026-07-05/06 en CLAUDE.md — NO volver a 131).
-    gyro_rate_dps = ANG_SIGN * ((float)gx / 100.0f);
+    gyro_rate_dps = ANG_SIGN * ((float)gx / 100.0f);   // Escalado del sensor: LSB crudos / sensibilidad -> deg/s
     if (gyro_rate_dps >  250.0f) gyro_rate_dps =  250.0f;
     if (gyro_rate_dps < -250.0f) gyro_rate_dps = -250.0f;
 
@@ -3002,7 +3005,7 @@ static void Ctrl_FiltroIMU(void)
     // dividir por cero. × 180/π pasa de radianes a grados.
     // Vale solo en cuasi-estático: acelerando, el accel mide g + movimiento
     // y este ángulo miente — por eso el filtro complementario le cree poco.
-    accel_ang_deg = ANG_SIGN * (atan2f((float)ay, (float)az) * (180.0f / M_PI));
+    accel_ang_deg = ANG_SIGN * (atan2f((float)ay, (float)az) * (180.0f / M_PI));   // Trigonometria: angulo de g, tan(roll)=ay/az
 
     // Inicialización del filtro en la primera muestra — evita que arranque en 0°
     static uint8_t filter_init = 0;
@@ -3019,8 +3022,8 @@ static void Ctrl_FiltroIMU(void)
     // pasa-altos sobre el gyro + pasa-bajos sobre el accel con constante de
     // tiempo τ = α·dt/(1−α) ≈ 0.49s: la deriva del gyro se corrige en ~½s y
     // el ruido/aceleraciones del accel entra atenuado ~50 veces.
-    filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_ctrl)
-                      + (1.0f - ALPHA) * accel_ang_deg;
+    filtered_roll_deg = ALPHA * (filtered_roll_deg + gyro_f * dt_ctrl)   // Filtro complementario: integracion de Euler del gyro (pasa-altos)
+                      + (1.0f - ALPHA) * accel_ang_deg;                  // + angulo absoluto del accel (pasa-bajos), pesos que suman 1
 
     if (filtered_roll_deg >  180.0f) filtered_roll_deg =  180.0f;
     if (filtered_roll_deg < -180.0f) filtered_roll_deg = -180.0f;
@@ -3035,9 +3038,9 @@ static void Ctrl_FiltroIMU(void)
         // de g en el plano YZ (pitágoras: √(ay²+az²)) — así el ángulo lateral
         // no se contamina cuando el robot además está inclinado en roll.
         float lat_acc = atan2f(-(float)ax,
-                               sqrtf((float)ay * (float)ay +
-                                     (float)az * (float)az)) * (180.0f / M_PI);
-        lat_tilt_f += 0.10f * (lat_acc - lat_tilt_f);
+                               sqrtf((float)ay * (float)ay +          // Pitagoras: g proyectada en el plano YZ
+                                     (float)az * (float)az)) * (180.0f / M_PI);   // Trigonometria: opuesto (X) / adyacente (YZ)
+        lat_tilt_f += 0.10f * (lat_acc - lat_tilt_f);   // Media movil exponencial (EMA)
     }
 }
 
@@ -3156,7 +3159,7 @@ static void Ctrl_EntradasLinea(void)
         // Si el ADC no supera el umbral, contribuye 0 (ruido/luz ambiente).
         float w[4];
         for (int i = 0; i < 4; i++) {
-            float signal = s[i] - ADC_BASELINE[i];
+            float signal = s[i] - ADC_BASELINE[i];   // Sustraccion de baseline: quita el fondo propio de cada sensor
             w[i] = (!line_ch_quarantine[i] && s[i] > LINE_THRESHOLD)
                  ? fmaxf(signal, 0.0f) : 0.0f;
         }
@@ -3280,8 +3283,8 @@ static void Ctrl_EntradasLinea(void)
             // escapa hacia una punta). Dividir por 9·w_sum normaliza: el peor
             // caso (toda la señal en un sensor extremo) da num = ±9·w_sum →
             // error = ±1. Resultado en [-1,+1], izquierda = positivo.
-            float num = 9.0f*w[0] + 1.0f*w[1] - 1.0f*w[2] - 9.0f*w[3];
-            line_error = num / (9.0f * w_sum) + line_error_trim_f;
+            float num = 9.0f*w[0] + 1.0f*w[1] - 1.0f*w[2] - 9.0f*w[3];   // Centroide (promedio ponderado): sumatoria de coef_i * peso_i
+            line_error = num / (9.0f * w_sum) + line_error_trim_f;   // Normalizacion: dividido el maximo posible -> [-1,+1]
 
             // Umbral más bajo porque sensores internos solo generan ±0.11
             if (line_error > 0.02f)       last_line_dir =  1.0f;
@@ -3303,8 +3306,8 @@ static void Ctrl_EntradasLinea(void)
         // agresiva en curvas (0.3 de error quita ~90%): recto rápido, curva lento.
         // Floor 10%: en curva cerrada el robot frena casi al mínimo (era 25%).
         // Sin floor: speed_factor→0 → line_angle_cmd=0 → pwm_sat→0 → spin puro.
-        float speed_factor = fmaxf(0.0f, 1.0f - fabsf(line_error) / 0.45f);
-        speed_factor *= speed_factor;
+        float speed_factor = fmaxf(0.0f, 1.0f - fabsf(line_error) / 0.45f);   // Interpolacion lineal: 1 centrado, 0 con |e|>=0.45
+        speed_factor *= speed_factor;   // Al cuadrado: caida suave cerca del centro, agresiva en curva
         line_desired_forward_vel = line_detected_raw
             ? fmaxf(LINE_SPEED_TARGET * 0.20f, LINE_SPEED_TARGET * speed_factor)
             : 0.0f;
@@ -3324,11 +3327,11 @@ static void Ctrl_EntradasLinea(void)
                 line_forward_accel_f    = 0.0f;
                 line_speed_predict_valid = 1;
             } else {
-                float accel_raw = (line_forward_vel_raw - line_forward_vel_prev) /
+                float accel_raw = (line_forward_vel_raw - line_forward_vel_prev) /   // Derivada por diferencia finita: (v_k - v_k-1)/dt
                                   DT_CTRL_FIXED;
                 accel_raw = clampf_local(accel_raw,
                                          -LINE_ACCEL_EST_MAX, LINE_ACCEL_EST_MAX);
-                line_forward_accel_f += LINE_ACCEL_FILTER_ALPHA *
+                line_forward_accel_f += LINE_ACCEL_FILTER_ALPHA *   // Media movil exponencial (EMA)
                                         (accel_raw - line_forward_accel_f);
                 line_forward_vel_prev = line_forward_vel_raw;
             }
@@ -3345,32 +3348,32 @@ static void Ctrl_EntradasLinea(void)
         // Físicamente: más inclinación = más aceleración de avance (péndulo
         // invertido), así que "ir más rápido" se pide inclinándose más.
         if (line_state == LINE_STATE_FOLLOWING) {
-            float vel_error = line_desired_forward_vel - line_forward_vel;
+            float vel_error = line_desired_forward_vel - line_forward_vel;   // Error = velocidad pedida - velocidad real
             float line_vel_kp_eff;
             float line_vel_i_term;
             if (vel_error > 0.0f) {
                 // Acelerando: acumula integral solo en positivo
-                line_vel_integral += vel_error * DT_CTRL_FIXED;
-                line_vel_integral = clampf_local(line_vel_integral, 0.0f, LINE_VEL_I_MAX);
+                line_vel_integral += vel_error * DT_CTRL_FIXED;   // Integracion rectangular: I += e*dt
+                line_vel_integral = clampf_local(line_vel_integral, 0.0f, LINE_VEL_I_MAX);   // Anti-windup
                 line_vel_kp_eff = LINE_VEL_KP;
-                line_vel_i_term = LINE_VEL_KI * line_vel_integral;
+                line_vel_i_term = LINE_VEL_KI * line_vel_integral;   // Termino I
             } else {
                 // Sobrevelocidad: la integral positiva servía para acelerar y no
                 // debe oponerse al freno. Se descarga rápido y se excluye de la
                 // salida hasta volver a quedar por debajo de la velocidad pedida.
-                line_vel_integral *= 0.50f;
+                line_vel_integral *= 0.50f;   // Descarga exponencial de la integral (mitad por ciclo)
                 line_vel_kp_eff = LINE_VEL_KP_BRAKE;
                 line_vel_i_term = 0.0f;
             }
             line_angle_cmd = clampf_local(
-                line_vel_kp_eff * vel_error + line_vel_i_term,
+                line_vel_kp_eff * vel_error + line_vel_i_term,   // Salida PI = P + I (lazo externo en cascada: pide grados)
                 -LINE_BRAKE_ANGLE_MAX, LINE_ANGLE
             );
 
             // Guarda independiente del PI: si la velocidad proyectada a 150ms
             // cruza la franja previa al tope global, fuerza un ángulo de freno.
             // Solo toma aceleración positiva; al desacelerar no interfiere.
-            float predicted_forward_vel = line_forward_vel_raw +
+            float predicted_forward_vel = line_forward_vel_raw +   // Extrapolacion lineal (Taylor 1er orden): v + a*t
                 fmaxf(line_forward_accel_f, 0.0f) * LINE_SPEED_PREDICT_SEC;
             float guard_speed = fmaxf(0.0f,
                 LINE_SPEED_TARGET - LINE_SPEED_GUARD_MARGIN);
@@ -3684,29 +3687,29 @@ static float WheelStation_AngleCorr(void)
     static float wheel_disp_f = 0.0f;   // desplazamiento reciente con fuga [counts]
     if (!wheel_pi_enabled || !wheel_pos_armed) { wheel_disp_f = 0.0f; return 0.0f; }
 
-    wheel_disp_f = wheel_disp_f * WHEEL_DISP_LEAK
+    wheel_disp_f = wheel_disp_f * WHEEL_DISP_LEAK          // Integrador con fuga: acumula counts y olvida exponencialmente
                  + 0.5f * (float)(delta_right + delta_left);
-    float v_trans = 0.5f * (wheel_spd_r_f + wheel_spd_l_f);   // [rps]
+    float v_trans = 0.5f * (wheel_spd_r_f + wheel_spd_l_f);   // [rps] semisuma = traslacion (avance del centro)
 
     // Reposo real → drenaje rápido de la memoria (ver WHEEL_DISP_FAST_LEAK).
     uint32_t now_ws = HAL_GetTick();
     if (fabsf(v_trans) < WHEEL_V_DB_RPS &&
         (now_ws - wheel_r_last_tick_ms) > WHEEL_DISP_CALM_MS &&
         (now_ws - wheel_l_last_tick_ms) > WHEEL_DISP_CALM_MS) {
-        wheel_disp_f *= WHEEL_DISP_FAST_LEAK;
+        wheel_disp_f *= WHEEL_DISP_FAST_LEAK;   // Decaimiento exponencial rapido (tau~100ms)
     }
 
-    float v_act = apply_deadbandf(v_trans, WHEEL_V_DB_RPS);
-    float d_act = apply_deadbandf(wheel_disp_f, (float)WHEEL_TRANS_DB);
+    float v_act = apply_deadbandf(v_trans, WHEEL_V_DB_RPS);   // Zona muerta: solo el exceso de velocidad
+    float d_act = apply_deadbandf(wheel_disp_f, (float)WHEEL_TRANS_DB);   // Zona muerta: solo el exceso de desplazamiento
     // Factor de calma (ver WHEEL_CALM_*): 0 = quieto → estación muda.
-    float calm = fmaxf(fabsf(gyro_f)  / WHEEL_CALM_GYRO_REF,
+    float calm = fmaxf(fabsf(gyro_f)  / WHEEL_CALM_GYRO_REF,   // Normalizacion 0..1 de cada senal, se queda con la mayor
                        fabsf(v_trans) / WHEEL_CALM_V_REF);
     if (calm > 1.0f) calm = 1.0f;
     // P con tope propio chico (ver WHEEL_STATION_P_MAX): solo anti-deriva.
-    float p_term = clampf_local(WHEEL_STATION_ANG_KP * d_act,
+    float p_term = clampf_local(WHEEL_STATION_ANG_KP * d_act,   // Termino P: proporcional al desplazamiento
                                 -WHEEL_STATION_P_MAX, WHEEL_STATION_P_MAX);
-    return clampf_local(-(p_term +
-                          WHEEL_STATION_DAMP * v_act) * calm,
+    return clampf_local(-(p_term +                              // PD con signo negado (correccion EN CONTRA del movimiento)
+                          WHEEL_STATION_DAMP * v_act) * calm,   // Termino D: proporcional a la velocidad, escalado por la calma
                         -WHEEL_STATION_ANG_MAX, WHEEL_STATION_ANG_MAX);
 }
 
@@ -3728,7 +3731,7 @@ static void Ctrl_SetpointDinamico(void)
             // - vel < 0 (avance): reducir ángulo si va muy rápido → frena
             // - vel > 0 (reversa): scale=1 siempre → ángulo completo → empuja hacia adelante
             float vel_fwd = fminf(0.0f, velocity_est_f);
-            float vel_scale = fmaxf(0.0f, 1.0f - fabsf(vel_fwd) / (LINE_SPEED_TARGET * 0.9f));
+            float vel_scale = fmaxf(0.0f, 1.0f - fabsf(vel_fwd) / (LINE_SPEED_TARGET * 0.9f));   // Interpolacion lineal: 1 parado, 0 a la velocidad tope
             float stability_scale = 1.0f;
             // Referencia: base_setpoint_f (setpoint actual de línea), no el upright (0°).
             // Sin esto, stability_scale penaliza la inclinación correcta de avance.
@@ -3736,36 +3739,36 @@ static void Ctrl_SetpointDinamico(void)
             float gyro_abs = fabsf(gyro_f);
 
             if (balance_err_abs > 1.5f)
-                stability_scale *= fmaxf(0.60f, 1.0f - (balance_err_abs - 1.5f) / 3.0f);
+                stability_scale *= fmaxf(0.60f, 1.0f - (balance_err_abs - 1.5f) / 3.0f);   // Interpolacion lineal con piso 0.6 (penaliza inestabilidad)
             if (gyro_abs > 20.0f)
-                stability_scale *= fmaxf(0.60f, 1.0f - (gyro_abs - 20.0f) / 45.0f);
+                stability_scale *= fmaxf(0.60f, 1.0f - (gyro_abs - 20.0f) / 45.0f);   // Idem por gyro; los dos factores se MULTIPLICAN (se acumulan)
 
             // Corrección P directa por déficit de velocidad de encoder:
             // frac=1 cuando el robot está parado, frac=0 cuando alcanza la vel deseada.
-            float enc_deficit = fmaxf(0.0f, line_desired_forward_vel - line_forward_vel);
+            float enc_deficit = fmaxf(0.0f, line_desired_forward_vel - line_forward_vel);   // Error solo en un sentido (falta velocidad)
             float enc_deficit_frac = (line_desired_forward_vel > 0.01f)
-                ? clampf_local(enc_deficit / line_desired_forward_vel, 0.0f, 1.0f)
+                ? clampf_local(enc_deficit / line_desired_forward_vel, 0.0f, 1.0f)   // Normalizacion: error RELATIVO en escala 0..1
                 : 0.0f;
             line_enc_angle_corr = clampf_local(
-                LINE_ENC_CORR_KP * enc_deficit_frac, 0.0f, LINE_ENC_CORR_MAX);
+                LINE_ENC_CORR_KP * enc_deficit_frac, 0.0f, LINE_ENC_CORR_MAX);   // Termino P sobre el deficit normalizado
 
             float reverse_vel = fmaxf(0.0f, velocity_est_f);
             float reverse_target = 0.0f;
             if (reverse_vel > LINE_REV_VEL_START) {
                 reverse_target = LINE_REV_BOOST_MAX *
                     clampf_local(
-                        (reverse_vel - LINE_REV_VEL_START) /
-                        (LINE_REV_VEL_FULL - LINE_REV_VEL_START),
+                        (reverse_vel - LINE_REV_VEL_START) /      // Interpolacion lineal entre dos umbrales:
+                        (LINE_REV_VEL_FULL - LINE_REV_VEL_START), // 0 en START, 1 en FULL (escala 0..1)
                         0.0f, 1.0f
                     );
                 if (stability_scale < 0.75f) stability_scale = 0.75f;
             }
 
-            float reverse_delta = reverse_target - line_reverse_boost;
+            float reverse_delta = reverse_target - line_reverse_boost;   // Limitador de slew-rate (rampa asimetrica: sube y baja distinto)
             float reverse_step = (reverse_delta > 0.0f) ? LINE_REV_BOOST_UP : LINE_REV_BOOST_DOWN;
             if (reverse_delta >  reverse_step) reverse_delta =  reverse_step;
             if (reverse_delta < -reverse_step) reverse_delta = -reverse_step;
-            line_reverse_boost += reverse_delta;
+            line_reverse_boost += reverse_delta;   // Rampa hacia el boost objetivo
 
             if (line_angle_cmd < 0.0f) {
                 // Freno activo: no aplicar boosts positivos ni vel_scale (que sería 0 y mataría el freno)
@@ -3804,9 +3807,9 @@ static void Ctrl_SetpointDinamico(void)
             // hacia atrás/adelante y nunca lograba quedarse estable. Ahora la
             // corrección es proporcional y suave, con una zona fina muerta en el
             // centro para que pueda asentarse y cumplir la ventana de estabilidad.
-            float front_min = fminf((float)adcAvg[5], (float)adcAvg[7]);
-            float hold_center = OBJ_REV_CLEAR_ADC + 0.5f * OBJ_REV_HOLD_BAND;
-            float hold_err    = hold_center - front_min;  // >0 = quedó cerca → retroceder
+            float front_min = fminf((float)adcAvg[5], (float)adcAvg[7]);   // El sensor que MENOS ve manda (el mas conservador)
+            float hold_center = OBJ_REV_CLEAR_ADC + 0.5f * OBJ_REV_HOLD_BAND;   // Punto medio de la banda objetivo
+            float hold_err    = hold_center - front_min;  // Error = objetivo - medicion (>0 = quedó cerca → retroceder)
             float hold_abs    = fabsf(hold_err);
 
             // Término D del hold (2026-07-10): inclinación en contra del
@@ -3816,15 +3819,15 @@ static void Ctrl_SetpointDinamico(void)
             // no se estrella contra la pared). Ver OBJ_REV_HOLD_KV.
             // velocity_est_f > 0 = reversa → damp positivo = inclina adelante.
             float hold_damp = clampf_local(
-                OBJ_REV_HOLD_KV * apply_deadbandf(velocity_est_f, OBJ_REV_HOLD_VEL_DB),
+                OBJ_REV_HOLD_KV * apply_deadbandf(velocity_est_f, OBJ_REV_HOLD_VEL_DB),   // Termino D (amortiguacion viscosa) sobre el exceso de velocidad
                 -OBJ_REV_HOLD_DAMP_MAX, OBJ_REV_HOLD_DAMP_MAX);
 
             if (hold_abs > OBJ_REV_HOLD_FINE_BAND) {
                 float hold_mag = clampf_local(
-                    (hold_abs - OBJ_REV_HOLD_FINE_BAND) / OBJ_REV_HOLD_ERR_FOR_MAX,
+                    (hold_abs - OBJ_REV_HOLD_FINE_BAND) / OBJ_REV_HOLD_ERR_FOR_MAX,   // Normalizacion del exceso a escala 0..1
                     0.0f, 1.0f);
                 float hold_angle = OBJ_REV_HOLD_ANGLE_MIN +
-                    (OBJ_REV_HOLD_ANGLE_MAX - OBJ_REV_HOLD_ANGLE_MIN) * hold_mag;
+                    (OBJ_REV_HOLD_ANGLE_MAX - OBJ_REV_HOLD_ANGLE_MIN) * hold_mag;   // Interpolacion lineal (lerp) entre angulo min y max
                 base_setpoint_target = SETPOINT_ANGLE + setpoint_trim +
                     ((hold_err > 0.0f) ? -hold_angle : hold_angle) + hold_damp;
                 // Anti-stall (ver AntiStall_Tick): el STOP es la entrada al
@@ -3851,20 +3854,20 @@ static void Ctrl_SetpointDinamico(void)
             // (BRAKE_VEL_DEADBAND) y anti-windup igual que el PI de línea normal.
             {
                 float lfwd_vel_raw = fmaxf(0.0f, -velocity_est_f);
-                float lfwd_vel     = apply_deadbandf(lfwd_vel_raw, BRAKE_VEL_DEADBAND);
-                float vel_error    = LOST_FWD_SPEED_TARGET - lfwd_vel;
-                float kp           = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;
+                float lfwd_vel     = apply_deadbandf(lfwd_vel_raw, BRAKE_VEL_DEADBAND);   // Zona muerta: filtra el piso de cuantizacion
+                float vel_error    = LOST_FWD_SPEED_TARGET - lfwd_vel;   // Error = referencia - medicion
+                float kp           = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;   // Ganancia asimetrica: frenar pega mas fuerte que acelerar
                 if (!late_cycle) {
                     if (vel_error > 0.0f) {
-                        lost_fwd_vel_integral += vel_error * dt_ctrl;
+                        lost_fwd_vel_integral += vel_error * dt_ctrl;   // Integracion rectangular: I += e*dt
                         lost_fwd_vel_integral = clampf_local(
-                            lost_fwd_vel_integral, 0.0f, LOST_FWD_VEL_I_MAX);
+                            lost_fwd_vel_integral, 0.0f, LOST_FWD_VEL_I_MAX);   // Anti-windup
                     } else {
-                        lost_fwd_vel_integral *= 0.80f;
+                        lost_fwd_vel_integral *= 0.80f;   // Descarga exponencial al frenar
                     }
                 }
                 base_setpoint_target = clampf_local(
-                    kp * vel_error + LOST_FWD_KI * lost_fwd_vel_integral,
+                    kp * vel_error + LOST_FWD_KI * lost_fwd_vel_integral,   // Salida PI = P + I (pide grados de inclinacion)
                     -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
 
                 // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
@@ -3911,20 +3914,20 @@ static void Ctrl_SetpointDinamico(void)
             // mismo integral compartido (los dos estados son mutuamente excluyentes).
             {
                 float efwd_vel_raw = fmaxf(0.0f, -velocity_est_f);
-                float efwd_vel     = apply_deadbandf(efwd_vel_raw, BRAKE_VEL_DEADBAND);
-                float vel_error    = LOST_FWD_SPEED_TARGET - efwd_vel;
-                float kp           = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;
+                float efwd_vel     = apply_deadbandf(efwd_vel_raw, BRAKE_VEL_DEADBAND);   // Zona muerta: filtra el piso de cuantizacion
+                float vel_error    = LOST_FWD_SPEED_TARGET - efwd_vel;   // Error = referencia - medicion
+                float kp           = (vel_error < 0.0f) ? LOST_FWD_KP_BRAKE : LOST_FWD_KP;   // Ganancia asimetrica (frenar > acelerar)
                 if (!late_cycle) {
                     if (vel_error > 0.0f) {
-                        lost_fwd_vel_integral += vel_error * dt_ctrl;
+                        lost_fwd_vel_integral += vel_error * dt_ctrl;   // Integracion rectangular: I += e*dt
                         lost_fwd_vel_integral = clampf_local(
-                            lost_fwd_vel_integral, 0.0f, LOST_FWD_VEL_I_MAX);
+                            lost_fwd_vel_integral, 0.0f, LOST_FWD_VEL_I_MAX);   // Anti-windup
                     } else {
-                        lost_fwd_vel_integral *= 0.80f;
+                        lost_fwd_vel_integral *= 0.80f;   // Descarga exponencial
                     }
                 }
                 base_setpoint_target = clampf_local(
-                    kp * vel_error + LOST_FWD_KI * lost_fwd_vel_integral,
+                    kp * vel_error + LOST_FWD_KI * lost_fwd_vel_integral,   // Salida PI = P + I
                     -LOST_FWD_BRAKE_MAX, LOST_FWD_ANGLE_MAX);
                 // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
                 base_setpoint_target += AntiStall_Tick(2,
@@ -3977,20 +3980,20 @@ static void Ctrl_SetpointDinamico(void)
             // en vez de ángulo fijo, que se aceleraba sin límite buscando la pared.
             {
                 float wa_vel_raw = fmaxf(0.0f, -velocity_est_f);
-                float wa_vel     = apply_deadbandf(wa_vel_raw, BRAKE_VEL_DEADBAND);
-                float vel_error  = OBJ_WALL_APPROACH_SPEED_TARGET - wa_vel;
-                float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;
+                float wa_vel     = apply_deadbandf(wa_vel_raw, BRAKE_VEL_DEADBAND);   // Zona muerta
+                float vel_error  = OBJ_WALL_APPROACH_SPEED_TARGET - wa_vel;   // Error = referencia - medicion
+                float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;   // Ganancia asimetrica
                 if (!late_cycle) {
                     if (vel_error > 0.0f) {
-                        obj_wall_vel_integral += vel_error * dt_ctrl;
+                        obj_wall_vel_integral += vel_error * dt_ctrl;   // Integracion rectangular: I += e*dt
                         obj_wall_vel_integral = clampf_local(
-                            obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);
+                            obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);   // Anti-windup
                     } else {
-                        obj_wall_vel_integral *= 0.80f;
+                        obj_wall_vel_integral *= 0.80f;   // Descarga exponencial
                     }
                 }
                 base_setpoint_target = clampf_local(
-                    kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,
+                    kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,   // Salida PI = P + I
                     -OBJ_WALL_BRAKE_ANGLE, OBJ_WALL_APPROACH_ANGLE_MAX);
                 // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
                 base_setpoint_target += AntiStall_Tick(3,
@@ -4020,20 +4023,20 @@ static void Ctrl_SetpointDinamico(void)
                 // velocidad de crucero con precisión en vez de ángulo fijo + freno
                 // bang-bang, que aceleraba a fondo hasta cruzar el umbral y frenaba de golpe.
                 float wf_vel_raw = fmaxf(0.0f, -velocity_est_f);
-                float wf_vel     = apply_deadbandf(wf_vel_raw, BRAKE_VEL_DEADBAND);
-                float vel_error  = OBJ_WALL_SPEED_TARGET - wf_vel;
-                float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;
+                float wf_vel     = apply_deadbandf(wf_vel_raw, BRAKE_VEL_DEADBAND);   // Zona muerta
+                float vel_error  = OBJ_WALL_SPEED_TARGET - wf_vel;   // Error = referencia - medicion
+                float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;   // Ganancia asimetrica
                 if (!late_cycle) {
                     if (vel_error > 0.0f) {
-                        obj_wall_vel_integral += vel_error * dt_ctrl;
+                        obj_wall_vel_integral += vel_error * dt_ctrl;   // Integracion rectangular: I += e*dt
                         obj_wall_vel_integral = clampf_local(
-                            obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);
+                            obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);   // Anti-windup
                     } else {
-                        obj_wall_vel_integral *= 0.80f;
+                        obj_wall_vel_integral *= 0.80f;   // Descarga exponencial
                     }
                 }
                 base_setpoint_target = clampf_local(
-                    kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,
+                    kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,   // Salida PI = P + I
                     -OBJ_WALL_BRAKE_ANGLE, OBJ_WALL_FWD_ANGLE);
                 // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
                 base_setpoint_target += AntiStall_Tick(4,
@@ -4058,20 +4061,20 @@ static void Ctrl_SetpointDinamico(void)
                 }
             } else {
                 float wf_vel_raw = fmaxf(0.0f, -velocity_est_f);
-                float wf_vel     = apply_deadbandf(wf_vel_raw, BRAKE_VEL_DEADBAND);
-                float vel_error  = OBJ_WALL_SPEED_TARGET - wf_vel;
-                float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;
+                float wf_vel     = apply_deadbandf(wf_vel_raw, BRAKE_VEL_DEADBAND);   // Zona muerta
+                float vel_error  = OBJ_WALL_SPEED_TARGET - wf_vel;   // Error = referencia - medicion
+                float kp         = (vel_error < 0.0f) ? OBJ_WALL_VEL_KP_BRAKE : OBJ_WALL_VEL_KP;   // Ganancia asimetrica
                 if (!late_cycle) {
                     if (vel_error > 0.0f) {
-                        obj_wall_vel_integral += vel_error * dt_ctrl;
+                        obj_wall_vel_integral += vel_error * dt_ctrl;   // Integracion rectangular: I += e*dt
                         obj_wall_vel_integral = clampf_local(
-                            obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);
+                            obj_wall_vel_integral, 0.0f, OBJ_WALL_VEL_I_MAX);   // Anti-windup
                     } else {
-                        obj_wall_vel_integral *= 0.80f;
+                        obj_wall_vel_integral *= 0.80f;   // Descarga exponencial
                     }
                 }
                 base_setpoint_target = clampf_local(
-                    kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,
+                    kp * vel_error + OBJ_WALL_VEL_KI * obj_wall_vel_integral,   // Salida PI = P + I
                     -OBJ_WALL_BRAKE_ANGLE, OBJ_WALL_FWD_ANGLE);
                 // Anti-stall (ver AntiStall_Tick): nunca quedarse quieto.
                 base_setpoint_target += AntiStall_Tick(6,
@@ -4163,7 +4166,7 @@ static void Ctrl_SetpointDinamico(void)
 
         float manual_desired_vel = clampf_local(manual_setpoint_cmd, -MANUAL_SPEED_MAX, MANUAL_SPEED_MAX);
         float manual_actual_vel  = -velocity_est_f; // + adelante, misma convención que el resto del archivo
-        float manual_vel_error   = manual_desired_vel - manual_actual_vel;
+        float manual_vel_error   = manual_desired_vel - manual_actual_vel;   // Error = referencia - medicion
 
         // "Acelerando" = el error empuja en el mismo sentido que la velocidad
         // deseada: P floja + acumula integral. Si no (frenando o revirtiendo),
@@ -4172,16 +4175,16 @@ static void Ctrl_SetpointDinamico(void)
                                                                     : (manual_vel_error <= 0.0f);
         float manual_vel_kp_eff;
         if (manual_accelerating) {
-            manual_vel_integral += manual_vel_error * DT_CTRL_FIXED;
-            manual_vel_integral  = clampf_local(manual_vel_integral, -MANUAL_VEL_I_MAX, MANUAL_VEL_I_MAX);
+            manual_vel_integral += manual_vel_error * DT_CTRL_FIXED;   // Integracion rectangular: I += e*dt
+            manual_vel_integral  = clampf_local(manual_vel_integral, -MANUAL_VEL_I_MAX, MANUAL_VEL_I_MAX);   // Anti-windup
             manual_vel_kp_eff = MANUAL_VEL_KP;
         } else {
-            manual_vel_integral *= 0.80f;
+            manual_vel_integral *= 0.80f;   // Descarga exponencial de la integral al frenar
             manual_vel_kp_eff = MANUAL_VEL_KP_BRAKE;
         }
 
         float manual_angle_cmd = clampf_local(
-            manual_vel_kp_eff * manual_vel_error + MANUAL_VEL_KI * manual_vel_integral,
+            manual_vel_kp_eff * manual_vel_error + MANUAL_VEL_KI * manual_vel_integral,   // Salida PI = P + I (lazo externo: pide grados)
             -MANUAL_ANGLE_MAX, MANUAL_ANGLE_MAX
         );
 
@@ -4232,7 +4235,7 @@ static void Ctrl_SetpointDinamico(void)
 
     {
         static float prev_setpoint_trim = 0.0f;
-        float trim_delta = setpoint_trim - prev_setpoint_trim;
+        float trim_delta = setpoint_trim - prev_setpoint_trim;   // Limitador de slew-rate del trim (cambio desde Qt sin escalon)
         const float TRIM_STEP = 0.008f;
         if (trim_delta >  TRIM_STEP) trim_delta =  TRIM_STEP;
         if (trim_delta < -TRIM_STEP) trim_delta = -TRIM_STEP;
@@ -4259,12 +4262,12 @@ static void Ctrl_SetpointDinamico(void)
             sp_step_max = 0.1f;
         }
 
-        float sp_delta = base_setpoint_target - base_setpoint_f;
+        float sp_delta = base_setpoint_target - base_setpoint_f;   // Limitador de slew-rate: cuanto falta para el objetivo
 
-        if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;
+        if (sp_delta >  sp_step_max) sp_delta =  sp_step_max;   // Recorta el paso maximo por ciclo
         if (sp_delta < -sp_step_max) sp_delta = -sp_step_max;
 
-        base_setpoint_f += sp_delta;
+        base_setpoint_f += sp_delta;   // Rampa hacia el objetivo (evita escalones bruscos de setpoint)
     }
 
     {
@@ -4272,11 +4275,11 @@ static void Ctrl_SetpointDinamico(void)
                              ? BRAKE_TILT_STEP_MAN
                              : BRAKE_TILT_STEP_BAL;
 
-        float brake_delta = brake_setpoint_target - brake_setpoint_f;
+        float brake_delta = brake_setpoint_target - brake_setpoint_f;   // Limitador de slew-rate del freno
         if (brake_delta >  brake_step_max) brake_delta =  brake_step_max;
         if (brake_delta < -brake_step_max) brake_delta = -brake_step_max;
 
-        brake_setpoint_f += brake_delta;
+        brake_setpoint_f += brake_delta;   // Rampa hacia el freno objetivo
     }
 
     // Término de posición: integra velocidad para corregir deriva lenta
@@ -4306,11 +4309,11 @@ static void Ctrl_SetpointDinamico(void)
             // nuevo (línea/manual) ni a la re-entrada a balance.
             wheel_station_corr_f = 0.0f;
         } else {
-            float ws_delta = wheel_station_corr - wheel_station_corr_f;
+            float ws_delta = wheel_station_corr - wheel_station_corr_f;   // Limitador de slew-rate propio (4x mas rapido que la rampa base)
             const float WS_STEP = 0.4f;
             if (ws_delta >  WS_STEP) ws_delta =  WS_STEP;
             if (ws_delta < -WS_STEP) ws_delta = -WS_STEP;
-            wheel_station_corr_f += ws_delta;
+            wheel_station_corr_f += ws_delta;   // Rampa de la correccion de estacion
         }
         dynamic_setpoint_f = clampf_local(dynamic_setpoint_f + wheel_station_corr_f,
                                           -sp_limit, sp_limit);
@@ -4579,16 +4582,16 @@ static void Ctrl_PIDBalance(void)
         //   D (Kd=0.12 %PWM/(°/s)): reacciona a la VELOCIDAD del error —
         //     frena la caída apenas empieza, antes de que el ángulo crezca.
         //     Es el término que amortigua la oscilación del P.
-        p_term = KP_value * control_error;
-        i_term = KI_value * integral;
+        p_term = KP_value * control_error;   // Termino P: proporcional al error de ahora
+        i_term = KI_value * integral;        // Termino I: memoria del error pasado (acumulado abajo)
 
         // Derivada numérica por diferencia finita: de/dt ≈ (e_k − e_k−1)/dt.
         // Amplifica ruido (un salto de 0.1° en 10ms = 10°/s), por eso se
         // recorta dos veces: la derivada a ±500°/s y el término D a ±15 %PWM.
-        float d_error = (control_error - prev_error) / dt_ctrl;
-        if (d_error >  500.0f) d_error =  500.0f;
+        float d_error = (control_error - prev_error) / dt_ctrl;   // Derivada por diferencia finita: (e_k - e_k-1)/dt
+        if (d_error >  500.0f) d_error =  500.0f;   // Saturacion: la derivada amplifica ruido
         if (d_error < -500.0f) d_error = -500.0f;
-        d_term = KD_value * d_error;
+        d_term = KD_value * d_error;   // Termino D: anticipa por la VELOCIDAD del error
 
         if (d_term >  15.0f) d_term =  15.0f;
         if (d_term < -15.0f) d_term = -15.0f;
@@ -4646,9 +4649,9 @@ static void Ctrl_PIDBalance(void)
                 // recta de 0.35 (error 0) a 1.0 (error ≥ 1.5°). Cerca del
                 // equilibrio el PID trabaja al 35% para no vibrar por ruido
                 // de sensor; lejos recupera autoridad completa.
-                float x = abs_error / SOFT_ZONE_ANGLE_DEG;
+                float x = abs_error / SOFT_ZONE_ANGLE_DEG;   // Normalizacion a escala 0..1
                 if (x > 1.0f) x = 1.0f;
-                float soft_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;
+                float soft_scale = SOFT_ZONE_MIN_SCALE + (1.0f - SOFT_ZONE_MIN_SCALE) * x;   // Interpolacion lineal (lerp) entre 0.35 y 1.0
 
                 if (balance_hold_active) {
                     // Hold: silencia P/I (sin chatter por offset residual de
@@ -4660,7 +4663,7 @@ static void Ctrl_PIDBalance(void)
                     // la caida ya tomo impulso" -> bamboleo permanente.
                     balance_pi_scale = 0.0f;
                     balance_d_scale  = soft_scale;
-                    integral *= 0.98f;
+                    integral *= 0.98f;   // Decaimiento exponencial: descarga la integral mientras dura el hold
                 } else {
                     balance_pi_scale = soft_scale;
                     balance_d_scale  = soft_scale;
@@ -4671,13 +4674,13 @@ static void Ctrl_PIDBalance(void)
             d_term *= balance_d_scale;
         }
 
-        output = p_term + i_term + d_term;
+        output = p_term + i_term + d_term;   // Salida PID = suma de los tres terminos
 
         prev_error = control_error;
         pwm_cmd = output;
         pwm_sat = pwm_cmd;
 
-        if (pwm_sat >  50.0f) { pwm_sat =  50.0f; sat_flag = 1; }
+        if (pwm_sat >  50.0f) { pwm_sat =  50.0f; sat_flag = 1; }   // Saturacion de salida (y flag para el anti-windup)
         if (pwm_sat < -50.0f) { pwm_sat = -50.0f; sat_flag = 1; }
 
         if (robot_state == ROBOT_STATE_LINE_FOLLOWING &&
@@ -4711,11 +4714,11 @@ static void Ctrl_PIDBalance(void)
                 pwm_step_max = 8.0f;
             }
 
-            float pwm_delta = pwm_sat - pwm_sat_prev;
+            float pwm_delta = pwm_sat - pwm_sat_prev;   // Limitador de slew-rate: recorta el ESCALON, no el valor
             if (pwm_delta >  pwm_step_max) pwm_delta =  pwm_step_max;
             if (pwm_delta < -pwm_step_max) pwm_delta = -pwm_step_max;
 
-            pwm_sat = pwm_sat_prev + pwm_delta;
+            pwm_sat = pwm_sat_prev + pwm_delta;   // Rampa: el valor viejo mas el paso ya acotado
             pwm_sat_prev = pwm_sat;
         }
 
@@ -4728,16 +4731,16 @@ static void Ctrl_PIDBalance(void)
         // si integrar ayuda a salir de la saturación, no a hundirse más).
         if (!late_cycle) {
             if (fabsf(pwm_sat) <= pwm_limit) {
-                integral += control_error * dt_ctrl;
+                integral += control_error * dt_ctrl;   // Integracion rectangular: I += e*dt (suma de Riemann)
             } else {
-                if (pwm_cmd >  pwm_limit && control_error < 0) integral += control_error * dt_ctrl;
+                if (pwm_cmd >  pwm_limit && control_error < 0) integral += control_error * dt_ctrl;   // Anti-windup por integracion condicional
                 else if (pwm_cmd < -pwm_limit && control_error > 0) integral += control_error * dt_ctrl;
             }
         }
 
         sat_flag = (fabsf(pwm_sat) >= pwm_limit) ? 1 : 0;
 
-        if (integral >  I_MAX) integral =  I_MAX;
+        if (integral >  I_MAX) integral =  I_MAX;   // Anti-windup por saturacion de la integral
         if (integral < -I_MAX) integral = -I_MAX;
 
         if (robot_state == ROBOT_STATE_BALANCE_ONLY) {
@@ -4790,32 +4793,32 @@ static void LineState_Following(void)
         // la línea a mitad de camino de un extremo (e=0.5)
         // pide 5 de diferencial. Los dos PID no compiten:
         // balance decide el PWM COMÚN, este el DIFERENCIAL.
-        float p_line = KP_LINE * line_error;
+        float p_line = KP_LINE * line_error;   // Termino P: proporcional al error de centroide
 
         if (!late_cycle) {
-            line_integral += line_error * dt_ctrl;
+            line_integral += line_error * dt_ctrl;   // Integracion rectangular: I += e*dt
         }
 
-        if (line_integral >  5.0f) line_integral =  5.0f;
+        if (line_integral >  5.0f) line_integral =  5.0f;   // Anti-windup
         if (line_integral < -5.0f) line_integral = -5.0f;
 
-        float i_line = KI_LINE * line_integral;
+        float i_line = KI_LINE * line_integral;   // Termino I
 
         // EMA (β=0.4, τ≈25ms) ANTES de derivar: la derivada
         // amplifica ruido, así que se deriva la versión
         // filtrada del error y no el error crudo.
-        line_error_f_d += 0.4f * (line_error - line_error_f_d);
+        line_error_f_d += 0.4f * (line_error - line_error_f_d);   // Media movil exponencial (EMA) previa a derivar
 
         float d_line = 0.0f;
         if (!late_cycle) {
-            float line_delta = line_error_f_d - line_error_prev;
-            if (line_delta >  0.3f) line_delta =  0.3f;
+            float line_delta = line_error_f_d - line_error_prev;   // Diferencia finita: e_k - e_k-1
+            if (line_delta >  0.3f) line_delta =  0.3f;   // Saturacion del salto (anti-pico)
             if (line_delta < -0.3f) line_delta = -0.3f;
-            d_line = KD_LINE * (line_delta / dt_ctrl);
+            d_line = KD_LINE * (line_delta / dt_ctrl);   // Termino D: derivada = delta / dt
         }
         line_error_prev = line_error_f_d;
 
-        float steering_cmd = p_line + i_line + d_line;
+        float steering_cmd = p_line + i_line + d_line;   // Salida PID = suma de los tres terminos
 
         // Steering directo: proporcional al error de línea sin inner PI.
         // El inner PI de encoders generaba problemas si el signo de
@@ -4963,16 +4966,16 @@ static void LineState_LostRotate(void)
 
     // El giro no sale anticipadamente al ver línea a mitad de camino (podría
     // ser una detección espuria); siempre completa por encoder.
-    float lrot_gz = (float)gz / 100.0f;
-    obj_rot_heading += lrot_gz * DT_CTRL_FIXED;
+    float lrot_gz = (float)gz / 100.0f;   // Escalado del sensor: LSB crudos / sensibilidad -> deg/s
+    obj_rot_heading += lrot_gz * DT_CTRL_FIXED;   // Integracion de Euler: rumbo = suma de (vel. angular * dt)
 
     __disable_irq();
     int32_t lrot_dr = encoder_right - obj_rot_r0;
     int32_t lrot_dl = encoder_left  - obj_rot_l0;
     __enable_irq();
-    float lrot_counts    = (fabsf((float)lrot_dr) + fabsf((float)lrot_dl)) * 0.5f;
-    float lrot_enc_deg   = lrot_counts * (LROT_ABS_TARGET / LROT_ENC_TARGET);
-    float lrot_abs_hdg   = fmaxf(fabsf(obj_rot_heading), lrot_enc_deg);
+    float lrot_counts    = (fabsf((float)lrot_dr) + fabsf((float)lrot_dl)) * 0.5f;   // Promedio de counts girados por ambas ruedas
+    float lrot_enc_deg   = lrot_counts * (LROT_ABS_TARGET / LROT_ENC_TARGET);   // Regla de tres: counts -> grados (calibrado)
+    float lrot_abs_hdg   = fmaxf(fabsf(obj_rot_heading), lrot_enc_deg);   // Fusion por maximo: el primero de los dos sensores que confirme el giro
     float lrot_enc_thr   = LROT_ENC_TARGET * LROT_ENC_FRAC;
 
     // 2026-07-05: con gz/100 (resolución nueva, 31% más alta que /131) el
@@ -5120,12 +5123,12 @@ static void LineState_LostFwd(void)
         steering_adjustment = 0.0f;
         lost_ret_ov_active  = 0;
     } else if (line_loss_pose_valid) {
-        float ret_dx   = line_loss_x_m - odom_x_m;
+        float ret_dx   = line_loss_x_m - odom_x_m;   // Vector desde donde estoy hasta el objetivo
         float ret_dy   = line_loss_y_m - odom_y_m;
-        float ret_dist = sqrtf(ret_dx * ret_dx + ret_dy * ret_dy);
-        float ret_bearing = atan2f(ret_dy, ret_dx) * (180.0f / M_PI);
-        float ret_herr    = ret_bearing - odom_theta_deg;
-        if      (ret_herr >  180.0f) ret_herr -= 360.0f;
+        float ret_dist = sqrtf(ret_dx * ret_dx + ret_dy * ret_dy);   // Pitagoras: distancia euclidea al objetivo
+        float ret_bearing = atan2f(ret_dy, ret_dx) * (180.0f / M_PI);   // Trigonometria: rumbo del vector (cartesiano -> polar)
+        float ret_herr    = ret_bearing - odom_theta_deg;   // Error de rumbo = adonde tengo que ir - adonde apunto
+        if      (ret_herr >  180.0f) ret_herr -= 360.0f;   // Wrap a [-180,180]: elige siempre el giro mas corto
         else if (ret_herr < -180.0f) ret_herr += 360.0f;
 
         // Punto alcanzado (o pasado de costado): NO rendirse ahí
@@ -5242,16 +5245,16 @@ static void LineState_EdgeRotate(void)
         obj_rot_phase1_ms   = 0;
     }
 
-    float erot_gz = (float)gz / 100.0f;
-    obj_rot_heading += erot_gz * DT_CTRL_FIXED;
+    float erot_gz = (float)gz / 100.0f;   // Escalado del sensor -> deg/s
+    obj_rot_heading += erot_gz * DT_CTRL_FIXED;   // Integracion de Euler: rumbo acumulado
 
     __disable_irq();
     int32_t erot_dr = encoder_right - obj_rot_r0;
     int32_t erot_dl = encoder_left  - obj_rot_l0;
     __enable_irq();
-    float erot_counts  = (fabsf((float)erot_dr) + fabsf((float)erot_dl)) * 0.5f;
-    float erot_enc_deg = erot_counts * (EROT_ABS_TARGET / EROT_ENC_TARGET);
-    float erot_abs_hdg = fmaxf(fabsf(obj_rot_heading), erot_enc_deg);
+    float erot_counts  = (fabsf((float)erot_dr) + fabsf((float)erot_dl)) * 0.5f;   // Promedio de counts de ambas ruedas
+    float erot_enc_deg = erot_counts * (EROT_ABS_TARGET / EROT_ENC_TARGET);   // Regla de tres: counts -> grados
+    float erot_abs_hdg = fmaxf(fabsf(obj_rot_heading), erot_enc_deg);   // Fusion por maximo (gyro vs encoder)
     float erot_enc_thr = EROT_ENC_TARGET * EROT_ENC_FRAC;
 
     if (obj_rot_phase == 0) {
@@ -5362,16 +5365,16 @@ static void LineState_PerpRotate(void)
         perp_obj_brake_start_ms = 0;
     }
 
-    float prot_gz = (float)gz / 100.0f;
-    obj_rot_heading += prot_gz * DT_CTRL_FIXED;
+    float prot_gz = (float)gz / 100.0f;   // Escalado del sensor -> deg/s
+    obj_rot_heading += prot_gz * DT_CTRL_FIXED;   // Integracion de Euler: rumbo acumulado
 
     __disable_irq();
     int32_t prot_dr = encoder_right - obj_rot_r0;
     int32_t prot_dl = encoder_left  - obj_rot_l0;
     __enable_irq();
-    float prot_counts  = (fabsf((float)prot_dr) + fabsf((float)prot_dl)) * 0.5f;
-    float prot_enc_deg = prot_counts * (PROT_ABS_TARGET / PROT_ENC_TARGET);
-    float prot_abs_hdg = fmaxf(fabsf(obj_rot_heading), prot_enc_deg);
+    float prot_counts  = (fabsf((float)prot_dr) + fabsf((float)prot_dl)) * 0.5f;   // Promedio de counts de ambas ruedas
+    float prot_enc_deg = prot_counts * (PROT_ABS_TARGET / PROT_ENC_TARGET);   // Regla de tres: counts -> grados
+    float prot_abs_hdg = fmaxf(fabsf(obj_rot_heading), prot_enc_deg);   // Fusion por maximo (gyro vs encoder)
     float prot_enc_thr = PROT_ENC_TARGET * PROT_ENC_FRAC;
 
     if (obj_rot_phase == 0) {
@@ -5513,12 +5516,12 @@ static void LineState_EdgeFwd(void)
         steering_adjustment = 0.0f;
         lost_ret_ov_active  = 0;
     } else if (line_loss_pose_valid) {
-        float ret_dx   = line_loss_x_m - odom_x_m;
+        float ret_dx   = line_loss_x_m - odom_x_m;   // Vector desde donde estoy hasta el objetivo
         float ret_dy   = line_loss_y_m - odom_y_m;
-        float ret_dist = sqrtf(ret_dx * ret_dx + ret_dy * ret_dy);
-        float ret_bearing = atan2f(ret_dy, ret_dx) * (180.0f / M_PI);
-        float ret_herr    = ret_bearing - odom_theta_deg;
-        if      (ret_herr >  180.0f) ret_herr -= 360.0f;
+        float ret_dist = sqrtf(ret_dx * ret_dx + ret_dy * ret_dy);   // Pitagoras: distancia euclidea al objetivo
+        float ret_bearing = atan2f(ret_dy, ret_dx) * (180.0f / M_PI);   // Trigonometria: rumbo del vector (cartesiano -> polar)
+        float ret_herr    = ret_bearing - odom_theta_deg;   // Error de rumbo = adonde tengo que ir - adonde apunto
+        if      (ret_herr >  180.0f) ret_herr -= 360.0f;   // Wrap a [-180,180]: elige siempre el giro mas corto
         else if (ret_herr < -180.0f) ret_herr += 360.0f;
 
         // Mismo sobrepaso que LOST_FWD (ver ahí).
@@ -5969,19 +5972,20 @@ static void LineState_ObjBordearPared(void)
         // Demasiado cerca: reversa pareja (mismo P de rumbo recto,
         // ver REV_STRAIGHT_KP/MAX/SLEW). line_pivot_active queda en 0: el
         // formato compartido de motores aplica half_steer=steering_adjustment*0.5.
-        float rate_diff = speed_right_rps_s - speed_left_rps_s;
+        float rate_diff = speed_right_rps_s - speed_left_rps_s;   // Error de rumbo: diferencia de velocidad entre ruedas
         float corr_target = clampf_local(
-            REV_STRAIGHT_KP * rate_diff,
+            REV_STRAIGHT_KP * rate_diff,   // Termino P sobre esa diferencia
             -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
         );
-        float corr_delta = corr_target - obj_rev_steer_f;
+        float corr_delta = corr_target - obj_rev_steer_f;   // Limitador de slew-rate
         if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
         if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
-        obj_rev_steer_f += corr_delta;
+        obj_rev_steer_f += corr_delta;   // Rampa hacia la correccion objetivo
         steering_adjustment = obj_rev_steer_f;
     } else if (too_close) {
         // Demasiado cerca: pivot alejándose de la pared (según sentido)
         line_pivot_active  = 1;
+        // Mezcla diferencial de pivot: comun +/- potencia, el signo elige el sentido.
         motorRightVelocity = (int16_t)clampf_local(
             -(pwm_sat + OBJ_WALL_PIVOT_POWER * (float)obj_esquive_dir), -30.0f, 30.0f);
         motorLeftVelocity  = (int16_t)clampf_local(
@@ -6043,15 +6047,15 @@ static void LineState_ObjParedLibre(void)
         obj_wall_seq_start_ms = 0;
         obj_detect_ignore_until_ms = HAL_GetTick() + 5000U;
     } else if (wall_reverse) {
-        float rate_diff = speed_right_rps_s - speed_left_rps_s;
+        float rate_diff = speed_right_rps_s - speed_left_rps_s;   // Error de rumbo: diferencia de velocidad entre ruedas
         float corr_target = clampf_local(
-            REV_STRAIGHT_KP * rate_diff,
+            REV_STRAIGHT_KP * rate_diff,   // Termino P sobre esa diferencia
             -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
         );
-        float corr_delta = corr_target - obj_rev_steer_f;
+        float corr_delta = corr_target - obj_rev_steer_f;   // Limitador de slew-rate
         if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
         if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
-        obj_rev_steer_f += corr_delta;
+        obj_rev_steer_f += corr_delta;   // Rampa hacia la correccion objetivo
         steering_adjustment = obj_rev_steer_f;
     } else if (too_close) {
         line_pivot_active  = 1;
@@ -6098,15 +6102,15 @@ static void LineState_ObjGiroPared(void)
     } else if (wall_reverse) {
         // Demasiado cerca: reversa pareja (mismo P de rumbo recto,
         // ver REV_STRAIGHT_KP/MAX/SLEW). line_pivot_active queda en 0.
-        float rate_diff = speed_right_rps_s - speed_left_rps_s;
+        float rate_diff = speed_right_rps_s - speed_left_rps_s;   // Error de rumbo: diferencia de velocidad entre ruedas
         float corr_target = clampf_local(
-            REV_STRAIGHT_KP * rate_diff,
+            REV_STRAIGHT_KP * rate_diff,   // Termino P sobre esa diferencia
             -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
         );
-        float corr_delta = corr_target - obj_rev_steer_f;
+        float corr_delta = corr_target - obj_rev_steer_f;   // Limitador de slew-rate
         if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
         if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
-        obj_rev_steer_f += corr_delta;
+        obj_rev_steer_f += corr_delta;   // Rampa hacia la correccion objetivo
         steering_adjustment = obj_rev_steer_f;
     } else if (too_close) {
         // Demasiado cerca: pivot alejándose de la pared (según sentido)
@@ -6172,7 +6176,7 @@ static void Ctrl_MotoresLinea(void)
     }
 
     if (!line_pivot_active) {
-        float half_steer = steering_adjustment * 0.5f;
+        float half_steer = steering_adjustment * 0.5f;   // Se reparte mitad y mitad: +half a una rueda, -half a la otra
 
         // En LOST/SEARCHING/OBJ_HOLD/LOST_FWD/EDGE_FWD/WALL_FWD/WALL_CLEAR (solo
         // cuando avanzan derecho, steering_adjustment==0): corrección yaw igual
@@ -6194,9 +6198,10 @@ static void Ctrl_MotoresLinea(void)
             // 0.23 = 0.3*(100/131): misma restauración de ganancia efectiva
             // que la corrección de yaw de balance común (ver ahí). gz crudo
             // con zona muerta (sin filtro — ver GZ_YAW_ASSIST_DB).
-            half_steer = apply_deadbandf((float)gz / 100.0f, GZ_YAW_ASSIST_DB) * 0.23f;
+            half_steer = apply_deadbandf((float)gz / 100.0f, GZ_YAW_ASSIST_DB) * 0.23f;   // Termino P sobre el exceso de velocidad de giro
         }
 
+        // Mezcla diferencial: PWM comun (equilibrio) -/+ steering (rumbo).
         float mR = pwm_sat - half_steer;
         float mL = pwm_sat + half_steer;
 
@@ -6237,10 +6242,10 @@ static void Ctrl_MotoresManual(void)
         // UNER.c), el giro seguía sintiéndose demasiado fuerte — "siempre
         // movimientos suaves".
         const float STEER_RATE = 0.0625f;
-        float steer_delta = manual_steering_cmd - steering_adjustment;
+        float steer_delta = manual_steering_cmd - steering_adjustment;   // Limitador de slew-rate del giro comandado
         if (steer_delta >  STEER_RATE) steer_delta =  STEER_RATE;
         if (steer_delta < -STEER_RATE) steer_delta = -STEER_RATE;
-        steering_adjustment += steer_delta;
+        steering_adjustment += steer_delta;   // Rampa hacia el comando (evita el salto brusco)
         manual_straight_steer_f = steering_adjustment; // sincronizado para la transición a "sin giro"
     } else {
         // Sin giro comandado: corrección de rumbo recto para que
@@ -6248,15 +6253,15 @@ static void Ctrl_MotoresManual(void)
         // mismo algoritmo P sobre diferencia de velocidad de ruedas ya
         // usado y calibrado en la reversa recta de OBJ_REVERSE/wall-following
         // (ver REV_STRAIGHT_KP/MAX/SLEW), reutilizado tal cual.
-        float rate_diff = speed_right_rps_s - speed_left_rps_s;
+        float rate_diff = speed_right_rps_s - speed_left_rps_s;   // Error de rumbo: diferencia de velocidad entre ruedas (0 = derecho)
         float corr_target = clampf_local(
-            REV_STRAIGHT_KP * rate_diff,
+            REV_STRAIGHT_KP * rate_diff,   // Termino P sobre esa diferencia
             -REV_STRAIGHT_MAX, REV_STRAIGHT_MAX
         );
-        float corr_delta = corr_target - manual_straight_steer_f;
+        float corr_delta = corr_target - manual_straight_steer_f;   // Limitador de slew-rate de la correccion
         if (corr_delta >  REV_STRAIGHT_SLEW) corr_delta =  REV_STRAIGHT_SLEW;
         if (corr_delta < -REV_STRAIGHT_SLEW) corr_delta = -REV_STRAIGHT_SLEW;
-        manual_straight_steer_f += corr_delta;
+        manual_straight_steer_f += corr_delta;   // Rampa hacia la correccion objetivo
         steering_adjustment = manual_straight_steer_f;
     }
 
@@ -6267,9 +6272,10 @@ static void Ctrl_MotoresManual(void)
     }
     prev_steering_cmd = manual_steering_cmd;
 
+    // Mezcla diferencial: PWM comun (equilibrio) -/+ steering (giro).
     float mR = pwm_sat - steering_adjustment;
     float mL = pwm_sat + steering_adjustment;
-    if (mR >  100.0f) mR =  100.0f;
+    if (mR >  100.0f) mR =  100.0f;   // Saturacion al rango fisico del PWM
     if (mR < -100.0f) mR = -100.0f;
     if (mL >  100.0f) mL =  100.0f;
     if (mL < -100.0f) mL = -100.0f;
@@ -6366,7 +6372,7 @@ static void Ctrl_MotoresBalance(void)
     float wheel_trim_l = 0.0f;   // para la rueda IZQUIERDA (se suma a mR)
     // Velocidad filtrada de cada rueda (para el término D): un count aislado
     // (3.57 rps) entra como ~0.7 y se desvanece, en vez de un escalón.
-    wheel_spd_r_f += WHEEL_SPD_BETA * (speed_right_rps_s - wheel_spd_r_f);
+    wheel_spd_r_f += WHEEL_SPD_BETA * (speed_right_rps_s - wheel_spd_r_f);   // Media movil exponencial (EMA, tau~50ms)
     wheel_spd_l_f += WHEEL_SPD_BETA * (speed_left_rps_s  - wheel_spd_l_f);
     // Gate de modo (2026-07-27): Ctrl_MotoresBalance también atiende
     // BALANCE_AND_SPEED, pero la estación es SOLO de BALANCE_ONLY/IDLE
@@ -6386,36 +6392,36 @@ static void Ctrl_MotoresBalance(void)
         }
         int32_t drift_r = enc_r - wheel_pos_anchor_r;   // deriva neta rueda derecha [counts]
         int32_t drift_l = enc_l - wheel_pos_anchor_l;   // deriva neta rueda izquierda
-        float rot   = 0.5f * (float)(drift_r - drift_l);        // [counts] el robot giró
-        float v_rot = 0.5f * (wheel_spd_r_f - wheel_spd_l_f);   // [rps]
+        float rot   = 0.5f * (float)(drift_r - drift_l);        // [counts] semiDIFERENCIA = rotacion (la semiSUMA seria traslacion)
+        float v_rot = 0.5f * (wheel_spd_r_f - wheel_spd_l_f);   // [rps] idem en velocidad: velocidad de giro
         // Calma rotacional (ver WHEEL_ROTCALM_*): 0 = sin giro real → canal
         // diferencial mudo; 1 = girando → autoridad completa.
-        float yaw_rate = ((float)gz / 100.0f) - wheel_yaw_bias_dps;   // [°/s]
-        float rot_calm = fmaxf(fabsf(yaw_rate) / WHEEL_ROTCALM_GYRO_REF,
+        float yaw_rate = ((float)gz / 100.0f) - wheel_yaw_bias_dps;   // [°/s] lectura escalada menos el bias medido en reposo
+        float rot_calm = fmaxf(fabsf(yaw_rate) / WHEEL_ROTCALM_GYRO_REF,   // Normalizacion 0..1 de cada senal, se queda con la mayor
                                fabsf(v_rot)    / WHEEL_ROTCALM_V_REF);
         if (rot_calm > 1.0f) rot_calm = 1.0f;
         // Heading-hold PI: rumbo acumulado desde el ancla (gz menos el bias
         // medido en reposo) → P sobre el exceso fuera de WHEEL_YAW_DB + I
         // que acumula ese exceso, ambos al canal del yaw-assist (misma
         // escala 0.23 y mismo signo → polaridad heredada, ya validada).
-        wheel_yaw_deg += yaw_rate * dt_ctrl;
-        float yaw_exc = apply_deadbandf(wheel_yaw_deg, WHEEL_YAW_DB);
+        wheel_yaw_deg += yaw_rate * dt_ctrl;   // Integracion de Euler: rumbo = suma de (velocidad angular * dt)
+        float yaw_exc = apply_deadbandf(wheel_yaw_deg, WHEEL_YAW_DB);   // Zona muerta: solo el exceso de rumbo
         if (yaw_exc != 0.0f && rot_calm > WHEEL_ROTCALM_INT_GATE) {
-            wheel_yaw_int = clampf_local(wheel_yaw_int + yaw_exc * dt_ctrl,
+            wheel_yaw_int = clampf_local(wheel_yaw_int + yaw_exc * dt_ctrl,   // Integracion rectangular + anti-windup por saturacion
                                          -WHEEL_YAW_INT_MAX / WHEEL_YAW_KI,
                                           WHEEL_YAW_INT_MAX / WHEEL_YAW_KI);
         }
-        float yaw_hold = clampf_local(WHEEL_YAW_KP * yaw_exc, -WHEEL_YAW_MAX, WHEEL_YAW_MAX)
-                       + WHEEL_YAW_KI * wheel_yaw_int;
-        correction += -yaw_hold * 0.23f * rot_calm;
+        float yaw_hold = clampf_local(WHEEL_YAW_KP * yaw_exc, -WHEEL_YAW_MAX, WHEEL_YAW_MAX)   // Termino P del heading-hold (saturado)
+                       + WHEEL_YAW_KI * wheel_yaw_int;   // + termino I: anula perturbaciones constantes
+        correction += -yaw_hold * 0.23f * rot_calm;   // Factor de escala a %PWM diferencial, atenuado por la calma
         // Exceso fuera de la zona muerta (continuo en el borde: 0 adentro).
         float rot_exc = 0.0f;
-        if      (rot >  WHEEL_ROT_DB) rot_exc = rot - WHEEL_ROT_DB;
+        if      (rot >  WHEEL_ROT_DB) rot_exc = rot - WHEEL_ROT_DB;   // Zona muerta manual (mismo criterio que apply_deadbandf)
         else if (rot < -WHEEL_ROT_DB) rot_exc = rot + WHEEL_ROT_DB;
         // PD: la D solo entra con el eje activo (fuera de la zona), así el
         // punto dulce no recibe amortiguación que pelee con el balance.
         float rot_trim = 0.0f;
-        if (rot_exc != 0.0f) rot_trim = (WHEEL_ROT_KP*rot_exc + WHEEL_ROT_KD*v_rot) * rot_calm;
+        if (rot_exc != 0.0f) rot_trim = (WHEEL_ROT_KP*rot_exc + WHEEL_ROT_KD*v_rot) * rot_calm;   // PD: P sobre posicion angular + D sobre velocidad de giro
         // Recomposición: derecha = +rot, izquierda = −rot.
         wheel_trim_r = clampf_local( rot_trim, -WHEEL_TRIM_MAX, WHEEL_TRIM_MAX);
         wheel_trim_l = clampf_local(-rot_trim, -WHEEL_TRIM_MAX, WHEEL_TRIM_MAX);
@@ -6425,15 +6431,16 @@ static void Ctrl_MotoresBalance(void)
         wheel_pos_armed = 0;
     }
 
+    // Mezcla diferencial: comun (pwm_sat) +/- diferencial (correction) por rueda.
     float mR = pwm_sat + correction + wheel_trim_l;   // mR mueve la rueda IZQUIERDA
     float mL = pwm_sat - correction + wheel_trim_r;   // mL mueve la rueda DERECHA
 
-    if (mR >  100.0f) mR =  100.0f;
+    if (mR >  100.0f) mR =  100.0f;   // Saturacion al rango fisico del PWM
     if (mR < -100.0f) mR = -100.0f;
     if (mL >  100.0f) mL =  100.0f;
     if (mL < -100.0f) mL = -100.0f;
 
-    motorRightVelocity = -(int16_t)lroundf(mL);
+    motorRightVelocity = -(int16_t)lroundf(mL);   // Redondeo al entero mas cercano (no truncamiento)
     motorLeftVelocity  = -(int16_t)lroundf(mR);
 }
 
@@ -6614,28 +6621,28 @@ static void Ctrl_SalidaMotores(void)
         int16_t neutral  = out_soft ? MOTOR_CMD_NEUTRAL : MOTOR_CMD_NEUTRAL_DYN;
 
         int16_t mR_comp = motorRightVelocity;
-        if (mR_comp >= -neutral && mR_comp <= neutral) mR_comp = 0;
+        if (mR_comp >= -neutral && mR_comp <= neutral) mR_comp = 0;   // Zona neutra: comandos chicos -> 0 real (anti-chatter)
         if (mR_comp != 0) {
             // Offset rampeado (ver MOTOR_DB_RAMP_GAIN): proporcional al exceso
             // sobre la zona neutra, con techo en el deadband de la rueda.
             int16_t cR = dbR;
             if (out_soft) {
-                int16_t magR = (int16_t)((mR_comp > 0 ? mR_comp : -mR_comp) - neutral);
-                cR = (int16_t)(magR * MOTOR_DB_RAMP_GAIN);
-                if (cR > dbR) cR = dbR;
+                int16_t magR = (int16_t)((mR_comp > 0 ? mR_comp : -mR_comp) - neutral);   // Exceso sobre la zona neutra
+                cR = (int16_t)(magR * MOTOR_DB_RAMP_GAIN);   // Rampa lineal del offset (en vez de escalon completo)
+                if (cR > dbR) cR = dbR;   // Techo: el deadband medido de la rueda
             }
-            mR_comp = (mR_comp > 0) ? (int16_t)(mR_comp + cR) : (int16_t)(mR_comp - cR);
+            mR_comp = (mR_comp > 0) ? (int16_t)(mR_comp + cR) : (int16_t)(mR_comp - cR);   // Compensacion de deadband: empuja en el sentido del comando
         }
         if (mR_comp >  100) mR_comp =  100;
         if (mR_comp < -100) mR_comp = -100;
 
         int16_t mL_comp = -motorLeftVelocity;
-        if (mL_comp >= -neutral && mL_comp <= neutral) mL_comp = 0;
+        if (mL_comp >= -neutral && mL_comp <= neutral) mL_comp = 0;   // Zona neutra (idem rueda derecha)
         if (mL_comp != 0) {
             int16_t cL = dbL;
             if (out_soft) {
-                int16_t magL = (int16_t)((mL_comp > 0 ? mL_comp : -mL_comp) - neutral);
-                cL = (int16_t)(magL * MOTOR_DB_RAMP_GAIN);
+                int16_t magL = (int16_t)((mL_comp > 0 ? mL_comp : -mL_comp) - neutral);   // Exceso sobre la zona neutra
+                cL = (int16_t)(magL * MOTOR_DB_RAMP_GAIN);   // Rampa lineal del offset
                 if (cL > dbL) cL = dbL;
             }
             mL_comp = (mL_comp > 0) ? (int16_t)(mL_comp + cL) : (int16_t)(mL_comp - cL);

@@ -210,7 +210,7 @@ void UNER_Task(void) {
                     unerRx->header = PAYLOAD;
                     unerRx->indexData = unerRx->indexR + 1;
                     unerRx->indexData &= unerRx->mask;
-                    unerRx->chk = 'U' ^ 'N' ^ 'E' ^ 'R' ^ unerRx->nBytes ^ ':';
+                    unerRx->chk = 'U' ^ 'N' ^ 'E' ^ 'R' ^ unerRx->nBytes ^ ':';   // Checksum XOR: arranca con el header ya recibido
                 } else {
                     unerRx->header = HEADER_U;
                     unerRx->indexR--;
@@ -220,10 +220,10 @@ void UNER_Task(void) {
             	//UNER_Debug("  payload byte, remaining=%u chk=0x%02X\n", unerRx->nBytes, unerRx->chk);
                 unerRx->nBytes--;
                 if (unerRx->nBytes > 0) {
-                    unerRx->chk ^= unerRx->buff[unerRx->indexR];
+                    unerRx->chk ^= unerRx->buff[unerRx->indexR];   // Acumula el XOR de cada byte del payload
                 } else {
                     unerRx->header = HEADER_U;
-                    if (unerRx->buff[unerRx->indexR] == unerRx->chk) {
+                    if (unerRx->buff[unerRx->indexR] == unerRx->chk) {   // Ultimo byte = checksum: si coincide, la trama llego intacta
                         unerRx->isComannd = true;
                         decodeCommand(unerRx, unerTx);
                     }
@@ -242,7 +242,7 @@ static uint8_t putHeaderOnTx(_sTx *dataTx, _eCmd ID, uint8_t frameLength)
 {
     dataTx->chk = 0;
     dataTx->buff[dataTx->indexW++]='U';
-    dataTx->indexW &= dataTx->mask;
+    dataTx->indexW &= dataTx->mask;   // Buffer circular: la mascara (tam-1) hace el "dar la vuelta" sin division
     dataTx->buff[dataTx->indexW++]='N';
     dataTx->indexW &= dataTx->mask;
     dataTx->buff[dataTx->indexW++]='E';
@@ -255,8 +255,8 @@ static uint8_t putHeaderOnTx(_sTx *dataTx, _eCmd ID, uint8_t frameLength)
     dataTx->indexW &= dataTx->mask;
     dataTx->buff[dataTx->indexW++]=ID;
     dataTx->indexW &= dataTx->mask;
-    dataTx->chk ^= (frameLength+1);
-    dataTx->chk ^= ('U' ^'N' ^'E' ^'R' ^ID ^':') ;
+    dataTx->chk ^= (frameLength+1);   // Checksum XOR de salida: mismo calculo que hace el receptor
+    dataTx->chk ^= ('U' ^'N' ^'E' ^'R' ^ID ^':') ;   // XOR es asociativo/conmutativo: el orden no importa
     return  dataTx->chk;
 }
 
@@ -264,7 +264,7 @@ static uint8_t putByteOnTx(_sTx *dataTx, uint8_t byte)
 {
     dataTx->buff[dataTx->indexW++]=byte;
     dataTx->indexW &= dataTx->mask;
-    dataTx->chk ^= byte;
+    dataTx->chk ^= byte;   // Cada byte enviado se acumula al checksum XOR
     return dataTx->chk;
 }
 
