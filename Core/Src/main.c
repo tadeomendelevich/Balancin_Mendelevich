@@ -69,7 +69,7 @@ typedef enum {
     LINE_STATE_EDGE_SETTLE,    // Post-90°: pausa de estabilización antes de avanzar
     LINE_STATE_EDGE_FWD,       // Post-90°: avanza con velocidad controlada hasta encontrar la línea
     LINE_STATE_GIVEN_UP,       // Ni el giro de 180 ni el de 90 encontraron la línea: reposo total hasta reponerla a mano
-    LINE_STATE_PERP_ROTATE,    // Los 4 ADC en negro sin manipulación: cruce perpendicular, gira 90° (sentido del último esquive)
+    LINE_STATE_PERPENDICULAR_ROTATE,    // Los 4 ADC en negro sin manipulación: cruce perpendicular, gira 90° (sentido del último esquive)
     // NOTA (2026-07-16): OBJ_ESPERA_REVERSA, OBJ_RETROCESO y OBJ_ARC eliminados
     // (muertos desde 2026-07-14). Esto RENUMERA los estados OBJ_* que viajan a
     // Qt en WifiOdomData_t.line_state — si Qt interpreta el valor, actualizar su mirror.
@@ -281,6 +281,29 @@ typedef enum {
 #define PERDIDA_FRENO_EMPUJE        1.0f
 #define INTEGRAL_DECAIMIENTO   		0.990f
 
+// ── Estación por rueda: mantener la POSICIÓN mientras balancea (BALANCE_ONLY/IDLE) ──
+// Eje TRASLACIÓN: PD sobre el desplazamiento reciente de encoders, aplicado al
+// SETPOINT de inclinación (no a PWM): para volver atrás, inclinarse hacia atrás
+// y dejar que el balance haga el resto. Mismo patrón que el hold de PAUSA_GIRO.
+// El eje ROTACIÓN sí va por PWM diferencial (ver Ctrl_MotoresBalance).
+// Historia completa de los ajustes (pasadas 1-16): CHANGELOG.md, 2026-07-26/27.
+#define RUEDA_ESTACION_ANG_KP    0.05f  // P: ° por count de desplazamiento reciente
+#define RUEDA_ESTACION_AMORT     1.00f  // D: ° por rps de velocidad de traslación
+#define RUEDA_ESTACION_ANG_MAX   1.5f   // tope total (si vuelca → 1.2; si frena poco → 1.8)
+#define RUEDA_ESTACION_P_MAX     0.5f   // tope propio del P: solo frena deriva lenta (la autoridad grande es de la D)
+#define RUEDA_TRASL_ZM           3      // counts sin corregir (ruido de cuantización)
+#define RUEDA_V_ZM_RPS           0.25f  // rps sin corregir (filtra el pico de un count suelto)
+// Factor de CALMA: atenúa P y D juntos según la actividad real
+// (calm = max(|gyro|/GIRO_REF, |v_trasl|/V_REF), tope 1). Quieto → estación muda.
+#define RUEDA_CALMA_GIRO_REF     8.0f   // °/s a los que calm llega a 1 por gyro (si no amortigua llegadas suaves → 6)
+#define RUEDA_CALMA_V_REF        1.0f   // rps a los que calm llega a 1 por velocidad
+#define RUEDA_DESPL_CALMA_MS     150    // ms sin tick en AMBAS ruedas = reposo real
+#define RUEDA_DESPL_FUGA_RAPIDA  0.90f  // fuga en reposo real (τ≈100ms): mata el residuo del P
+#define RUEDA_DESPL_FUGA         0.998f // fuga normal del desplazamiento (τ≈5s)
+// NO reintentar el "fade de supervivencia" por gyro alto (probado y eliminado el
+// 2026-07-27): toda recuperación de empujón supera 40°/s → la estación quedaba
+// muda justo cuando debía frenar. El exceso se acota con RUEDA_ESTACION_ANG_MAX.
+
 // Steering PID (lazo cerrado por encoders)
 #define DIRECCION_KP        5.0f    // ajustar según respuesta real
 #define DIRECCION_KI        0.2f
@@ -445,7 +468,7 @@ typedef enum {
 #define OBJ_PAUSA_POS_KP           0.06f     // grados por count de deriva (≈1° cada 10 cm)
 #define OBJ_PAUSA_POS_MAX          1.5f      // tope de la corrección de posición (°)
 #define OBJ_PAUSA_POS_ZM_COUNTS    3.0f      // banda muerta (≈2 cm): adentro no corrige, deja asentar
-#define OBJ_GIRO_FINAL_VENTANA_MS   1500U     // la línea hallada al salir del bordeo debe disparar PERP dentro de esta ventana
+#define OBJ_GIRO_FINAL_VENTANA_MS   1500U     // la línea hallada al salir del bordeo debe disparar PERPENDICULAR dentro de esta ventana
 // 2026-07-13: esquive alternado. `obj_esquive_dir` = +1 → giro 90° a la DERECHA
 // y pared seguida con el lateral izquierdo ADC7 (adc_promedio[6]) — el comportamiento
 // de siempre. -1 → todo espejado: giro a la IZQUIERDA y pared con el lateral
@@ -585,10 +608,10 @@ static volatile uint32_t adc_foto_secuencia = 0;
 // Cuarentena de sensores de línea enganchados (2026-07-10): un canal clavado
 // en el tope (~4095, típico de soldadura fría — baja al presionarlo con el
 // dedo — o emisor IR caído) finge "línea" permanente de ese lado: arrastra el
-// centroide, impide detectar la pérdida de línea y ensucia all_black. Si un
+// centroide, impide detectar la pérdida de línea y ensucia todo_negro. Si un
 // canal pasa LINEA_CLAVADO_MS continuos por encima de LINEA_CLAVADO_ADC se lo pone
 // en cuarentena (contribuye 0 al centroide/detección y se marca con X en el
-// display); vuelve solo apenas lee blanco de nuevo (< LINE_THRESHOLD).
+// display); vuelve solo apenas lee blanco de nuevo (< LINEA_UMBRAL_ADC).
 // NOTA: es una DEFENSA, no un fix — el canal enganchado es un problema de
 // hardware (revisar soldadura/conector del sensor marcado con X).
 #define LINEA_CLAVADO_ADC   3950.0f  // por encima de esto se considera "clavado en el tope"
@@ -706,7 +729,7 @@ float KV_brake_value;
 float KP_LINE = 10.0f;
 float KD_LINE = 2.0f;
 float KI_LINE = 0.5f;
-float LINE_THRESHOLD = 3000.0f;  // entre piso blanco (~1800) y cinta negra (~3800)
+float LINEA_UMBRAL_ADC = 3000.0f;  // entre piso blanco (~1800) y cinta negra (~3800)
 float LINE_ANGLE = 2.0f;        // inclinación máxima (°) para avanzar en seguimiento de línea
 
 // Trim del centroide de línea: corrige desplazamiento físico del array de sensores.
@@ -736,7 +759,7 @@ static uint8_t    linea_vista_desde_entrada = 0; // evita búsqueda automática 
 static float      linea_busqueda_dir  = 1.0f; // dirección de búsqueda (+1 o -1)
 static float      ultima_linea_dir    = 1.0f; // última dirección válida de la línea (+1 o -1)
 static uint8_t    linea_centrada_al_perder = 1; // 1 = venía centrado (ADC del medio) al perder la línea, 0 = venía por los extremos
-// 1 = el último sensor con señal fue un extremo (w[0]/w[3]) sin soporte del medio
+// 1 = el último sensor con señal fue un extremo (linea_peso[0]/linea_peso[3]) sin soporte del medio
 static uint8_t    ultimo_detectado_solo_borde = 0;
 static float      linea_error_filtrado_d   = 0.0f;
 
@@ -820,7 +843,7 @@ static uint32_t obj_rev_ultimo_mov_ms = 0;         // tick del último cambio de
 static int8_t   obj_esquive_dir      = 1;         // sentido del esquive ACTUAL: +1 derecha (ADC7), -1 izquierda (ADC5)
 static int8_t   obj_esquive_prox_dir = 1;         // sentido de la PRÓXIMA detección (se alterna en cada objeto)
 // Latch de reversa de pared por counts (ver OBJ_PARED_REV_COUNTS)
-static uint8_t  obj_pared_rev_pestillo    = 0;
+static uint8_t  obj_pared_rev_latch    = 0;
 static int32_t  obj_pared_rev_der0 = 0;
 static int32_t  obj_pared_rev_izq0 = 0;
 static uint32_t obj_pared_rev_inicio_ms = 0;
@@ -839,9 +862,9 @@ static uint8_t  obj_frente_confirmado = 0;          // latch: habilita hold de d
 static uint32_t obj_hold_inicio_ms    = 0;         // inicio de la pausa post-giro (PAUSA_GIRO, 2s)
 static int32_t  obj_pausa_der0         = 0;         // ancla de posición del hold post-giro (PAUSA_GIRO)
 static int32_t  obj_pausa_izq0         = 0;
-static uint32_t obj_giro_final_pendiente_ms = 0;     // línea reencontrada al salir del bordeo; espera el giro final PERP
-static uint8_t  perp_desde_esquive   = 0;     // el PERP_ROTATE actual es el giro final de un esquive
-static uint32_t perp_obj_freno_inicio_ms   = 0;     // inicio real del contrafreno suave del giro final de esquive
+static uint32_t obj_giro_final_pendiente_ms = 0;     // línea reencontrada al salir del bordeo; espera el giro final PERPENDICULAR
+static uint8_t  perpendicular_desde_esquive   = 0;     // el PERPENDICULAR_ROTATE actual es el giro final de un esquive
+static uint32_t perpendicular_obj_freno_inicio_ms   = 0;     // inicio real del contrafreno suave del giro final de esquive
 static uint32_t obj_pared_acerca_inicio_ms = 0;    // timestamp de entrada a WALL_APPROACH
 static uint32_t obj_pared_avance_inicio_ms = 0;         // timestamp de entrada a WALL_FWD (init de PI/estado, no se usa para ignorar línea)
 static uint32_t obj_pared_perdida_ms      = 0;         // (sin uso para ignorar línea, ver obj_pared_sec_inicio_ms)
@@ -1105,7 +1128,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
         uint8_t row = adc_historial_escritura;
         for (uint8_t ch = 0; ch < 8; ++ch)
             adc_historial[row][ch] = adc_valores[ch];
-        adc_historial_escritura = (uint8_t)((row + 1U) % ADC_HISTORIAL_TAMANO);
+        adc_historial_escritura = (uint8_t)((row + 1U) % ADC_HISTORIAL_TAMANO);   // Buffer circular por modulo: al llegar al final vuelve a 0
         if (adc_historial_cantidad < ADC_HISTORIAL_TAMANO)
             adc_historial_cantidad++;
         __DMB();
@@ -1254,8 +1277,8 @@ uint8_t usb_enqueue_tx_segments(const uint8_t *first, uint16_t first_len,
 
     primask = __get_PRIMASK();
     __disable_irq();
-    used = (uint16_t)((tx_cabeza - tx_cola) & USB_TX_BUF_MASCARA);
-    free_space = (uint16_t)(USB_TX_BUF_MASCARA - used);
+    used = (uint16_t)((tx_cabeza - tx_cola) & USB_TX_BUF_MASCARA);   // Buffer circular por mascara: bytes pendientes de enviar
+    free_space = (uint16_t)(USB_TX_BUF_MASCARA - used);   // Espacio libre = capacidad total - ocupado
     if (total_len > free_space) {
         usb_tx_descartados++;
         if (!primask) __enable_irq();
@@ -1368,7 +1391,7 @@ void MotorControl(int16_t setMotorRight, int16_t setMotorLeft)
     // que duty% = CCR/(ARR+1). Despejando: CCR = (ARR+1)·duty/100.
     // Ej.: 50% → CCR=480 → pin en alto 480 de cada 960 ticks del timer.
     uint32_t ccrR = ((arr3 + 1) * dutyR) / 100U;   // Regla de tres: % de duty -> cuentas del timer
-    uint32_t ccrL = ((arr4 + 1) * dutyL) / 100U;
+    uint32_t ccrL = ((arr4 + 1) * dutyL) / 100U;   // Regla de tres: duty [%] -> cuentas del timer (CCR)
 
     if (ccrR > arr3) ccrR = arr3;
     if (ccrL > arr4) ccrL = arr4;
@@ -1752,7 +1775,7 @@ static float AntiStall_Tick(uint8_t tag, uint8_t wants_motion, float max_boost)
         as_boost *= ANTIATASCO_DECAIMIENTO;   // Decaimiento exponencial (multiplicativo por ciclo)
     }
     if (wants_motion && as_still >= ANTIATASCO_ESPERA_CIC)
-        as_boost = fminf(as_boost + ANTIATASCO_PASO, max_boost);
+        as_boost = fminf(as_boost + ANTIATASCO_PASO, max_boost);   // Rampa con tope: sube de a un paso por ciclo hasta el maximo
     return as_boost;
 }
 
@@ -2024,7 +2047,7 @@ static const char *LineStateStr(void)
         case LINE_STATE_EDGE_SETTLE:        return "EESTAB";
         case LINE_STATE_EDGE_FWD:           return "EVUELV";
         case LINE_STATE_GIVEN_UP:           return "PARADO";
-        case LINE_STATE_PERP_ROTATE:        return "PGIRO";
+        case LINE_STATE_PERPENDICULAR_ROTATE:        return "PGIRO";
         case LINE_STATE_OBJ_FRENO_REVERSA:  return "STOP";
         case LINE_STATE_OBJ_GIRO_ESQUIVE:   return "ESQUIV";
         case LINE_STATE_OBJ_PAUSA_GIRO:     return "PAUSA";
@@ -2262,7 +2285,7 @@ void updateDisplay(void) {
                     if (h > 0)
                         SSD1306_DrawFilledRectangle(x0, digit_y - 1 - h, bar_width, h, SSD1306_COLOR_WHITE);
                     // indicador negro/blanco: relleno = ve cinta negra
-                    if (adc_promedio[adc_idx] > (uint16_t)LINE_THRESHOLD)
+                    if (adc_promedio[adc_idx] > (uint16_t)LINEA_UMBRAL_ADC)
                         SSD1306_DrawFilledRectangle(x0, bar_top, bar_width, ind_h - 1, SSD1306_COLOR_WHITE);
                     else
                         SSD1306_DrawRectangle(x0, bar_top, bar_width, ind_h - 1, SSD1306_COLOR_WHITE);
@@ -2298,7 +2321,7 @@ void updateDisplay(void) {
             uint8_t det = 0;
             for (uint8_t ch = 0; ch < 4; ch++)
                 if (!linea_canal_cuarentena[ch] &&
-                    adc_promedio[ch] > (uint16_t)LINE_THRESHOLD) det = 1;
+                    adc_promedio[ch] > (uint16_t)LINEA_UMBRAL_ADC) det = 1;
             if (det) {
                 float e = clampf_local(linea_error_display, -0.6f, 0.6f);
                 int16_t off = (int16_t)(e * (float)(fw / 2 - 4) / 0.6f);
@@ -2345,9 +2368,9 @@ void updateDisplay(void) {
             if (h > 0)
                 SSD1306_DrawFilledRectangle(x0, digit_y - 1 - h, bar_width, h, SSD1306_COLOR_WHITE);
 
-            // tick de umbral (1-4: LINE_THRESHOLD, 5-8: OBJ_DETECT_UMBRAL_VAL),
+            // tick de umbral (1-4: LINEA_UMBRAL_ADC, 5-8: OBJ_DETECT_UMBRAL_VAL),
             // en color invertido si la barra ya lo cubre
-            float th = (i < 4) ? LINE_THRESHOLD : OBJ_DETECT_UMBRAL_VAL;
+            float th = (i < 4) ? LINEA_UMBRAL_ADC : OBJ_DETECT_UMBRAL_VAL;
             uint16_t hth = (uint16_t)((uint32_t)th * bar_max_h / 4095U);
             uint16_t yth = digit_y - 1 - hth;
             SSD1306_COLOR_t tc = (h >= hth) ? SSD1306_COLOR_BLACK : SSD1306_COLOR_WHITE;
@@ -2355,7 +2378,7 @@ void updateDisplay(void) {
 
             // indicador de disparo: cuadradito arriba de la columna
             // (línea 1-4: v > umbral = cinta negra; objeto 5-8: v < umbral = objeto)
-            uint8_t trig = (i < 4) ? (adc_promedio[i] > (uint16_t)LINE_THRESHOLD)
+            uint8_t trig = (i < 4) ? (adc_promedio[i] > (uint16_t)LINEA_UMBRAL_ADC)
                                    : ((float)adc_promedio[i] < OBJ_DETECT_UMBRAL_VAL);
             if (trig) {
                 SSD1306_COLOR_t ic = (h >= bar_max_h - 7) ? SSD1306_COLOR_BLACK
@@ -2394,7 +2417,7 @@ void updateDisplay(void) {
         snprintf(lbuf, sizeof(lbuf), "I:%s", nbuf + 1);   OLED_Str5(66, 30, lbuf);
         FormatSignedFixed(nbuf, sizeof(nbuf), KD_LINE, 2);
         snprintf(lbuf, sizeof(lbuf), "D:%s", nbuf + 1);   OLED_Str5(66, 39, lbuf);
-        snprintf(lbuf, sizeof(lbuf), "TH:%lu", (unsigned long)(uint32_t)LINE_THRESHOLD);
+        snprintf(lbuf, sizeof(lbuf), "TH:%lu", (unsigned long)(uint32_t)LINEA_UMBRAL_ADC);
         OLED_Str5(66, 48, lbuf);
         FormatSignedFixed(nbuf, sizeof(nbuf), LINE_SPEED_TARGET, 2);
         snprintf(lbuf, sizeof(lbuf), "VT:%s", nbuf + 1);  OLED_Str5(66, 57, lbuf);
@@ -2408,7 +2431,7 @@ void updateDisplay(void) {
 
         const uint16_t rows4[4] = { 13, 26, 39, 52 };
         for (uint8_t i = 0; i < 4; i++) {
-            uint8_t trig_l = (adc_promedio[i] > (uint16_t)LINE_THRESHOLD);
+            uint8_t trig_l = (adc_promedio[i] > (uint16_t)LINEA_UMBRAL_ADC);
             snprintf(lbuf, sizeof(lbuf), "%u:%4u%c", i + 1, adc_promedio[i], trig_l ? '*' : ' ');
             OLED_Str5(2, rows4[i], lbuf);
 
@@ -2530,7 +2553,7 @@ void updateDisplay(void) {
                 if (fabsf(linea_perdida_x_m) > rng) rng = fabsf(linea_perdida_x_m);
                 if (fabsf(linea_perdida_y_m) > rng) rng = fabsf(linea_perdida_y_m);
             }
-            float k = (float)(bw / 2 - 3) / rng;
+            float k = (float)(bw / 2 - 3) / rng;   // Escala del mapa: pixeles por metro (autoajuste al rango visible)
 
             // punto de pérdida de línea (cuadradito hueco)
             if (linea_perdida_pose_valida) {
@@ -2543,7 +2566,7 @@ void updateDisplay(void) {
             int16_t px = cx - (int16_t)(odom_y_m * k);
             int16_t py = cy - (int16_t)(odom_x_m * k);
             float th = odom_theta_grados * ((float)M_PI / 180.0f);
-            int16_t hx = px - (int16_t)(sinf(th) * 7.0f);
+            int16_t hx = px - (int16_t)(sinf(th) * 7.0f);   // Punta de la flecha: descomposicion polar->cartesiano del rumbo
             int16_t hy = py - (int16_t)(cosf(th) * 7.0f);
             if (hx < bx + 1)      hx = bx + 1;
             if (hx > bx + bw - 2) hx = bx + bw - 2;
@@ -2564,7 +2587,7 @@ void updateDisplay(void) {
             snprintf(lbuf, sizeof(lbuf), "TH:%s", nbuf);   OLED_Str5(rx, 30, lbuf);
 
             if (linea_perdida_pose_valida) {
-                float ddx = linea_perdida_x_m - odom_x_m;
+                float ddx = linea_perdida_x_m - odom_x_m;   // Vector desde la pose actual hasta el punto guardado
                 float ddy = linea_perdida_y_m - odom_y_m;
                 FormatSignedFixed(nbuf, sizeof(nbuf), sqrtf(ddx * ddx + ddy * ddy), 2);
                 snprintf(lbuf, sizeof(lbuf), "D:%sm", nbuf + 1);
@@ -2701,7 +2724,7 @@ static uint8_t Ctrl_LeerIMU(void)
         accel_prev_x = accel_x; accel_prev_y = accel_y; accel_prev_z = accel_z;
         accel_prev_init = 1;
     }
-    float accel_delta = fabsf((float)(accel_x - accel_prev_x)) +
+    float accel_delta = fabsf((float)(accel_x - accel_prev_x)) +   // Norma L1 (suma de |delta| de los 3 ejes): cuanto se movio el sensor
                          fabsf((float)(accel_y - accel_prev_y)) +
                          fabsf((float)(accel_z - accel_prev_z));
     accel_movimiento_f += 0.30f * (accel_delta - accel_movimiento_f);   // Media movil exponencial (EMA)
@@ -2721,7 +2744,7 @@ static void Ctrl_VelocidadEncoders(void)
     enc_der = encoder_derecho;
     enc_izq = encoder_izquierdo;
     __enable_irq();
-    delta_derecho = enc_der - enc_right_prev;
+    delta_derecho = enc_der - enc_right_prev;   // Diferencia de counts respecto al ciclo anterior (avance de ESTE ciclo)
     delta_izquierdo  = enc_izq - enc_left_prev;
     enc_right_prev = enc_der;
     enc_left_prev  = enc_izq;
@@ -2767,7 +2790,7 @@ static void Ctrl_VelocidadEncoders(void)
     if ((estado_robot == ROBOT_STATE_IDLE || f_caido) &&
         delta_derecho == 0 && delta_izquierdo == 0 && giro_z != 0) {
         static uint16_t yaw_bias_warmup = 0;
-        float gz_dps_cal = (float)giro_z / 100.0f;
+        float gz_dps_cal = (float)giro_z / 100.0f;   // Escalado del sensor: LSB crudos / sensibilidad -> deg/s
         if (fabsf(gz_dps_cal - rueda_yaw_bias_dps) < 5.0f) {
             rueda_yaw_bias_dps += ((yaw_bias_warmup < 100) ? 0.08f : 0.005f)
                                 * (gz_dps_cal - rueda_yaw_bias_dps); // Media movil exponencial
@@ -2791,9 +2814,9 @@ static void Ctrl_LatchesPared(void)
     if (linea_estado == LINE_STATE_OBJ_BORDEAR_PARED ||
         linea_estado == LINE_STATE_OBJ_PARED_LIBRE  ||
         linea_estado == LINE_STATE_OBJ_GIRO_PARED) {
-        if (!obj_pared_rev_pestillo &&
+        if (!obj_pared_rev_latch &&
             (float)adc_promedio[OBJ_PARED_ADC_IDX] < OBJ_PARED_REVERSA_UMBRAL) {
-            obj_pared_rev_pestillo    = 1;
+            obj_pared_rev_latch    = 1;
             obj_pared_rev_objetivo     = OBJ_PARED_REV_COUNTS;
             obj_pared_rev_der0 = enc_der;
             obj_pared_rev_izq0 = enc_izq;
@@ -2804,16 +2827,16 @@ static void Ctrl_LatchesPared(void)
         // OBJ_PARED_TRABADO_VENTANA_MS el movimiento acumulado de encoders no llega
         // a STUCK_COUNTS, está trabado contra la pared (empuja sin avanzar o
         // pivot atorado) → reversa LARGA de destrabe (ESCAPE_COUNTS).
-        if (!obj_pared_rev_pestillo) {
+        if (!obj_pared_rev_latch) {
             if (obj_pared_trabado_ms == 0) {
                 obj_pared_trabado_ms = HAL_GetTick();
                 obj_pared_trabado_der0 = enc_der;
                 obj_pared_trabado_izq0 = enc_izq;
             } else if (HAL_GetTick() - obj_pared_trabado_ms >= OBJ_PARED_TRABADO_VENTANA_MS) {
-                int32_t stuck_moved = (abs(enc_der - obj_pared_trabado_der0) +
+                int32_t stuck_moved = (abs(enc_der - obj_pared_trabado_der0) +   // Desplazamiento promedio de ambas ruedas (|delta| ignora el sentido)
                                        abs(enc_izq - obj_pared_trabado_izq0)) / 2;
                 if (stuck_moved < OBJ_PARED_TRABADO_COUNTS) {
-                    obj_pared_rev_pestillo    = 1;
+                    obj_pared_rev_latch    = 1;
                     obj_pared_rev_objetivo     = OBJ_PARED_REV_ESCAPE_COUNTS;
                     obj_pared_rev_der0 = enc_der;
                     obj_pared_rev_izq0 = enc_izq;
@@ -2825,8 +2848,8 @@ static void Ctrl_LatchesPared(void)
             obj_pared_trabado_ms = 0;       // en reversa: la ventana no corre
         }
 
-        if (obj_pared_rev_pestillo) {
-            int32_t wall_rev_done = (abs(enc_der - obj_pared_rev_der0) +
+        if (obj_pared_rev_latch) {
+            int32_t wall_rev_done = (abs(enc_der - obj_pared_rev_der0) +   // Idem: cuanto recorrio la reversa desde su ancla de counts
                                      abs(enc_izq - obj_pared_rev_izq0)) / 2;
             // Timeout doble para la reversa de escape (recorrido más largo).
             uint32_t rev_tout = (obj_pared_rev_objetivo > OBJ_PARED_REV_COUNTS)
@@ -2834,7 +2857,7 @@ static void Ctrl_LatchesPared(void)
                               : OBJ_PARED_REV_TIMEOUT_MS;
             if (wall_rev_done >= obj_pared_rev_objetivo ||
                 (HAL_GetTick() - obj_pared_rev_inicio_ms) > rev_tout)
-                obj_pared_rev_pestillo = 0;
+                obj_pared_rev_latch = 0;
         }
 
         // ── Timeout de pared perdida (2026-07-11, 2026-07-20: IDLE → GIVEN_UP) ──
@@ -2856,7 +2879,7 @@ static void Ctrl_LatchesPared(void)
         // HAL_GetTick()-10 (≈ el uptime) contra los 5s y el GIVEN_UP saltaba
         // INSTANTÁNEAMENTE, en vez de dar los 5s de gracia para girar a
         // buscarla.
-        if (obj_pared_rev_pestillo ||
+        if (obj_pared_rev_latch ||
             (float)adc_promedio[OBJ_PARED_ADC_IDX] < OBJ_PARED_UMBRAL) {
             obj_pared_perdida_desde_ms = 0;
         } else {
@@ -2866,12 +2889,12 @@ static void Ctrl_LatchesPared(void)
                 linea_estado                 = LINE_STATE_GIVEN_UP;
                 ajuste_direccion        = 0.0f;
                 obj_pared_perdida_desde_ms  = 0;
-                obj_pared_rev_pestillo         = 0;
+                obj_pared_rev_latch         = 0;
                 obj_pared_trabado_ms          = 0;
             }
         }
     } else {
-        obj_pared_rev_pestillo        = 0;
+        obj_pared_rev_latch        = 0;
         obj_pared_trabado_ms         = 0;
         obj_pared_perdida_desde_ms = 0;
     }
@@ -2913,7 +2936,7 @@ static void Ctrl_Odometria(void)
         // ciclo es ruido de cuantización/timing, no traslación real — integrarlo
         // con el rumbo cambiando hace "caminar" la posición (ver defines arriba).
         if (fabsf(gz_odom_dps) > ODOM_PIVOT_GIROZ_DPS &&
-            abs(delta_derecho + delta_izquierdo) <= ODOM_PIVOT_MAX_COUNTS) {
+            abs(delta_derecho + delta_izquierdo) <= ODOM_PIVOT_MAX_COUNTS) {	// ROTACION PURA PARA HACER LA DISTANCIA = A CERO
             odom_d = 0.0f;
         }
 
@@ -2932,7 +2955,7 @@ static void Ctrl_Odometria(void)
         if      (odom_theta_grados >  180.0f) odom_theta_grados -= 360.0f;   // Wrap del angulo al rango [-180,180]
         else if (odom_theta_grados < -180.0f) odom_theta_grados += 360.0f;
         odom_x_m += odom_d * cosf(odom_th_mid_rad);   // Descomposicion del paso en componentes (polar -> cartesiano)
-        odom_y_m += odom_d * sinf(odom_th_mid_rad);
+        odom_y_m += odom_d * sinf(odom_th_mid_rad);   // Componente Y del mismo paso (seno = cateto opuesto)
     }
 }
 
@@ -2966,7 +2989,7 @@ static uint8_t Ctrl_TimingDt(void)
         return 0;   // primer ciclo: todavía no hay dt válido
     }
 
-    uint32_t diff_us = sample_us - last_mpu_us;
+    uint32_t diff_us = sample_us - last_mpu_us;   // Resta de timestamps: tiempo real entre dos datos del IMU
     last_mpu_us = sample_us;
 
     dt_real = (float)diff_us * 1e-6f;   // Conversion de unidades: microsegundos -> segundos
@@ -2988,7 +3011,6 @@ static void Ctrl_FiltroIMU(void)
     // sensibilidad [LSB por °/s]. El valor teórico del datasheet para el
     // fondo de escala configurado sería 131 (±250 dps), pero 100 es el que
     // quedó calibrado empíricamente contra giros reales medidos en el robot
-    // (ver Registro 2026-07-05/06 en CLAUDE.md — NO volver a 131).
     giro_velocidad_dps = ANG_SIGN * ((float)giro_x / 100.0f);   // Escalado del sensor: LSB crudos / sensibilidad -> deg/s
     if (giro_velocidad_dps >  250.0f) giro_velocidad_dps =  250.0f;
     if (giro_velocidad_dps < -250.0f) giro_velocidad_dps = -250.0f;
@@ -3060,7 +3082,7 @@ static void Ctrl_CuarentenaLinea(void)
             }
         } else {
             linea_canal_trabado_t0[ch] = 0;
-            if (adc_promedio[ch] < (uint16_t)LINE_THRESHOLD)
+            if (adc_promedio[ch] < (uint16_t)LINEA_UMBRAL_ADC)
                 linea_canal_cuarentena[ch] = 0;   // leyó blanco: el sensor volvió
         }
     }
@@ -3083,35 +3105,39 @@ static void Ctrl_EntradasLinea(void)
         // Si cualquier sensor baja del umbral durante OBJ_DETECT_ANTIRREBOTE_CNT ciclos
         // consecutivos (10 ciclos = 100 ms), arranca la secuencia de evasión.
         {
-            static uint8_t obj_cnt = 0;
-            static uint8_t obj_clear_cnt = 0;
-            uint8_t obj_now = ((float)adc_promedio[4] < OBJ_DETECT_UMBRAL_f ||
+            static uint8_t obj_confirma_cnt = 0;
+            static uint8_t obj_libera_cnt = 0;
+            uint8_t obj_visto_ahora = ((float)adc_promedio[4] < OBJ_DETECT_UMBRAL_f ||
                                (float)adc_promedio[5] < OBJ_DETECT_UMBRAL_f ||
                                (float)adc_promedio[6] < OBJ_DETECT_UMBRAL_f ||
                                (float)adc_promedio[7] < OBJ_DETECT_UMBRAL_f);
-            if (obj_falso_disparo_bloqueo) {
+            if (obj_falso_disparo_bloqueo) {	// Se pone en alto en la reversa posterior a deteccion objeto
                 // No reintentar cada pocos segundos si el sensor que causó el
                 // falso positivo continúa activo. Rearma sólo cuando los cuatro
                 // sensores permanecen libres durante la misma ventana de debounce.
-                obj_cnt = 0;
-                if (!obj_now) {
-                    if (obj_clear_cnt < OBJ_DETECT_ANTIRREBOTE_CNT) obj_clear_cnt++;
-                    if (obj_clear_cnt >= OBJ_DETECT_ANTIRREBOTE_CNT) {
+                obj_confirma_cnt = 0;
+                if (!obj_visto_ahora) {		// No estoy viendo objeto ahora
+                    if (obj_libera_cnt < OBJ_DETECT_ANTIRREBOTE_CNT) obj_libera_cnt++;	// Sumo al contador de salida de esquive
+                    if (obj_libera_cnt >= OBJ_DETECT_ANTIRREBOTE_CNT) {	// 10 ciclos sin objeto en adc
                         obj_falso_disparo_bloqueo = 0;
-                        obj_clear_cnt = 0;
+                        obj_libera_cnt = 0;
                     }
                 } else {
-                    obj_clear_cnt = 0;
+                    obj_libera_cnt = 0;
                 }
             } else {
-                obj_clear_cnt = 0;
-                if (obj_now) { if (obj_cnt < OBJ_DETECT_ANTIRREBOTE_CNT) obj_cnt++; }
-                else         { obj_cnt = 0; }
+                obj_libera_cnt = 0;
+                // Confirma objeto real recien tras 10 ciclos seguidos viendolo (antirrebote)
+                if (obj_visto_ahora) {
+                    if (obj_confirma_cnt < OBJ_DETECT_ANTIRREBOTE_CNT) obj_confirma_cnt++;
+                } else {
+                    obj_confirma_cnt = 0;
+                }
             }
-            if (obj_cnt >= OBJ_DETECT_ANTIRREBOTE_CNT &&
+            if (obj_confirma_cnt >= OBJ_DETECT_ANTIRREBOTE_CNT &&
                 !obj_falso_disparo_bloqueo &&
                 linea_estado == LINE_STATE_FOLLOWING &&
-                HAL_GetTick() >= obj_ignorar_hasta_ms) {
+                HAL_GetTick() >= obj_ignorar_hasta_ms) {	// Entro en modo esquive, pongo banderas y contadores en 0
                 // 2026-07-14: directo a la fase STOP, sin pasar por ESPERA_REVERSA.
                 // El balance libre de ESPERA no tiene ancla de posición: llegando
                 // con inercia el robot se iba un poco para atrás y perdía la pared
@@ -3124,11 +3150,11 @@ static void Ctrl_EntradasLinea(void)
                 obj_rev_banda_entrada_ms = 0;
                 obj_frente_confirma_cnt = 0;
                 obj_frente_confirmado = 0;
-                obj_cnt              = 0;
+                obj_confirma_cnt              = 0;
                 // Sentido alternado (2026-07-13): esta esquiva usa el sentido
                 // programado y deja armado el opuesto para el próximo objeto.
                 obj_esquive_dir      = obj_esquive_prox_dir;
-                obj_esquive_prox_dir = (int8_t)-obj_esquive_prox_dir;
+                obj_esquive_prox_dir = (int8_t)-obj_esquive_prox_dir;   // Alternancia de sentido: invierte el signo en cada objeto
                 ajuste_direccion = 0.0f;
                 linea_integral       = 0.0f;
                 linea_error_previo     = 0.0f;
@@ -3150,23 +3176,23 @@ static void Ctrl_EntradasLinea(void)
         // Peso cuadrático: pos² × sign(pos) → coeficientes {-9,-1,+1,+9}.
         // Normalización: 9 × suma_pesos → error en [-1, +1].
         // Convención: izquierda = positivo, derecha = negativo.
-        float s[4] = {
+        float linea_adc_crudo[4] = {
             (float)adc_promedio[0], (float)adc_promedio[1],
             (float)adc_promedio[2], (float)adc_promedio[3]
         };
 
         // Sustracción de baseline: peso = señal por encima del fondo de cada sensor.
         // Si el ADC no supera el umbral, contribuye 0 (ruido/luz ambiente).
-        float w[4];
+        float linea_peso[4];
         for (int i = 0; i < 4; i++) {
-            float signal = s[i] - ADC_LINEA_BASE[i];   // Sustraccion de baseline: quita el fondo propio de cada sensor
-            w[i] = (!linea_canal_cuarentena[i] && s[i] > LINE_THRESHOLD)
-                 ? fmaxf(signal, 0.0f) : 0.0f;
-        }
-        suma_pesos = w[0] + w[1] + w[2] + w[3];
+            float signal = linea_adc_crudo[i] - ADC_LINEA_BASE[i];   // Sustraccion de baseline: quita el fondo propio de cada sensor
+            linea_peso[i] = (!linea_canal_cuarentena[i] && linea_adc_crudo[i] > LINEA_UMBRAL_ADC)	// Si el sensor no esta en cuarentena
+                 ? fmaxf(signal, 0.0f) : 0.0f;	// ademas, si el sensor da mayor al umbral de deteccion de adc
+        }	// fmaxf(signal, 0.0f) si es valor negativo lo igualo a cero
+        suma_pesos = linea_peso[0] + linea_peso[1] + linea_peso[2] + linea_peso[3];   // Suma de pesos: denominador del centroide (0 = nadie ve linea)
 
         // Presencia de línea con debounce en ambos sentidos. Antes esta
-        // asignación era instantánea: ruido alrededor de LINE_THRESHOLD hacía
+        // asignación era instantánea: ruido alrededor de LINEA_UMBRAL_ADC hacía
         // que LOST_BRAKE volviera a FOLLOWING por una sola muestra y luego
         // repitiera FRENA/SIGUE continuamente.
         linea_detectada_cruda = (suma_pesos > 0.0f);
@@ -3193,70 +3219,70 @@ static void Ctrl_EntradasLinea(void)
         //     el robot quieto/sin manipular significa que está cruzando una
         //     línea PERPENDICULAR a su dirección de avance (ej. una "+"): la
         //     franja negra cubre los 4 sensores de punta a punta. Dispara un
-        //     giro instantáneo de 90° (LINE_STATE_PERP_ROTATE) para alinearse
+        //     giro instantáneo de 90° (LINE_STATE_PERPENDICULAR_ROTATE) para alinearse
         //     y retomar el seguimiento normal. Debounce corto (50ms) para
         //     filtrar ruido de un solo ciclo, no los 2s de "en el aire".
         // (b) en cualquier otro sub-estado (buscando la línea), no hace nada
         //     especial — sigue el flujo normal de búsqueda (LOST/EDGE).
-        // Umbral de movimiento (ACCEL_MOTION_THRESHOLD) es un punto de
+        // Umbral de movimiento (ACCEL_MOVIMIENTO_UMBRAL) es un punto de
         // partida, ajustar según pruebas físicas (unidades: LSB crudos del
         // MPU6050 por ciclo, EMA). "En el aire" sigue necesitando >2s.
-        // Cuando baja al piso (all_black→0) → ignorar obstáculos 3s (mano al soltar).
+        // Cuando baja al piso (todo_negro→0) → ignorar obstáculos 3s (mano al soltar).
         {
-            const float ACCEL_MOTION_THRESHOLD = 300.0f;
-            const uint32_t PERP_DEBOUNCE_MS = 50U;
+            const float ACCEL_MOVIMIENTO_UMBRAL = 300.0f;
+            const uint32_t PERPENDICULAR_ANTIRREBOTE_MS = 50U;
             // Tras dejar de mover el acelerómetro (lo soltaron/apoyaron), el timer de
-            // all_black puede venir arrastrando segundos acumulados desde que estaba
+            // todo_negro puede venir arrastrando segundos acumulados desde que estaba
             // en el aire — sin esto, apoyarlo sobre cualquier zona momentáneamente
-            // oscura (o el punto de partida) disparaba PERP_ROTATE al instante. Exige
+            // oscura (o el punto de partida) disparaba PERPENDICULAR_ROTATE al instante. Exige
             // además un mínimo de quietud continua del acelerómetro antes de habilitar
             // el disparo de cruce perpendicular.
-            const uint32_t ACCEL_SETTLE_MS = 400U;
+            const uint32_t ACCEL_ASENTADO_MS = 400U;
             // Guardas anti "giro fantasma al apoyar el robot" (2026-07-05): un cruce
             // perpendicular REAL ocurre mientras se sigue la línea — los 4 sensores
             // pasan de "línea parcial" (línea + blanco a los costados) a todo negro
             // en un instante, y el todo-negro dura poco. Viniendo del aire, en cambio,
             // los 4 sensores llevan MUCHO tiempo en negro y nunca hubo vista parcial
-            // (en el aire all_black implica linea_detectada, así que el timer de línea
+            // (en el aire todo_negro implica linea_detectada, así que el timer de línea
             // no discrimina — esta variable sí).
-            const uint32_t PERP_MAX_ELAPSED_MS  = 800U;  // todo-negro más viejo que esto NO es un cruce
-            const uint32_t PERP_PARTIAL_WIN_MS  = 400U;  // el todo-negro debe empezar a menos de esto de la última vista parcial
-            // Canal en cuarentena → all_black imposible (conservador: mejor
+            const uint32_t PERPENDICULAR_DURACION_MAX_MS  = 800U;  // todo-negro más viejo que esto NO es un cruce
+            const uint32_t PERPENDICULAR_VISTA_PREVIA_MS  = 400U;  // el todo-negro debe empezar a menos de esto de la última vista parcial
+            // Canal en cuarentena → todo_negro imposible (conservador: mejor
             // perderse un cruce perpendicular real que girar por un sensor roto).
-            uint8_t all_black = (adc_promedio[0] > (uint16_t)LINE_THRESHOLD && !linea_canal_cuarentena[0] &&
-                                 adc_promedio[1] > (uint16_t)LINE_THRESHOLD && !linea_canal_cuarentena[1] &&
-                                 adc_promedio[2] > (uint16_t)LINE_THRESHOLD && !linea_canal_cuarentena[2] &&
-                                 adc_promedio[3] > (uint16_t)LINE_THRESHOLD && !linea_canal_cuarentena[3]);
-            if (linea_detectada_cruda && !all_black)
+            uint8_t todo_negro = (adc_promedio[0] > (uint16_t)LINEA_UMBRAL_ADC && !linea_canal_cuarentena[0] &&
+                                 adc_promedio[1] > (uint16_t)LINEA_UMBRAL_ADC && !linea_canal_cuarentena[1] &&
+                                 adc_promedio[2] > (uint16_t)LINEA_UMBRAL_ADC && !linea_canal_cuarentena[2] &&
+                                 adc_promedio[3] > (uint16_t)LINEA_UMBRAL_ADC && !linea_canal_cuarentena[3]);
+            if (linea_detectada_cruda && !todo_negro)
                 ultima_linea_parcial_ms = HAL_GetTick();
-            uint8_t accel_moving = (accel_movimiento_f > ACCEL_MOTION_THRESHOLD);
-            if (accel_moving) {
+            uint8_t accel_moviendose = (accel_movimiento_f > ACCEL_MOVIMIENTO_UMBRAL);
+            if (accel_moviendose) {
                 accel_quieto_inicio_ms = 0;
             } else if (accel_quieto_inicio_ms == 0) {
                 accel_quieto_inicio_ms = HAL_GetTick();
             }
-            uint8_t accel_settled = (accel_quieto_inicio_ms != 0) &&
-                ((HAL_GetTick() - accel_quieto_inicio_ms) > ACCEL_SETTLE_MS);
-            if (all_black) {
-                if (todos_negros_inicio_ms == 0) todos_negros_inicio_ms = HAL_GetTick();
-                uint32_t all_black_elapsed = HAL_GetTick() - todos_negros_inicio_ms;
-                if (accel_moving) {
-                    if (all_black_elapsed > 2000U) f_en_el_aire = 1;
+            uint8_t accel_asentado = (accel_quieto_inicio_ms != 0) &&	// Si ya se dejo de mover
+                ((HAL_GetTick() - accel_quieto_inicio_ms) > ACCEL_ASENTADO_MS);
+            if (todo_negro) {	// Todos los ir en negro
+                if (todos_negros_inicio_ms == 0) todos_negros_inicio_ms = HAL_GetTick();	// Guardo timestamp
+                uint32_t todo_negro_transcurrido_ms = HAL_GetTick() - todos_negros_inicio_ms;   // Resta de timestamps: cuanto lleva el todo-negro
+                if (accel_moviendose) {
+                    if (todo_negro_transcurrido_ms > 2000U) f_en_el_aire = 1;
                 } else {
                     f_en_el_aire = 0;
                     if (linea_estado == LINE_STATE_FOLLOWING &&
-                        accel_settled &&
-                        all_black_elapsed > PERP_DEBOUNCE_MS &&
-                        all_black_elapsed < PERP_MAX_ELAPSED_MS &&
+                        accel_asentado &&
+                        todo_negro_transcurrido_ms > PERPENDICULAR_ANTIRREBOTE_MS &&
+                        todo_negro_transcurrido_ms < PERPENDICULAR_DURACION_MAX_MS &&
                         ultima_linea_parcial_ms != 0 &&
-                        (todos_negros_inicio_ms - ultima_linea_parcial_ms) < PERP_PARTIAL_WIN_MS) {
+                        (todos_negros_inicio_ms - ultima_linea_parcial_ms) < PERPENDICULAR_VISTA_PREVIA_MS) {
                         uint32_t now_ms = HAL_GetTick();
-                        perp_desde_esquive =
+                        perpendicular_desde_esquive =	// Pregunto si hay un giro pendiente (1500ms antes)
                             (obj_giro_final_pendiente_ms != 0) &&
                             ((now_ms - obj_giro_final_pendiente_ms) <= OBJ_GIRO_FINAL_VENTANA_MS);
-                        obj_giro_final_pendiente_ms = 0;
-                        perp_obj_freno_inicio_ms = 0;
-                        linea_estado          = LINE_STATE_PERP_ROTATE;
+                        obj_giro_final_pendiente_ms = 0;	// Seteo banderas para realizar el giro
+                        perpendicular_obj_freno_inicio_ms = 0;
+                        linea_estado          = LINE_STATE_PERPENDICULAR_ROTATE;
                         obj_rot_inicializado = 0;
                         obj_rot_fase       = 0;
                         obj_rot_rumbo     = 0.0f;
@@ -3269,12 +3295,12 @@ static void Ctrl_EntradasLinea(void)
                 todos_negros_inicio_ms = 0;
                 f_en_el_aire = 0;
             }
-            if (prev_todos_negros && !all_black)
-                obj_ignorar_hasta_ms = HAL_GetTick() + 3000U;
-            prev_todos_negros = all_black;
+            if (prev_todos_negros && !todo_negro)	// Evaluo flanco negativo para no repetir bucle
+                obj_ignorar_hasta_ms = HAL_GetTick() + 3000U;	// Determino el tiempo en el que dejare de ignorar
+            prev_todos_negros = todo_negro;
         }
 
-        if (linea_detectada_cruda) {
+        if (linea_detectada_cruda) {	// Si veo la linea, viene de "(suma_pesos > 0.0f)"
             // Centroide = promedio de las posiciones de los sensores pesado
             // por cuánta línea ve cada uno: Σ(coef_i·w_i) / Σw_i. Los sensores
             // están en posiciones {-3,-1,+1,+3} (en unidades de 5.75mm); se usa
@@ -3283,21 +3309,20 @@ static void Ctrl_EntradasLinea(void)
             // escapa hacia una punta). Dividir por 9·suma_pesos normaliza: el peor
             // caso (toda la señal en un sensor extremo) da num = ±9·suma_pesos →
             // error = ±1. Resultado en [-1,+1], izquierda = positivo.
-            float num = 9.0f*w[0] + 1.0f*w[1] - 1.0f*w[2] - 9.0f*w[3];   // Centroide (promedio ponderado): sumatoria de coef_i * peso_i
+            float num = 9.0f*linea_peso[0] + 1.0f*linea_peso[1] - 1.0f*linea_peso[2] - 9.0f*linea_peso[3];   // Centroide (promedio ponderado): sumatoria de coef_i * peso_i
             linea_error = num / (9.0f * suma_pesos) + linea_error_ajuste_f;   // Normalizacion: dividido el maximo posible -> [-1,+1]
+            // linea_error_ajuste_f correcion de offset mecanico
 
             // Umbral más bajo porque sensores internos solo generan ±0.11
-            if (linea_error > 0.02f)       ultima_linea_dir =  1.0f;
+            if (linea_error > 0.02f)       ultima_linea_dir =  1.0f;	// Guardo la ultima direccion de la linea
             else if (linea_error < -0.02f) ultima_linea_dir = -1.0f;
 
-            // Snapshot literal: ¿el único sensor con señal fue un extremo, sin
-            // ningún soporte de los sensores del medio? Se congela en su último
-            // valor al perder la línea (este bloque solo corre con linea_detectada).
-            ultimo_detectado_solo_borde = ((w[0] > 0.0f || w[3] > 0.0f) &&
-                                        w[1] <= 0.0f && w[2] <= 0.0f);
+            // Si los sensores de los bordes fueron los ultimos en detectar linea
+            ultimo_detectado_solo_borde = ((linea_peso[0] > 0.0f || linea_peso[3] > 0.0f) &&
+                                        linea_peso[1] <= 0.0f && linea_peso[2] <= 0.0f);
         }
-        linea_error_display    = linea_error;
-        linea_detectada_display = (uint8_t)linea_detectada;
+        linea_error_display    = linea_error;	// Guardo el valor de error solo para display, variable de exposicion no trabajo
+        linea_detectada_display = (uint8_t)linea_detectada;	// Bandera para graficar en QT por wifi
 
         // Velocidad deseada cae cuadráticamente con el error de línea.
         // La recta 1 − |e|/0.45 vale 1 centrado y llega a 0 con |e|=0.45
@@ -3310,27 +3335,26 @@ static void Ctrl_EntradasLinea(void)
         speed_factor *= speed_factor;   // Al cuadrado: caida suave cerca del centro, agresiva en curva
         linea_vel_avance_deseada = linea_detectada_cruda
             ? fmaxf(LINE_SPEED_TARGET * 0.20f, LINE_SPEED_TARGET * speed_factor)
-            : 0.0f;
+            : 0.0f;	// Si la velocidad calculada es mayor que el 20% de la velocidad de linea (predeter. 2,5m/s)
+
         // Para el PI de línea el deadband debe ser de tipo "cero o valor real".
-        // apply_deadbandf() resta 0.35 a toda lectura válida: a 2.50m/s hacía
-        // creer al control que iba a 2.15m/s y seguía acelerando sobre el tope.
-        float line_forward_vel_raw = fmaxf(0.0f, -velocidad_est_f);
+        float line_forward_vel_raw = fmaxf(0.0f, -velocidad_est_f);	// Solo guardo la velocidad hacia adelante (negativo=adelante)
         linea_vel_avance = (line_forward_vel_raw > FRENO_VEL_ZONA_MUERTA)
-                         ? line_forward_vel_raw : 0.0f;
+                         ? line_forward_vel_raw : 0.0f;		// Filtro el piso de lectura de los encoder para no reaccionar ante falsa velocidad (0.32 m/s)
 
         // Estimación de aceleración para anticipar el cruce del límite. Solo
         // se conserva mientras sigue una línea real; así una readquisición no
         // genera una derivada falsa por el salto desde cero.
-        if (linea_estado == LINE_STATE_FOLLOWING && linea_detectada_cruda) {
-            if (!linea_prediccion_valida) {
+        if (linea_estado == LINE_STATE_FOLLOWING && linea_detectada_cruda) {	// Si estoy siguiendo linea y la veo
+            if (!linea_prediccion_valida) {		// No tengo una lectura anterior valida (del seguidor de linea)
                 linea_vel_avance_prev   = line_forward_vel_raw;
                 linea_acel_avance_f    = 0.0f;
                 linea_prediccion_valida = 1;
-            } else {
+            } else {	// Si tengo una lectura anterior valida de aceleracion
                 float accel_raw = (line_forward_vel_raw - linea_vel_avance_prev) /   // Derivada por diferencia finita: (v_k - v_k-1)/dt
-                                  DT_CTRL_FIJO;
+                                  DT_CTRL_FIJO;	 // Calculo la aceleracion  (dt fijo)
                 accel_raw = clampf_local(accel_raw,
-                                         -LINEA_ACEL_EST_MAX, LINEA_ACEL_EST_MAX);
+                                         -LINEA_ACEL_EST_MAX, LINEA_ACEL_EST_MAX);	// Limito los valores , min y max
                 linea_acel_avance_f += LINEA_ACEL_FILTRO_ALFA *   // Media movil exponencial (EMA)
                                         (accel_raw - linea_acel_avance_f);
                 linea_vel_avance_prev = line_forward_vel_raw;
@@ -3351,21 +3375,21 @@ static void Ctrl_EntradasLinea(void)
             float vel_error = linea_vel_avance_deseada - linea_vel_avance;   // Error = velocidad pedida - velocidad real
             float line_vel_kp_eff;
             float line_vel_i_term;
-            if (vel_error > 0.0f) {
+            if (vel_error > 0.0f) {		// Si el robot va mas lento de lo pedido
                 // Acelerando: acumula integral solo en positivo
                 linea_integral_velocidad += vel_error * DT_CTRL_FIJO;   // Integracion rectangular: I += e*dt
-                linea_integral_velocidad = clampf_local(linea_integral_velocidad, 0.0f, LINEA_VEL_I_MAX);   // Anti-windup
-                line_vel_kp_eff = LINEA_VEL_KP;
-                line_vel_i_term = LINEA_VEL_KI * linea_integral_velocidad;   // Termino I
-            } else {
+                linea_integral_velocidad = clampf_local(linea_integral_velocidad, 0.0f, LINEA_VEL_I_MAX);   // Anti-windup, seteo maximo (minimo es 0)
+                line_vel_kp_eff = LINEA_VEL_KP;	// Termino KP del PI
+                line_vel_i_term = LINEA_VEL_KI * linea_integral_velocidad;   // Termino KI del PI
+            } else {	// En caso de que el robot vaya mas rapido de lo pedido
                 // Sobrevelocidad: la integral positiva servía para acelerar y no
                 // debe oponerse al freno. Se descarga rápido y se excluye de la
                 // salida hasta volver a quedar por debajo de la velocidad pedida.
                 linea_integral_velocidad *= 0.50f;   // Descarga exponencial de la integral (mitad por ciclo)
-                line_vel_kp_eff = LINEA_VEL_KP_FRENO;
-                line_vel_i_term = 0.0f;
+                line_vel_kp_eff = LINEA_VEL_KP_FRENO; // KP
+                line_vel_i_term = 0.0f;	// Reseteo la integral para disminuir error
             }
-            linea_angulo_comando = clampf_local(
+            linea_angulo_comando = clampf_local(	// Salida, pongo limite de angulo frontal y trasero (+2 y -3)
                 line_vel_kp_eff * vel_error + line_vel_i_term,   // Salida PI = P + I (lazo externo en cascada: pide grados)
                 -LINEA_FRENO_ANGULO_MAX, LINE_ANGLE
             );
@@ -3376,25 +3400,25 @@ static void Ctrl_EntradasLinea(void)
             float predicted_forward_vel = line_forward_vel_raw +   // Extrapolacion lineal (Taylor 1er orden): v + a*t
                 fmaxf(linea_acel_avance_f, 0.0f) * LINEA_VEL_PREDICCION_SEG;
             float guard_speed = fmaxf(0.0f,
-                LINE_SPEED_TARGET - LINEA_VEL_GUARDA_MARGEN);
+                LINE_SPEED_TARGET - LINEA_VEL_GUARDA_MARGEN);	// Guardo un margen de 0.15 m/s de seguridad
             if (predicted_forward_vel > guard_speed) {
                 float guard_brake = -clampf_local(
                     LINEA_VEL_GUARDA_KP * (predicted_forward_vel - guard_speed),
                     0.0f, LINEA_FRENO_ANGULO_MAX);
-                if (guard_brake < linea_angulo_comando)
-                    linea_angulo_comando = guard_brake;
+                if (guard_brake < linea_angulo_comando)	// Si el freno es menor que la salida de angulo del PI, o sea, FRENA MAS
+                    linea_angulo_comando = guard_brake;	// Guardo el FRENO mas grande de guard_brake, por cada m/s 6 grados de freno.
                 // No conservar empuje integral mientras la guarda está frenando.
                 linea_integral_velocidad *= 0.50f;
             }
-        } else {
-            linea_integral_velocidad *= 0.80f;
-            linea_angulo_comando = 0.0f;
+        } else {	// Si no estoy en modo segiudor de linea
+            linea_integral_velocidad *= 0.80f;	// Descargo integ
+            linea_angulo_comando = 0.0f;	// Dejo de pedir avance
         }
 
-    } else if ((estado_robot == ROBOT_STATE_BALANCE_AND_SPEED) ||
+    } else if ((estado_robot == ROBOT_STATE_BALANCE_AND_SPEED) ||	// Si no estoy en modo seguidor de linea
                (estado_robot == ROBOT_STATE_BALANCE_ONLY)) {
         // velocidad_est ya actualizado desde encoders al inicio del ciclo
-        linea_detectada = 0;
+        linea_detectada = 0;	// Reseteo variables y flags
         linea_detectada_cruda = 0;
         linea_detect_confirma_cnt = 0;
         linea_detect_libera_cnt = 0;
@@ -3424,7 +3448,7 @@ static void Ctrl_EntradasLinea(void)
 // ─────────────────────────────────────────────────────────────────────
 static void Ctrl_OverrideManualLinea(void)
 {
-    manual_override_linea =
+    manual_override_linea =	// Decido si puedo controlar el auto, unico caso, si estoy en modo seguidor linea y no la veo a la linea, para volver manualmente a la linea digmaos.
         (estado_robot == ROBOT_STATE_LINE_FOLLOWING) && !linea_detectada &&
         (HAL_GetTick() - manual_ultimo_cmd_ms) < 250U &&
         (fabsf(manual_setpoint_comando) > 0.01f || fabsf(manual_direccion_comando) > 0.5f);
@@ -3439,7 +3463,7 @@ static void Ctrl_CambiosDeEstado(void)
     static eRobotState prev_robot_state   = ROBOT_STATE_IDLE;
     static uint8_t     display_before_line = 0;  // guarda el display previo al modo línea
 
-    if (estado_robot == ROBOT_STATE_LINE_FOLLOWING && prev_robot_state != ROBOT_STATE_LINE_FOLLOWING) {
+    if (estado_robot == ROBOT_STATE_LINE_FOLLOWING && prev_robot_state != ROBOT_STATE_LINE_FOLLOWING) {	// Entro a modo seguidor de linea
         display_before_line = f_cambiar_pantalla;  // guardar display actual
         f_cambiar_pantalla    = 1;                 // cambiar al display de línea
         integral            = 0.0f;
@@ -3478,8 +3502,8 @@ static void Ctrl_CambiosDeEstado(void)
         todos_negros_inicio_ms  = 0;
         ultima_linea_parcial_ms = 0;
         obj_giro_final_pendiente_ms = 0;
-        perp_desde_esquive   = 0;
-        perp_obj_freno_inicio_ms   = 0;
+        perpendicular_desde_esquive   = 0;
+        perpendicular_obj_freno_inicio_ms   = 0;
         obj_pared_linea_confirma_cnt = 0;
         obj_falso_disparo_bloqueo = 0;
         obj_frente_confirma_cnt = 0;
@@ -3500,7 +3524,7 @@ static void Ctrl_CambiosDeEstado(void)
     {
         static eLineState prev_line_state_disp = LINE_STATE_FOLLOWING;
         if (estado_robot == ROBOT_STATE_LINE_FOLLOWING) {
-            int prev_obj = (prev_line_state_disp >= LINE_STATE_OBJ_FRENO_REVERSA);
+            int prev_obj = (prev_line_state_disp >= LINE_STATE_OBJ_FRENO_REVERSA);	// Modos definidos por jerarquia en el ENUM
             int curr_obj = (linea_estado           >= LINE_STATE_OBJ_FRENO_REVERSA);
             if (!prev_obj && curr_obj) {
                 f_cambiar_pantalla = 6;  // entrar en evasión → pantalla OBJ
@@ -3567,122 +3591,21 @@ static void Ctrl_CambiosDeEstado(void)
     prev_robot_state = estado_robot;
 }
 
-// ── Estación por rueda — eje de TRASLACIÓN por SETPOINT (2026-07-26) ──
-// El primer diseño (2026-07-21) corregía la traslación con trim de PWM
-// directo a las ruedas, igual que la rotación. En el robot falló asimétrico:
-// la deriva hacia adelante NUNCA frenaba (y hacia atrás corregía mal). Causa:
-// en un balancín el PWM de rueda es el actuador EQUIVOCADO para posición —
-// frenar las ruedas inclina el cuerpo hacia adelante y el PID de balance
-// responde acelerando: el trim (topeado a ±8%) pelea contra el balance y
-// pierde. El actuador correcto es el SETPOINT de inclinación: para volver
-// atrás, inclinarse hacia atrás y dejar que el balance haga el resto. Es el
-// mismo patrón ya validado en los holds de PAUSA_GIRO y PERP_SETTLE
-// (OBJ_PAUSA_POS_*), con la misma ganancia y el mismo signo:
-// counts positivos = avance → corrección NEGATIVA (inclina hacia atrás).
-// La ROTACIÓN sí queda en PWM diferencial (ver Ctrl_MotoresBalance): girar
-// las ruedas en sentidos opuestos no afecta el pitch, ahí el trim no pelea
-// con el balance.
-#define RUEDA_ESTACION_ANG_KP   0.05f  // ° por count de desplazamiento reciente (0.08→0.05 el
-                                      // 2026-07-26: el resorte fuerte + D ciega en chico = vaivén
-                                      // perpetuo; resorte blando inyecta menos energía)
-#define RUEDA_ESTACION_AMORT     1.00f  // ° por rps de velocidad de traslación (1.20→1.00 el
-                                      // 2026-07-27: con 1.20 + V_DB 0.15 el pico de un count
-                                      // suelto generaba ~0.66° de salto de setpoint → el robot
-                                      // nunca se quedaba quieto ni entraba a la siesta; los ~15
-                                      // cruces los asienta la siesta, no hace falta tanta D)
-#define RUEDA_ESTACION_ANG_MAX  1.5f   // tope de la corrección (2.5→1.5 el 2026-07-27): el freno de
-                                      // la D es proporcional a v (1°/rps) — la proporcionalidad se
-                                      // mantiene, solo baja el TECHO. Con 2.5° el empujón fuerte
-                                      // apilaba estación + freno clásico (ComputeBrakeSetpoint-
-                                      // Target) y el total volcaba al robot; con 1.5° el freno
-                                      // sigue firme pero el balance conserva margen para
-                                      // sobrevivir. Si aún vuelca con empujón fuerte → 1.5→1.2;
-                                      // si frena poco → 1.5→1.8
-#define RUEDA_ESTACION_P_MAX    0.5f   // tope PROPIO del término P (2026-07-27): tras un empujón el
-                                      // desplazamiento reciente llega enorme (~90 counts por 30cm
-                                      // × 0.05°/count = 4.5°) y saturaba el tope general de 2.5° —
-                                      // al frenar en el punto dulce la D muere pero ese P seguía
-                                      // empujando 2.5° de vuelta durante segundos (τ≈5s de la
-                                      // fuga): brusco, se pasaba del equilibrio y el error nunca
-                                      // bajaba de los 0.8° de la siesta. El P existe solo para
-                                      // frenar deriva LENTA (~mm/s) — con 0.5° alcanza y queda
-                                      // debajo del umbral de entrada de la siesta; la autoridad
-                                      // grande (2.5°) es de la D, que sí debe pegar en empujones
-#define RUEDA_TRASL_ZM         3      // counts de desplazamiento reciente sin corregir (ruido)
-#define RUEDA_V_ZM_RPS         0.25f  // rps sin corregir (0.15→0.25 el 2026-07-27, vuelve al valor
-                                      // validado del 2026-07-26): con 0.15 el pico de ~0.7 rps de
-                                      // un count suelto pasaba casi entero por la zona muerta y la
-                                      // D lo convertía en un pateo de setpoint — el robot nunca
-                                      // juntaba los 140ms de quietud que pide la siesta (círculo
-                                      // vicioso: cada tick → corrección → movimiento → más ticks).
-                                      // Con 0.25 el pico residual (0.45 rps) genera ≤0.45° breve
-                                      // y el vaivén real (0.3-0.7 rps) sigue cubierto
-// Factor de CALMA (2026-07-27, reemplaza a la rodilla WHEEL_V_SOFT_KNEE):
-// atenuación GLOBAL de toda la estación (P y D juntos) según cuánta
-// actividad real hay: calm = max(|gyro|/GYRO_REF, |v_trans|/V_REF),
-// clampeado a 1. Cuerpo quieto (gyro→0, v→0) → calm→0 → estación MUDA:
-// cero perturbación de setpoint en el punto dulce, el PID de balance +
-// hold + siesta son los dueños de esa zona. Un empujón dispara el gyro
-// al instante → estación entera sin retraso (el gyro no tiene la lag de
-// los encoders). Suavizar término por término (rodilla de la D, tope del
-// P, drenaje) no alcanzó: siempre quedaba alguno activo perturbando.
-// Knobs: sigue brusco en el punto dulce → subir REFs (más atenuación en
-// calma); no amortigua llegadas suaves → bajar GYRO_REF a 6.
-#define RUEDA_CALMA_GIRO_REF    8.0f   // °/s a los que calm llega a 1 por gyro
-#define RUEDA_CALMA_V_REF       1.0f   // rps a los que calm llega a 1 por velocidad
-// (El "fade de supervivencia" del 2026-07-27 se probó y se ELIMINÓ el mismo
-// día: gateaba por gyro>40°/s, pero cualquier recuperación normal de empujón
-// supera eso — la estación quedaba muda casi siempre y no frenaba nada. El
-// exceso en empujones fuertes se resuelve con el techo RUEDA_ESTACION_ANG_MAX,
-// no apagando el freno.)
-#define RUEDA_DESPL_CALMA_MS     150    // ms sin un tick en AMBAS ruedas (+ v bajo la zona muerta)
-                                      // para declarar reposo real y drenar rápido (2026-07-27)
-#define RUEDA_DESPL_FUGA_RAPIDA   0.90f  // fuga en reposo real: τ≈100ms — el residuo del P muere en
-                                      // ~0.3s de quietud. Sin esto, el residuo (hasta 0.5°) se
-                                      // drenaba con τ≈5s y mantenía al robot GATEANDO de vuelta:
-                                      // cada tick del gateo reseteaba la ventana de la siesta →
-                                      // no entraba nunca. La deriva lenta REAL (cuesta abajo,
-                                      // ~cm/s) tiquea cada <150ms y NO dispara el drenaje — el P
-                                      // anti-deriva sigue vivo ahí. Filosofía sin ancla: quieto de
-                                      // verdad = no hay ningún lado adonde volver
-#define RUEDA_DESPL_FUGA        0.998f // fuga del desplazamiento: τ≈5s a 100 Hz (0.995→0.998 el
-                                      // 2026-07-27): con τ≈2s una deriva lenta <1.5 counts/s
-                                      // (~5 mm/s) NUNCA acumulaba más que RUEDA_TRASL_ZM — la
-                                      // fuga drenaba más rápido de lo que la deriva sumaba y el
-                                      // robot "se iba de a poco" sin corrección. Con τ≈5s el
-                                      // umbral de deriva invisible baja a ~0.6 counts/s (~2 mm/s)
+// Signo: counts positivos = avance → corrección NEGATIVA (inclina hacia atrás).
+// Por qué el actuador es el setpoint y no el PWM de rueda: CHANGELOG.md 2026-07-26.
 
 // Corrección de setpoint para mantener la estación (solo BALANCE/IDLE).
-// Gate con rueda_pos_armada: el ancla se estampa en Ctrl_MotoresBalance
-// (que corre DESPUÉS en el ciclo) — el primer ciclo no corrige, mismo
-// patrón que el hold de PAUSA_GIRO. PD:
-//   • P sobre el EXCESO fuera de la zona muerta (continuo en el borde).
-//   • D activa mientras el robot se mueve (2026-07-26): sin amortiguación
-//     propia el resorte, a través del retardo del balance, bombeaba un
-//     vaivén adelante/atrás de amplitud CRECIENTE. El freno de
-//     ComputeBrakeSetpointTarget no sirve acá: su deadband de 0.35 m/s
-//     está por encima de estas velocidades. Se amortigua con la velocidad
-//     EMA por rueda (wheel_spd_*_f, actualizada en Ctrl_MotoresBalance el
-//     ciclo anterior), que sí ve movimientos chicos. + = avance, mismo
-//     signo que el P (mapa lineal del diseño PWM verificado).
-//   • Sin I, a propósito: un integrador de posición acumularía durante el
-//     vaivén natural del balance y pelearía contra él (el modo de falla
-//     del primer diseño por velocidad). El único I de la estación está en
-//     el heading-hold de yaw, donde sí corresponde.
-//   • SIN ANCLA (2026-07-26, rediseño final): el objetivo NO es volver a
-//     un lugar — es VELOCIDAD CERO donde sea ("quedate quieto donde
-//     estés"). Los diseños con ancla fija + zona muerta + latch generaban
-//     el dilema resorte-vs-vaivén y nunca asentaban bien. Ahora:
-//       - D: amortigua la velocidad EMA, con zona muerta de 0.8 rps para
-//         que el pico de ~0.7 rps de un count suelto NO genere corrección
-//         (cero temblor en reposo). Es quien mata los empujones.
-//       - "P": desplazamiento RECIENTE con fuga (τ≈2s) — un ancla FLOTANTE
-//         que sigue al robot. Frena el arrastre lento que se escapa por
-//         debajo de la zona muerta de la D, pero se olvida del lugar: tras
-//         un empujón el robot queda donde la velocidad murió, sin insistir
-//         en volver al punto original. En reposo la fuga lo lleva a 0 y la
-//         corrección desaparece sola (equilibrio mecánico, sin latch).
-static float WheelStation_AngleCorr(void)
+// Es un PD SIN ANCLA: el objetivo no es volver a un punto, es velocidad
+// cero donde sea ("quedate quieto donde estés").
+//   • D — amortigua la velocidad EMA por rueda: mata los empujones.
+//   • P — desplazamiento reciente con fuga (ancla FLOTANTE que sigue al
+//     robot): frena el arrastre lento que pasa por debajo de la zona
+//     muerta de la D. En reposo la fuga lo lleva a 0 y se apaga solo.
+//   • Sin I a propósito: acumularía durante el vaivén natural del balance
+//     y pelearía contra él. El único I está en el heading-hold de yaw.
+// No corrige en el primer ciclo: el ancla se estampa en Ctrl_MotoresBalance,
+// que corre DESPUÉS (mismo patrón que el hold de PAUSA_GIRO).
+static float Estacion_CorreccionAngulo(void)
 {
     static float wheel_disp_f = 0.0f;   // desplazamiento reciente con fuga [counts]
     if (!rueda_pi_habilitado || !rueda_pos_armada) { wheel_disp_f = 0.0f; return 0.0f; }
@@ -3735,7 +3658,7 @@ static void Ctrl_SetpointDinamico(void)
             float stability_scale = 1.0f;
             // Referencia: setpoint_base_f (setpoint actual de línea), no el upright (0°).
             // Sin esto, stability_scale penaliza la inclinación correcta de avance.
-            float balance_err_abs = fabsf(roll_filtrado_grados - setpoint_base_f);
+            float balance_err_abs = fabsf(roll_filtrado_grados - setpoint_base_f);   // Error respecto al setpoint de linea, NO al vertical (0 grados)
             float gyro_abs = fabsf(giro_filtrado);
 
             if (balance_err_abs > 1.5f)
@@ -3772,13 +3695,13 @@ static void Ctrl_SetpointDinamico(void)
 
             if (linea_angulo_comando < 0.0f) {
                 // Freno activo: no aplicar boosts positivos ni vel_scale (que sería 0 y mataría el freno)
-                base_setpoint_target = linea_angulo_comando * stability_scale;
+                base_setpoint_target = linea_angulo_comando * stability_scale;   // Freno escalado por estabilidad (factor 0..1)
             } else {
                 float line_angle_with_boost = clampf_local(
                     linea_angulo_comando + linea_enc_angulo_corr + linea_reversa_empuje,
                     0.0f, LINE_ANGLE + LINEA_ENC_CORR_MAX + LINEA_REV_EMPUJE_MAX
                 );
-                base_setpoint_target = line_angle_with_boost * vel_scale * stability_scale;
+                base_setpoint_target = line_angle_with_boost * vel_scale * stability_scale;   // Avance escalado: los tres factores 0..1 se MULTIPLICAN
             }
         } else if (linea_estado == LINE_STATE_FOLLOWING) {
             // La pérdida se confirma recién después de 150ms para no reaccionar
@@ -3946,7 +3869,7 @@ static void Ctrl_SetpointDinamico(void)
         } else if (linea_estado == LINE_STATE_OBJ_GIRO_ESQUIVE ||
                    linea_estado == LINE_STATE_LOST_ROTATE ||
                    linea_estado == LINE_STATE_EDGE_ROTATE ||
-                   linea_estado == LINE_STATE_PERP_ROTATE) {
+                   linea_estado == LINE_STATE_PERPENDICULAR_ROTATE) {
             // Rotación: upright sin avance, sin freno de encoders
             base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
             brake_setpoint_target = 0.0f;
@@ -3965,9 +3888,9 @@ static void Ctrl_SetpointDinamico(void)
                 int32_t pdr = encoder_derecho - obj_pausa_der0;
                 int32_t pdl = encoder_izquierdo  - obj_pausa_izq0;
                 __enable_irq();
-                float pausa_drift = (float)(pdr + pdl) * 0.5f;
+                float pausa_drift = (float)(pdr + pdl) * 0.5f;   // Semisuma de ambas ruedas: deriva de TRASLACION (no de giro)
                 if (fabsf(pausa_drift) > OBJ_PAUSA_POS_ZM_COUNTS) {
-                    pausa_corr = clampf_local(-OBJ_PAUSA_POS_KP * pausa_drift,
+                    pausa_corr = clampf_local(-OBJ_PAUSA_POS_KP * pausa_drift,   // Termino P de signo opuesto a la deriva (la contrarresta)
                                               -OBJ_PAUSA_POS_MAX, OBJ_PAUSA_POS_MAX);
                 }
             }
@@ -4007,7 +3930,7 @@ static void Ctrl_SetpointDinamico(void)
             // corrección que la reversa pareja (ver switch más abajo). Si todavía hay
             // velocidad residual de avance, frena primero (upright + freno de encoders)
             // en vez de arrancar la reversa de golpe con inercia hacia adelante.
-            if (obj_pared_rev_pestillo) {   // reversa por counts, ver latch (2026-07-10)
+            if (obj_pared_rev_latch) {   // reversa por counts, ver latch (2026-07-10)
                 obj_pared_integral_vel = 0.0f;
                 if (fabsf(apply_deadbandf(velocidad_est_f, FRENO_VEL_ZONA_MUERTA)) > OBJ_PARED_REVERSA_QUIETO_VEL) {
                     base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
@@ -4048,7 +3971,7 @@ static void Ctrl_SetpointDinamico(void)
         } else if (linea_estado == LINE_STATE_OBJ_PARED_LIBRE) {
             // Mismo esquema que OBJ_WALL_FWD (reversa si demasiado cerca, si no PI de
             // velocidad avanzando) -- ver comentarios ahí arriba.
-            if (obj_pared_rev_pestillo) {   // reversa por counts, ver latch (2026-07-10)
+            if (obj_pared_rev_latch) {   // reversa por counts, ver latch (2026-07-10)
                 obj_pared_integral_vel = 0.0f;
                 if (fabsf(apply_deadbandf(velocidad_est_f, FRENO_VEL_ZONA_MUERTA)) > OBJ_PARED_REVERSA_QUIETO_VEL) {
                     base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
@@ -4087,7 +4010,7 @@ static void Ctrl_SetpointDinamico(void)
             // Wall-following girando: upright puro, motores controlados por linea_pivot_activo.
             // Demasiado cerca (ADC7 < REVERSE_THOLD): inclinación hacia atrás (reversa pareja),
             // con la misma espera de estabilidad que en OBJ_WALL_FWD antes de arrancar.
-            if (obj_pared_rev_pestillo) {   // reversa por counts, ver latch (2026-07-10)
+            if (obj_pared_rev_latch) {   // reversa por counts, ver latch (2026-07-10)
                 if (fabsf(apply_deadbandf(velocidad_est_f, FRENO_VEL_ZONA_MUERTA)) > OBJ_PARED_REVERSA_QUIETO_VEL) {
                     base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
                     brake_setpoint_target = ComputeBrakeSetpointTarget(ROBOT_STATE_BALANCE_ONLY);
@@ -4122,7 +4045,7 @@ static void Ctrl_SetpointDinamico(void)
             linea_estado != LINE_STATE_LOST_ROTATE &&
             linea_estado != LINE_STATE_OBJ_GIRO_ESQUIVE  &&
             linea_estado != LINE_STATE_EDGE_ROTATE &&
-            linea_estado != LINE_STATE_PERP_ROTATE &&
+            linea_estado != LINE_STATE_PERPENDICULAR_ROTATE &&
             linea_estado != LINE_STATE_OBJ_GIRO_PARED &&
             linea_estado != LINE_STATE_OBJ_BORDEAR_PARED &&
             linea_estado != LINE_STATE_OBJ_PARED_LIBRE &&
@@ -4210,13 +4133,13 @@ static void Ctrl_SetpointDinamico(void)
         // + estación por rueda: inclinación contra deriva/velocidad, aplicada
         // POST-rampa al final de la función (ver ahí por qué).
         base_setpoint_target  = SETPOINT_ANGLE + setpoint_trim;
-        wheel_station_corr    = WheelStation_AngleCorr();
+        wheel_station_corr    = Estacion_CorreccionAngulo();
         brake_setpoint_target = ComputeBrakeSetpointTarget(estado_robot);
     } else {
         // IDLE-activo balancea con Ctrl_MotoresBalance → misma estación.
         // (MOTOR_TEST también cae acá pero su setpoint no llega a motores.)
         base_setpoint_target = SETPOINT_ANGLE + setpoint_trim;
-        wheel_station_corr   = WheelStation_AngleCorr();
+        wheel_station_corr   = Estacion_CorreccionAngulo();
     }
 
     // Clamp global de setpoint. MANUAL_CONTROL necesita su propia excepción
@@ -4229,7 +4152,7 @@ static void Ctrl_SetpointDinamico(void)
                                         -sp_limit - brake_setpoint_target,
                                          sp_limit - brake_setpoint_target);
 
-    setpoint_dinamico = base_setpoint_target + brake_setpoint_target;
+    setpoint_dinamico = base_setpoint_target + brake_setpoint_target;   // Superposicion: setpoint total = avance + freno
     if (setpoint_dinamico >  sp_limit) setpoint_dinamico =  sp_limit;
     if (setpoint_dinamico < -sp_limit) setpoint_dinamico = -sp_limit;
 
@@ -4283,14 +4206,14 @@ static void Ctrl_SetpointDinamico(void)
     }
 
     // Término de posición: integra velocidad para corregir deriva lenta
-    setpoint_dinamico_f = setpoint_base_f + setpoint_freno_f;
+    setpoint_dinamico_f = setpoint_base_f + setpoint_freno_f;   // Idem con las dos componentes ya rampeadas
     setpoint_dinamico_f = clampf_local(setpoint_dinamico_f, -sp_limit, sp_limit);
     // En modo línea el setpoint nunca supera el límite de freno hacia atrás.
     if (estado_robot == ROBOT_STATE_LINE_FOLLOWING) {
         if (setpoint_dinamico_f < -LINEA_FRENO_ANGULO_MAX)
             setpoint_dinamico_f = -LINEA_FRENO_ANGULO_MAX;
     }
-    setpoint_freno_f   = setpoint_dinamico_f - setpoint_base_f;
+    setpoint_freno_f   = setpoint_dinamico_f - setpoint_base_f;   // Recalcula el freno tras el clamp para que la suma siga cerrando
 
     // Estación por rueda: corrección POST-rampa (2026-07-27). Antes viajaba
     // dentro de base_setpoint_target y quedaba sometida a la rampa de
@@ -5320,9 +5243,9 @@ static void LineState_EdgeRotate(void)
     }
 }
 
-// PERP_ROTATE: cruce perpendicular (4 sensores en negro) — gira 90° hacia
+// PERPENDICULAR_ROTATE: cruce perpendicular (4 sensores en negro) — gira 90° hacia
 // el lado del último esquive y retoma FOLLOWING.
-static void LineState_PerpRotate(void)
+static void LineState_PerpendicularRotate(void)
 {
     // Cruce perpendicular detectado (los 4 ADC en negro sin manipular
     // el robot): gira 90° fijo y vuelve directo a FOLLOWING, sin pasar
@@ -5362,7 +5285,7 @@ static void LineState_PerpRotate(void)
         obj_rot_fase       = 0;
         obj_rot_rumbo     = 0.0f;
         obj_rot_fase1_ms   = 0;
-        perp_obj_freno_inicio_ms = 0;
+        perpendicular_obj_freno_inicio_ms = 0;
     }
 
     float prot_gz = (float)giro_z / 100.0f;   // Escalado del sensor -> deg/s
@@ -5400,15 +5323,15 @@ static void LineState_PerpRotate(void)
         int enc_done      = (prot_counts >= PROT_ENC_TARGET);
         int overshoot     = (prot_abs_hdg > PROT_ABS_TARGET * 1.2f);
         uint32_t obj_brake_elapsed = 0;
-        if (enc_done && perp_desde_esquive) {
-            if (perp_obj_freno_inicio_ms == 0)
-                perp_obj_freno_inicio_ms = HAL_GetTick();
-            obj_brake_elapsed = HAL_GetTick() - perp_obj_freno_inicio_ms;
+        if (enc_done && perpendicular_desde_esquive) {
+            if (perpendicular_obj_freno_inicio_ms == 0)
+                perpendicular_obj_freno_inicio_ms = HAL_GetTick();
+            obj_brake_elapsed = HAL_GetTick() - perpendicular_obj_freno_inicio_ms;
         }
-        int brake_done = perp_desde_esquive
+        int brake_done = perpendicular_desde_esquive
             ? (enc_done && obj_brake_elapsed >= PROT_OBJ_BRAKE_DURATION)
             : (enc_done && p1e >= PROT_BRAKE_DURATION);
-        int phase_timeout = perp_desde_esquive
+        int phase_timeout = perpendicular_desde_esquive
             ? (!enc_done && p1e >= PROT_P1_MAX)
             : (p1e >= PROT_P1_MAX);
         if (brake_done || phase_timeout || overshoot) {
@@ -5417,8 +5340,8 @@ static void LineState_PerpRotate(void)
             // Sin pausa posterior: el giro final lento ya entrega
             // el robot directamente al seguidor de línea.
             linea_estado = LINE_STATE_FOLLOWING;
-            perp_desde_esquive = 0;
-            perp_obj_freno_inicio_ms = 0;
+            perpendicular_desde_esquive = 0;
+            perpendicular_obj_freno_inicio_ms = 0;
             linea_vista_desde_entrada = 1;
             linea_integral       = 0.0f;
             linea_error_previo     = 0.0f;
@@ -5429,10 +5352,10 @@ static void LineState_PerpRotate(void)
             ajuste_direccion = 0.0f;
             // Sin este reset, si los sensores siguen en negro después del
             // giro (no habia linea real), el timer ya vencido re-dispara
-            // otro PERP_ROTATE apenas vuelva a FOLLOWING -> giro en círculos.
+            // otro PERPENDICULAR_ROTATE apenas vuelva a FOLLOWING -> giro en círculos.
             todos_negros_inicio_ms  = 0;
         } else if (!enc_done) {
-            perp_obj_freno_inicio_ms = 0;
+            perpendicular_obj_freno_inicio_ms = 0;
             float remaining = PROT_ENC_TARGET - prot_counts;
             float ramp = fminf(remaining / (PROT_ENC_TARGET * 0.15f), 1.0f);
             float pivot = PROT_DIR * PROT_PIVOT * 0.4f * fmaxf(ramp, 0.2f);
@@ -5441,7 +5364,7 @@ static void LineState_PerpRotate(void)
             motor_izquierdo_velocidad  = (int16_t)clampf_local(-(pwm_saturado - pivot), -60.0f, 60.0f);
         } else {
             float brake_power = PROT_BRAKE;
-            if (perp_desde_esquive) {
+            if (perpendicular_desde_esquive) {
                 float brake_ramp = fminf(
                     (float)obj_brake_elapsed / (float)PROT_OBJ_BRAKE_RAMP_MS,
                     1.0f);
@@ -5953,7 +5876,7 @@ static void LineState_ObjBordearPared(void)
     uint8_t line_ignore   = ((HAL_GetTick() - obj_pared_sec_inicio_ms) < OBJ_PARED_LINEA_IGNORAR_MS);
     float wall_adc        = (float)adc_promedio[OBJ_PARED_ADC_IDX];
     uint8_t wall_visible  = (wall_adc < OBJ_PARED_UMBRAL);
-    uint8_t wall_reverse  = obj_pared_rev_pestillo;   // por counts (2026-07-10)
+    uint8_t wall_reverse  = obj_pared_rev_latch;   // por counts (2026-07-10)
     uint8_t too_close     = (!wall_reverse) && (wall_adc < OBJ_PARED_MUY_CERCA_UMBRAL);
     if (ObjWall_LineConfirmed(linea_detectada, line_ignore)) {
         linea_vista_desde_entrada = 1;
@@ -6027,7 +5950,7 @@ static void LineState_ObjParedLibre(void)
     int32_t clear_counts = (abs(clear_dr) + abs(clear_dl)) / 2;
 
     float wall_adc       = (float)adc_promedio[OBJ_PARED_ADC_IDX];
-    uint8_t wall_reverse = obj_pared_rev_pestillo;   // por counts (2026-07-10)
+    uint8_t wall_reverse = obj_pared_rev_latch;   // por counts (2026-07-10)
     uint8_t too_close    = (!wall_reverse) && (wall_adc < OBJ_PARED_MUY_CERCA_UMBRAL);
     // Misma ventana que BORDEAR_PARED, medida desde la entrada a TODA
     // la secuencia (obj_pared_sec_inicio_ms) — ver fix 2026-07-05.
@@ -6081,7 +6004,7 @@ static void LineState_ObjGiroPared(void)
     // TOO_CLOSE_THOLD → pivot alejándose en cambio.
     float wall_adc       = (float)adc_promedio[OBJ_PARED_ADC_IDX];
     uint8_t wall_visible = (wall_adc < OBJ_PARED_UMBRAL);
-    uint8_t wall_reverse = obj_pared_rev_pestillo;   // por counts (2026-07-10)
+    uint8_t wall_reverse = obj_pared_rev_latch;   // por counts (2026-07-10)
     uint8_t too_close    = (!wall_reverse) && (wall_adc < OBJ_PARED_MUY_CERCA_UMBRAL);
     // Misma ventana que BORDEAR_PARED/PARED_LIBRE, medida desde la
     // entrada a toda la secuencia (obj_pared_sec_inicio_ms).
@@ -6157,7 +6080,7 @@ static void Ctrl_MotoresLinea(void)
         case LINE_STATE_EDGE_SETTLE:       LineState_EdgeSettle();      break;
         case LINE_STATE_EDGE_FWD:          LineState_EdgeFwd();         break;
         case LINE_STATE_GIVEN_UP:          LineState_GivenUp();         break;
-        case LINE_STATE_PERP_ROTATE:       LineState_PerpRotate();      break;
+        case LINE_STATE_PERPENDICULAR_ROTATE:       LineState_PerpendicularRotate();      break;
         case LINE_STATE_OBJ_FRENO_REVERSA: LineState_ObjFrenoReversa(); break;
         case LINE_STATE_OBJ_GIRO_ESQUIVE:  LineState_ObjGiroEsquive();  break;
         case LINE_STATE_OBJ_PAUSA_GIRO:    LineState_ObjPausaGiro();    break;
@@ -6311,7 +6234,7 @@ static void Ctrl_MotoresBalance(void)
     // principal — NO se toca acá). La estación se controla en DOS EJES
     // DESACOPLADOS, cada uno con SU actuador:
     //   • TRASLACIÓN (promedio de deriva de las ruedas): via SETPOINT de
-    //     inclinación — ver WheelStation_AngleCorr() en la etapa 12. El
+    //     inclinación — ver Estacion_CorreccionAngulo() en la etapa 12. El
     //     primer diseño la corregía acá con trim de PWM y en el robot la
     //     deriva hacia adelante nunca frenaba: frenar las ruedas inclina el
     //     cuerpo y el balance responde acelerando — el trim pelea con el
@@ -6883,7 +6806,7 @@ int main(void)
       .send_wifi_log = &f_enviar_log_wifi,
       .change_display = &f_cambiar_pantalla,
       .kp_line = &KP_LINE, .kd_line = &KD_LINE, .ki_line = &KI_LINE,
-      .line_threshold = &LINE_THRESHOLD, .line_speed = &LINE_SPEED_TARGET,
+      .line_threshold = &LINEA_UMBRAL_ADC, .line_speed = &LINE_SPEED_TARGET,
       .sp_limit = &SP_LIMIT_DEG,
       .manual_setpoint = &manual_setpoint_comando,
       .manual_steering = &manual_direccion_comando,
