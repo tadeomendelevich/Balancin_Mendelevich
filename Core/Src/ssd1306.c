@@ -25,8 +25,6 @@ static const SSD1306_Platform_t *pPlat = NULL;
 //#define WRITE_DATA_ASYNC(b,n) pPlat->write_data_async(pPlat->ctx, (b), (n))
 #define WRITE_DATA_ASYNC(buf, len)   \
 SSD1306_Platform_WriteDataAsync((buf), (len))
-#define IS_BUSY()         pPlat->is_busy(pPlat->ctx)
-#define DELAY_MS(ms)      pPlat->delay_ms(pPlat->ctx, (ms))
 
 /* Absolute value */
 #define ABS(x)   ((x) > 0 ? (x) : -(x))
@@ -61,8 +59,6 @@ static SSD1306_t SSD1306;
 #define SSD1306_NORMALDISPLAY       0xA6
 #define SSD1306_INVERTDISPLAY       0xA7
 
-#define SSD1306_COLUMNADDR  0x21  // Set column address
-#define SSD1306_PAGEADDR    0x22  // Set page address
 
 
 void SSD1306_RegisterPlatform(const SSD1306_Platform_t *plat) {

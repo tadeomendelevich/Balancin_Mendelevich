@@ -55,7 +55,6 @@ typedef struct {
 #define GYRO_CONFIG_REG      0x1B  // Registro de configuración del giroscopio
 #define ACCEL_CONFIG_REG     0x1C  // Registro de configuración del acelerómetro
 #define ACCEL_XOUT_H_REG     0x3B  // Dirección base de lectura del acelerómetro
-#define GYRO_XOUT_H_REG      0x43  // Dirección base de lectura del giroscopio
 #define CONFIG_REG    		 0x1A
 
 #define MPU6050_READ_SIZE    14    // 6 bytes Accel + 2 bytes Temp + 6 bytes Gyro
@@ -65,10 +64,8 @@ typedef struct {
 // ------------------------------------------------------
 
 // Gravedad terrestre en m/s²
-#define GRAVEDAD            9.81
 
 // Factor de multiplicación para convertir a escala fija (2 decimales)
-#define MULTIPLICADORFLOAT  100  // Ejemplo: 9.81 × 100 = 981
 
 // Códigos de retorno
 #define MPU6050_OK           0
