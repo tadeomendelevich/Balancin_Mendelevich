@@ -82,7 +82,7 @@ static float *p_SP_LIMIT = NULL;
 // El corte de emergencia (10 m/s) sigue siendo una proteccion independiente;
 // este rango es deliberadamente mas conservador para el comando de usuario.
 #define LINE_SPEED_CMD_MIN_MPS  0.20f
-// 2026-07-27: 4.00 -> 8.00 a pedido del usuario (queria pasar de 4 m/s desde
+// 4.00 -> 8.00 a pedido del usuario (queria pasar de 4 m/s desde
 // Qt y el clamp del firmware lo recortaba en silencio). Sigue por debajo del
 // corte de emergencia de 10 m/s: pedir un objetivo >= a ese corte seria
 // autodestructivo (el robot cortaria motores al alcanzarlo).
@@ -427,7 +427,6 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			}
         	break;
         case GETSPEED:
-            // Implementado 2026-07-24 (antes caia en default → UNKNOWN).
             // Respuesta: 3 floats LE = velocidad global [m/s], rueda derecha
             // [rps], rueda izquierda [rps]. La convencion interna del firmware
             // es "negativo = adelante" (ver vel_enc en main.c); para la UI se
@@ -581,8 +580,6 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 		break;
 
         case MODIFY_KV_BRAKE:
-            // Hasta 2026-07-24 este comando NO tenia case: Qt lo enviaba y el
-            // firmware respondia UNKNOWN sin tocar KV_brake_value.
             if (p_KV_BRAKE) {
                 float new_KV;
                 if (getF32BoundedFromRx(dataRx, &new_KV, 0.0f, KV_BRAKE_CMD_MAX))
@@ -659,7 +656,7 @@ static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 			putByteOnTx(dataTx, dataTx->chk);
 		break;
 
-        // Tope de inclinacion del setpoint dinamico [grados] (2026-07-27).
+        // Tope de inclinacion del setpoint dinamico [grados].
         // Es el "sp_limit" de Ctrl_SetpointDinamico: cuanto puede inclinarse
         // el robot para acelerar o frenar. Responde UNKNOWN si no hay binding
         // (mismo patron que MODIFY_BETA_*), no un ACK mentiroso.

@@ -166,7 +166,7 @@ typedef enum{
     MODIFY_KD_LINE = 0xC1,
     MODIFY_KI_LINE = 0xC2,
     MODIFY_LINE_THRES = 0xC3,
-    MODIFY_LINE_SPEED = 0xC4,       // float32 m/s, limitado en STM32 a 0.20..8.00 (era 4.00 hasta 2026-07-27)
+    MODIFY_LINE_SPEED = 0xC4,       // float32 m/s, limitado en STM32 a 0.20..8.00 (era 4.00)
     ACTIVATE_LINE_FOLLOWING = 0xC5,
     ACTIVATE_POS_MAINTENANCE = 0xC6,
     ACTIVATE_MANUAL_CONTROL = 0xC7,
@@ -234,7 +234,7 @@ typedef struct __attribute__((packed)) {
     uint16_t adc8;
     float    roll_deg;         // ángulo de balanceo (filtered_roll_deg) — alimenta la Vista 3D de Qt sin depender de ACTIVATE_WIFI_LOG
     float    lat_deg;          // inclinación LATERAL (banking alrededor del eje de avance), por
-                               // acelerómetro con EMA — tercer eje de la Vista 3D de Qt (2026-07-10)
+                               // acelerómetro con EMA — tercer eje de la Vista 3D de Qt
 } WifiOdomData_t;
 
 void UNER_Init(_sRx *rx, _sTx *tx);
