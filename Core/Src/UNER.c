@@ -15,10 +15,29 @@
 extern void USB_Debug(const char *fmt, ...);
 extern void USB_DebugStr(const char *dbgStr);
 
+static uint8_t (*request_wifi_mode)(uint8_t mode);
+
 static const char firmware[] = "UNER V1.0";
 
 static _sRx *unerRx;
 static _sTx *unerTx;
+// Preserve command replies while CIPSEND is busy; telemetry yields to this queue.
+#define UDP_REPLY_QUEUE_SIZE 4
+static uint8_t udpReplies[UDP_REPLY_QUEUE_SIZE][TXBUFSIZE];
+static uint16_t udpReplyLength[UDP_REPLY_QUEUE_SIZE];
+static uint8_t udpReplyHead, udpReplyTail, udpReplyCount;
+static void flushUdpReplies(void) {
+    if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED ||
+        (ESP01_GetMode() == ESP01_MODE_SOFTAP && !ESP01_HasPeer())) {
+        udpReplyHead = udpReplyTail = udpReplyCount = 0;
+        return;
+    }
+    if (udpReplyCount && !ESP01_IsSending() &&
+        ESP01_Send(udpReplies[udpReplyTail], 0, udpReplyLength[udpReplyTail], TXBUFSIZE) == ESP01_SEND_READY) {
+        udpReplyTail = (udpReplyTail + 1U) % UDP_REPLY_QUEUE_SIZE;
+        --udpReplyCount;
+    }
+}
 
 // Prototipo externo de estado USB (ya lo tienes en main.c)
 extern USBD_HandleTypeDef hUsbDeviceFS;
@@ -131,6 +150,7 @@ static uint8_t last_manual_cmd = 0;
 static volatile uint32_t rx_overflow_count = 0;
 
 void UNER_Init(_sRx *rx, _sTx *tx) {
+    udpReplyHead = udpReplyTail = udpReplyCount = 0;
     unerRx = rx;
     unerTx = tx;
     unerRx->indexR = 0;
@@ -164,6 +184,7 @@ void UNER_PushByte(uint8_t byte) {
 }
 
 void UNER_Task(void) {
+    flushUdpReplies();
     uint8_t auxIndex = unerRx->indexW;
     while (unerRx->indexR != auxIndex) {
         switch (unerRx->header) {
@@ -371,6 +392,30 @@ static void putAllSensorsOnTx(_sTx *dataTx)
 static void decodeCommand(_sRx *dataRx, _sTx *dataTx)
 {
     switch(dataRx->buff[dataRx->indexData]){
+        case SET_WIFI_MODE: {
+            // Original length includes command, mode and checksum.
+            uint8_t length = dataRx->buff[(dataRx->indexData - 2U) & dataRx->mask];
+            uint8_t mode = dataRx->buff[(dataRx->indexData + 1U) & dataRx->mask];
+            uint8_t accepted = length == 3U && request_wifi_mode && request_wifi_mode(mode);
+            putHeaderOnTx(dataTx, SET_WIFI_MODE, 3);
+            putByteOnTx(dataTx, accepted ? ACK : UNKNOWN);
+            putByteOnTx(dataTx, mode);
+            putByteOnTx(dataTx, dataTx->chk);
+            break;
+        }
+        case GET_WIFI_STATUS: {
+            char ip[16] = {0};
+            const char *current = ESP01_GetLocalIP();
+            if (current) strncpy(ip, current, sizeof(ip)-1U);
+            putHeaderOnTx(dataTx, GET_WIFI_STATUS, 21);
+            putByteOnTx(dataTx, (uint8_t)ESP01_GetMode());
+            putByteOnTx(dataTx, ESP01_StateWIFI() == ESP01_WIFI_CONNECTED);
+            putByteOnTx(dataTx, ESP01_StateUDPTCP() == ESP01_UDPTCP_CONNECTED);
+            putByteOnTx(dataTx, ESP01_HasPeer());
+            putBytesOnTx(dataTx, ip, sizeof(ip));
+            putByteOnTx(dataTx, dataTx->chk);
+            break;
+        }
         case ALIVE:
         	USB_Debug("\n ALIVE RECIBIDO!\n");
             putHeaderOnTx(dataTx, ALIVE, 2);
@@ -948,6 +993,7 @@ uint8_t UNER_ShouldSendAllSensors(void) {
 void UNER_RegisterBindings(const UNER_Bindings_t *b) {
     if (b == NULL) return;
 
+    request_wifi_mode = b->request_wifi_mode;
     p_adcBuf = b->adc; adcBufLen = b->adc_len;
     p_motorRightVel = b->motor_right_velocity; p_motorLeftVel = b->motor_left_velocity;
     p_ax = b->ax; p_ay = b->ay; p_az = b->az;
@@ -987,8 +1033,14 @@ static void UNER_SendData(void) {
     }
 
     // UDP (ESP01)
-    if (ESP01_StateUDPTCP() == ESP01_UDPTCP_CONNECTED && !ESP01_IsSending()) {
-        ESP01_Send(unerTx->buff, unerTx->indexR, len, TXBUFSIZE);
+    if (ESP01_StateUDPTCP() == ESP01_UDPTCP_CONNECTED &&
+        (ESP01_GetMode() != ESP01_MODE_SOFTAP || ESP01_HasPeer()) && udpReplyCount < UDP_REPLY_QUEUE_SIZE) {
+        for (uint16_t i = 0; i < len; ++i)
+            udpReplies[udpReplyHead][i] = unerTx->buff[(unerTx->indexR + i) & unerTx->mask];
+        udpReplyLength[udpReplyHead] = len;
+        udpReplyHead = (udpReplyHead + 1U) % UDP_REPLY_QUEUE_SIZE;
+        ++udpReplyCount;
+        flushUdpReplies();
     }
 
     // Avanzar índice de lectura
@@ -999,7 +1051,8 @@ static void UNER_SendWifiStruct(_eCmd command, const void *data, uint8_t payload
     if (data == NULL || payloadLen == 0U)
         return;
 
-    if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending()) {
+    if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED || ESP01_IsSending() || udpReplyCount ||
+        (ESP01_GetMode() == ESP01_MODE_SOFTAP && !ESP01_HasPeer())) {
         return;
     }
 

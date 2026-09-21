@@ -1,1221 +1,341 @@
-/*
- * ESP01.c
- *
- *  Created on: July 31, 2025
- *      Author: Tadeo Mendelevich
+/* ESP-01 AT transport: one transaction at a time, bounded cooperative work.
+ * STA and SoftAP use the same UNER/UDP payloads. No delays in the control loop.
  */
-
 #include "ESP01.h"
-#include <stddef.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
 #include "stm32f4xx_hal.h"
 #include "UNER.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-extern void USB_Debug(const char *fmt, ...);
+#define PEER_LEASE_MS 10000U
+#define RX_BUDGET 256U
+#define TX_BUDGET 8U
+typedef enum { OFF, RESET_LOW, BOOT, CONFIGURE, READY, CLOSED } Phase;
+typedef enum { TX_IDLE, TX_COMMAND, TX_PROMPT, TX_PAYLOAD, TX_RESULT } TxPhase;
+static _sESP01Handle io;
+static OnESP01ChangeState notify;
+static ESP01DebugStr debug;
+static ESP01_Mode mode;
+static Phase phase;
+static TxPhase txPhase;
+static const char *ssid, *password;
+static uint8_t networkUp, socketUp, peerKnown, tcp, metadata, legacyDhcp;
+static uint8_t step, waiting, replyOk, replyError, gotPrompt, discoveryReply;
+static uint32_t deadline, peerAt, aliveAt;
+static char localIP[16], remoteIP[16], peerIP[16];
+static uint16_t localPort, remotePort, peerPort;
+static volatile uint16_t rxW, rxR;
+static volatile uint8_t rxOverflow;
+static uint8_t rx[ESP01RXBUFAT], payload[256], packet[256];
+static char command[224], line[224], packetIP[16];
+static uint16_t commandLen, commandPos, payloadLen, payloadPos, lineLen;
+static uint16_t packetLen, packetPos, packetPort;
+static uint8_t inPacket, discardLine;
+static uint32_t rxAt;
 
-#define ALIVE_INTERVAL_FAST_MS 	5000
-#define ALIVE_INTERVAL_SLOW_MS 	10000
-#define ALIVE_FAST_COUNT 		20
-#define ESP01_BURST_LIMIT       8
-
-static uint8_t alive_counter = 0;
-static uint16_t connection_watchdog = 0;
-
-static enum {
-	ESP01ATIDLE,
-	ESP01ATAT,
-	ESP01ATRESPONSE,
-	ESP01ATCIPMUX,
-	ESP01ATCWMODE_SET,
-	ESP01ATCWMODE_RESPONSE,
-	ESP01ATCWDHCP_SET,
-	ESP01ATCWDHCP_RESPONSE,
-	ESP01ATCWAUTOCONN,
-	ESP01ATCWAUTOCONN_RESPONSE,
-	ESP01ATCWJAP,
-	ESP01CWJAPRESPONSE,
-	ESP01ATCIFSR,
-	ESP01CIFSRRESPONSE,
-	ESP01ATCIPCLOSE,
-	ESP01ATCIPSTART,
-	ESP01CIPSTARTRESPONSE,
-	ESP01ATPREPUDP,
-	ESP01ATCONNECTED,
-	ESP01ATHARDRST0,
-	ESP01ATHARDRST1,
-	ESP01ATHARDRSTSTOP,
-	ESP01ATRECONNECT,
-} esp01ATSate = ESP01ATIDLE;
-
-static union{
-	struct{
-		uint8_t WAITINGSYMBOL: 1;
-		uint8_t WIFICONNECTED: 1;
-		uint8_t TXCIPSEND: 1;
-		uint8_t SENDINGDATA: 1;
-		uint8_t HRDRESETON: 1;
-		uint8_t ATRESPONSEOK: 1;
-		uint8_t UDPTCPCONNECTED: 1;
-		uint8_t WAITINGRESPONSE: 1;
-	}bit;
-	uint8_t byte;
-} esp01Flags;
-
-static void ESP01ATDecode();
-static void ESP01DOConnection();
-static void ESP01_InternalStateChange(_eESP01STATUS state);
-static void ESP01_NotifyStateChange(_eESP01STATUS state);
-static void ESP01SENDData();
-static void ESP01StrToBufTX(const char *str);
-static void ESP01ByteToBufTX(uint8_t value);
-
-static uint32_t esp01TimeoutTask = 0;
-static uint32_t esp01TimeoutDataRx = 0;
-static uint32_t esp01TimeoutTxSymbol = 0;
-static uint32_t esp01TimeoutSending = 0;
-static OnESP01ChangeState aESP01ChangeState = NULL;
-static ESP01DebugStr aDbgStr = NULL;
-
-static const char *esp01SSID = NULL;
-static const char *esp01PASSWORD = NULL;
-static const char *esp01RemoteIP = NULL;
-//static char esp01PROTO[4] = "TCP";
-static char esp01PROTO[4] = "UDP";
-static char esp01RemotePORT[6] = {0};
-static char esp01LocalIP[16] = {0};
-static char esp01LocalPORT[6] = {0};
-
-static uint8_t esp01HState = 0;
-static uint16_t	esp01nBytes = 0;
-static uint8_t	esp01RXATBuf[ESP01RXBUFAT];
-static uint8_t	esp01TXATBuf[ESP01TXBUFAT];
-static uint16_t	esp01iwRXAT = 0;
-static uint16_t	esp01irRXAT = 0;
-static uint16_t esp01irTX = 0;
-static uint16_t esp01iwTX = 0;
-
-static uint8_t esp01TriesAT = 0;
-
-static _sESP01Handle esp01Handle = {.aDoCHPD = NULL, .aWriteUSARTByte = NULL,
-									.bufRX = NULL, .iwRX = NULL, .sizeBufferRX = 0};
-
-const char ATAT[] = "AT\r\n";
-const char ATCIPMUX[] = "AT+CIPMUX=1\r\n";
-const char ATCWQAP[] = "AT+CWQAP\r\n";
-const char ATCWMODE[] = "AT+CWMODE=3\r\n";
-const char ATCWJAP[] = "AT+CWJAP=";
-const char ATCIFSR[] = "AT+CIFSR\r\n";
-const char ATCIPSTART[] = "AT+CIPSTART=";
-//const char ATCIPCLOSE[] = "AT+CIPCLOSE\r\n";
-const char ATCIPCLOSE[] = "AT+CIPCLOSE=0\r\n";
-const char ATCIPSEND[] = "AT+CIPSEND=";
-
-const char respAT[] = "0302AT\r";
-const char respATp[] = "0302AT+";
-const char respOK[] = "0402OK\r\n";
-const char respERROR[] = "0702ERROR\r\n";
-const char respWIFIGOTIP[] = "1302WIFI GOT IP\r\n";
-const char respWIFICONNECTED[] = "1602WIFI CONNECTED\r\n";
-const char respWIFIDISCONNECT[] = "1702WIFI DISCONNECT\r\n";
-const char respWIFIDISCONNECTED[] = "1902WIFI DISCONNECTED\r\n";
-const char respDISCONNECTED[] = "1402DISCONNECTED\r\n";
-const char respSENDOK[] = "0902SEND OK\r\n";
-const char respCONNECT[] = "0902CONNECT\r\n";
-const char respCLOSED[] = "0802CLOSED\r\n";
-const char respCIFSRAPIP[] = "1205+CIFSR:STAIP";
-const char respBUSY[] = "0602busy .";
-const char respIPD[] = "0410+IPD";
-const char respReady[] = "0702ready\r\n";
-const char respBUSYP[] = "0602busy p";
-const char respBUSYS[] = "0602busy s";
-const char respFAIL[]  = "0602FAIL\r\n";
-// 	  const char respCIFSRAPIP[] = "1102+CIFSR:APIP";
-//    const char respCIFSRAPMAC[] = "1202+CIFSR:APMAC";
-//    const char respCIFSRSTAIP[] = "1205+CIFSR:STAIP";
-//    const char respCIFSRSTAMAC[] = "1302+CIFSR:STAMAC";
-
-const char *const responses[] = {respAT, respATp, respOK, respERROR, respWIFIGOTIP, respWIFICONNECTED,
-								 respWIFIDISCONNECT, respWIFIDISCONNECTED, respDISCONNECTED, respSENDOK, respCONNECT, respCLOSED,
-								 respCIFSRAPIP, respBUSY, respIPD, respReady, respBUSYP, respBUSYS, respFAIL, NULL};
-
-static uint8_t indexResponse = 0;
-static uint8_t indexResponseChar = 0;
-
-static uint8_t tryingTCP = 0;
-static uint8_t waitingForTCPClient = 0;
-static uint16_t lastIPDlen = 0;  // guarda la longitud del +IPD
-
-//static uint8_t tcpServerStarted = 0;
-//static uint8_t configUDPObtenida = 0; // Unused
-static uint8_t udpIniciado = 0;
-static uint32_t lastAliveTick = 0;
-
-extern void UNER_SendAlive(void);
-
-//const char _DNSFAIL[] = "DNS FAIL\r";
-//const char _ATCIPDNS[] = "AT+CIPDNS_CUR=1,\"208.67.220.220\",\"8.8.8.8\"\r\n";
-//const char CIFSRAPIP[] = "+CIFSR:APIP\r";
-//const char CIFSRAPMAC[] = "+CIFSR:APMAC\r";
-//const char CIFSRSTAIP[] = "+CIFSR:STAIP\r";
-//const char CIFSRSTAMAC[] = "+CIFSR:STAMAC\r";
-
-void ESP01_SetWIFI(const char *ssid, const char *password){
-	esp01ATSate = ESP01ATIDLE;
-	esp01Flags.byte = 0;
-
-	esp01SSID = ssid;
-	esp01PASSWORD = password;
-
-	esp01TimeoutTask = 50;
-	esp01ATSate = ESP01ATHARDRST0;
-	esp01TriesAT = 0;
+static int expired(uint32_t now, uint32_t when) { return (int32_t)(now-when) >= 0; }
+static void event(_eESP01STATUS s) { if (notify) notify(s); }
+static void logMessage(const char *s) { if (debug) debug(s); }
+static void clearPeer(void) { peerKnown=0; peerIP[0]=0; discoveryReply=0; }
+static void resetModule(void) {
+    networkUp=socketUp=0; clearPeer(); txPhase=TX_IDLE;
+    waiting=replyOk=replyError=gotPrompt=0;
+    commandLen=commandPos=payloadLen=payloadPos=lineLen=0;
+    inPacket=discardLine=0; rxR=rxW; rxOverflow=0; localIP[0]=0;
+    step=0; metadata=1; legacyDhcp=0;
+    if (io.aDoCHPD) io.aDoCHPD(0);
+    phase=RESET_LOW; deadline=HAL_GetTick()+150U;
+    event(ESP01_WIFI_RECONNECTING);
 }
-
-
-_eESP01STATUS ESP01_StartUDP(const char *RemoteIP, uint16_t RemotePORT, uint16_t LocalPORT){
-	char buf[100];
-	sprintf(buf,
-		">> ESP01_StartUDP params: IP=%s, RemotePort=%u, LocalPort=%u\r\n",
-		RemoteIP, (unsigned)RemotePORT, (unsigned)LocalPORT);
-	aDbgStr(buf);
-
-
-	if(esp01Handle.aWriteUSARTByte == NULL)
-		return ESP01_NOT_INIT;
-
-	if(LocalPORT == 0)
-		LocalPORT = 30000;
-
-	strcpy(esp01PROTO, "UDP");
-	udpIniciado      = 0;
-
-	// <<< AQUÍ guardo el puntero a la IP PASADA desde main.c >>>
-	esp01RemoteIP = RemoteIP;
-
-	itoa(RemotePORT, esp01RemotePORT, 10);
-	itoa(LocalPORT, esp01LocalPORT, 10);
-
-	if(esp01SSID == NULL)
-		return ESP01_WIFI_NOT_SETED;
-
-	if(esp01Flags.bit.WIFICONNECTED == 0)
-		return ESP01_WIFI_DISCONNECTED;
-
-	esp01ATSate = ESP01ATPREPUDP;
-
-	return ESP01_UDPTCP_CONNECTING;
+static int ipv4(const char *s) {
+    unsigned a,b,c,d; char tail;
+    return sscanf(s,"%u.%u.%u.%u%c",&a,&b,&c,&d,&tail)==4 &&
+           a>0 && a<224 && b<256 && c<256 && d>0 && d<255;
 }
-
-_eESP01STATUS ESP01_StartTCP(const char *RemoteIP, uint16_t RemotePORT, uint16_t LocalPORT){
-	if(esp01Handle.aWriteUSARTByte == NULL)
-		return ESP01_NOT_INIT;
-
-	if(LocalPORT == 0)
-		LocalPORT = 30000;
-
-	strcpy(esp01PROTO, "TCP");
-
-	esp01RemoteIP = RemoteIP;
-
-	itoa(RemotePORT, esp01RemotePORT, 10);
-	itoa(LocalPORT, esp01LocalPORT, 10);
-
-	if(esp01SSID == NULL)
-		return ESP01_WIFI_NOT_SETED;
-
-	if(esp01Flags.bit.WIFICONNECTED == 0)
-		return ESP01_WIFI_DISCONNECTED;
-
-	esp01ATSate = ESP01ATCIPCLOSE;
-
-	return ESP01_UDPTCP_CONNECTING;
+static int credentialsValid(const char *s, const char *p, int ap) {
+    if (!s || !p || !*s || strlen(s)>32 || strlen(p)>63 || (ap && strlen(p)<8)) return 0;
+    return !strpbrk(s,"\r\n\"\\") && !strpbrk(p,"\r\n\"\\");
 }
-
-
-void ESP01_CloseUDPTCP(){
-	if(esp01Handle.aWriteUSARTByte == NULL)
-		return;
-
-	esp01ATSate = ESP01ATCIPCLOSE;
+static void queueCommand(const char *s) {
+    snprintf(command,sizeof(command),"%s",s);
+    commandLen=(uint16_t)strlen(command); commandPos=0;
+    replyOk=replyError=gotPrompt=0; waiting=0;
 }
-
-_eESP01STATUS ESP01_StateWIFI(){
-	if(esp01Handle.aWriteUSARTByte == NULL)
-		return ESP01_NOT_INIT;
-
-	if(esp01Flags.bit.WIFICONNECTED)
-		return ESP01_WIFI_CONNECTED;
-	else
-		return ESP01_WIFI_DISCONNECTED;
+static int flushCommand(void) {
+    unsigned count=0;
+    while (commandPos<commandLen && count++<TX_BUDGET) {
+        if (!io.aWriteUSARTByte((uint8_t)command[commandPos])) return 0;
+        ++commandPos;
+    }
+    return commandPos==commandLen;
 }
-
-char *ESP01_GetLocalIP(){
-	if(esp01Flags.bit.WIFICONNECTED &&  esp01LocalIP[0]!='\0')
-		return esp01LocalIP;
-
-	return NULL;
+// Strict whole-datagram UNER validation: discovery cannot execute motor commands.
+static int validFrame(const uint8_t *p, uint16_t n) {
+    if (n<8 || memcmp(p,"UNER",4) || p[5]!=':' || p[4]<2 || n!=(uint16_t)(p[4]+6U)) return 0;
+    uint8_t check=0;
+    for (uint16_t i=0;i<n;++i) check^=p[i];
+    return check==0;
 }
-
-
-_eESP01STATUS ESP01_StateUDPTCP(){
-	if(esp01Handle.aWriteUSARTByte == NULL)
-		return ESP01_NOT_INIT;
-
-	if(esp01Flags.bit.UDPTCPCONNECTED)
-		return ESP01_UDPTCP_CONNECTED;
-	else
-		return ESP01_UDPTCP_DISCONNECTED;
+static void receivedPacket(void) {
+    if (packetLen>sizeof(packet) || !socketUp) return;
+    int discover = packetLen==strlen(ESP01_DISCOVERY) &&
+                   !memcmp(packet,ESP01_DISCOVERY,packetLen);
+    if (!discover && !validFrame(packet,packetLen)) return;
+    uint32_t now=HAL_GetTick();
+    if (metadata && ipv4(packetIP) && packetPort) {
+        int same = peerKnown && !strcmp(peerIP,packetIP) && peerPort==packetPort;
+        if (!same && peerKnown && now-peerAt<PEER_LEASE_MS) return;
+        // A new peer must explicitly discover or send a valid ALIVE, never a motor command.
+        if (!same && !discover && !(packetLen==8 && packet[6]==ALIVE)) return;
+        strcpy(peerIP,packetIP); peerPort=packetPort; peerAt=now; peerKnown=1;
+    } else if (mode==ESP01_MODE_SOFTAP) return;
+    else { // old AT firmware without CIPDINFO: retain the configured STA destination
+        strcpy(peerIP,remoteIP); peerPort=remotePort; peerAt=now; peerKnown=1;
+    }
+    if (discover) { discoveryReply=1; return; }
+    if (!io.bufRX || !io.iwRX || !io.sizeBufferRX) return;
+    uint16_t w=*io.iwRX;
+    if (io.irRX) {
+        uint16_t used=(w+io.sizeBufferRX-*io.irRX)%io.sizeBufferRX;
+        if (packetLen>=io.sizeBufferRX-used) { logMessage("ESP RX application full\r\n"); return; }
+    }
+    for (uint16_t i=0;i<packetLen;++i) {
+        io.bufRX[w++]=packet[i]; if (w==io.sizeBufferRX) w=0;
+    }
+    *io.iwRX=w;
 }
-
-
-void ESP01_WriteRX(uint8_t value){
-	if(esp01Handle.bufRX == NULL)
-		return;
-	esp01RXATBuf[esp01iwRXAT++] = value;
-	if(esp01iwRXAT == ESP01RXBUFAT)
-		esp01iwRXAT = 0;
-}
-
-_eESP01STATUS ESP01_Send(uint8_t *buf, uint16_t irRingBuf, uint16_t length, uint16_t sizeRingBuf){
-	if(esp01Handle.aWriteUSARTByte == NULL)
-		return ESP01_NOT_INIT;
-
-	if(esp01Flags.bit.UDPTCPCONNECTED == 0)
-		return ESP01_UDPTCP_DISCONNECTED;
-
-	if(esp01Flags.bit.SENDINGDATA == 0){
-		char strInt[10];
-		uint8_t l = 0;
-
-		itoa(length, strInt, 10);
-		l = strlen(strInt);
-		if(l>4 || l==0)
-			return ESP01_SEND_ERROR;
-
-		ESP01StrToBufTX(ATCIPSEND);
-		ESP01StrToBufTX(strInt);
-		ESP01StrToBufTX("\r>");
-
-
-		for(uint16_t i=0; i<length; i++){
-			esp01TXATBuf[esp01iwTX++] = buf[irRingBuf++];
-			if(esp01iwTX == ESP01TXBUFAT)
-				esp01iwTX = 0;
-			if(irRingBuf == sizeRingBuf)
-				irRingBuf = 0;
-		}
-
-		esp01Flags.bit.TXCIPSEND = 1;
-		esp01Flags.bit.SENDINGDATA = 1;
-		// Colchón: si el SEND OK nunca llega (se perdió, ERROR no parseado),
-		// sin esto SENDINGDATA quedaba en 1 PARA SIEMPRE (el timeout existía
-		// pero nadie lo armaba) → ESP01_Send devolvía BUSY eternamente y el
-		// robot dejaba de transmitir del todo hasta el próximo reset.
-		esp01TimeoutSending = 100;  // 1s (decrementa en ESP01_Timeout10ms)
-
-		if(aDbgStr != NULL){
-			aDbgStr("+&DBGSENDING DATA ");
-			aDbgStr(strInt);
-			aDbgStr("\n");
-		}
-
-
-		return ESP01_SEND_READY;
-	}
-
-	if(aDbgStr != NULL)
-		aDbgStr("+&DBGSENDING DATA BUSY\n");
-
-	return ESP01_SEND_BUSY;
-}
-
-
-void ESP01_Init(_sESP01Handle *hESP01){
-
-	memcpy(&esp01Handle, hESP01, sizeof(_sESP01Handle));
-
-	esp01ATSate = ESP01ATIDLE;
-	esp01HState = 0;
-	esp01irTX = 0;
-	esp01iwTX = 0;
-	esp01irRXAT = 0;
-	esp01iwRXAT = 0;
-	esp01Flags.byte = 0;
-    connection_watchdog = 0;
-}
-
-
-void ESP01_Timeout10ms(){
-	if(esp01TimeoutTask)
-		esp01TimeoutTask--;
-
-	if(esp01TimeoutDataRx){
-		esp01TimeoutDataRx--;
-		if(!esp01TimeoutDataRx)
-			esp01HState = 0;
-	}
-
-	if(esp01TimeoutTxSymbol)
-		esp01TimeoutTxSymbol--;
-
-	if(esp01TimeoutSending) {
-		esp01TimeoutSending--;
-		if(!esp01TimeoutSending && esp01Flags.bit.SENDINGDATA) {
-			// Limpieza COMPLETA del envío colgado: antes solo se bajaba
-			// SENDINGDATA y quedaban TXCIPSEND/WAITINGSYMBOL y bytes viejos
-			// en el buffer TX — el próximo CIPSEND salía pegado a esa basura.
-			esp01Flags.bit.SENDINGDATA = 0;
-			esp01Flags.bit.TXCIPSEND = 0;
-			esp01Flags.bit.WAITINGSYMBOL = 0;
-			esp01irTX = esp01iwTX;
-			if(aDbgStr) aDbgStr(">>> TIMEOUT: SENDINGDATA cleared forcedly\r\n");
-		}
-	}
-}
-
-void ESP01_Task(){
-    // --- Connection Watchdog ---
-    // If we are supposed to be connected (or connecting) but not yet successfully connected, increment watchdog.
-    // We reset it if we are IDLE (no wifi set) or if UDPTCPCONNECTED is true.
-    if (esp01Flags.bit.UDPTCPCONNECTED || esp01ATSate == ESP01ATIDLE) {
-        connection_watchdog = 0;
+static int parseIPD(void) {
+    // CIPMUX=0: +IPD,len[,remote IP,remote port]:
+    unsigned n=0, port=0; char ip[18]={0}; int consumed=0;
+    if (sscanf(line,"+IPD,%u,%17[^,],%u:%n",&n,ip,&port,&consumed)==3 &&
+        consumed==(int)lineLen && port<=65535) {
+        // Accept quoted and unquoted IPv4 (AT revisions differ).
+        if (ip[0]=='"') {
+            size_t l=strlen(ip);
+            if (l<3 || ip[l-1]!='"') return 0;
+            memmove(ip,ip+1,l-2); ip[l-2]=0;
+        }
+        if (strlen(ip)>15 || !ipv4(ip)) return 0;
+        strcpy(packetIP,ip); packetPort=(uint16_t)port;
     } else {
-        connection_watchdog++;
-        // OJO: ESP01_Task() se llama desde el subtick 0 de main → cada 100 ms,
-        // no cada 10 ms. 200 ticks * 100 ms = 20 s (con 2000 eran 200 s reales).
-        if (connection_watchdog > 200) {
-            if(aDbgStr) aDbgStr(">>> WATCHDOG TIMEOUT: Resetting ESP01...\r\n");
-            connection_watchdog = 0;
-            esp01ATSate = ESP01ATHARDRST0;
-            esp01TimeoutTask = 0;
-            esp01TriesAT = 0;
+        consumed=0;
+        if (sscanf(line,"+IPD,%u:%n",&n,&consumed)!=1 || consumed!=(int)lineLen) return 0;
+        packetIP[0]=0; packetPort=0;
+    }
+    if (!n || n>65535) return 0;
+    packetLen=(uint16_t)n; packetPos=0; inPacket=1; return 1;
+}
+static void receivedLine(void) {
+    if (!strcmp(line,"OK")) replyOk=1;
+    else if (!strcmp(line,"ERROR") || strstr(line,"FAIL") || !strncmp(line,"busy",4)) replyError=1;
+    else if (!strcmp(line,"SEND OK") && txPhase==TX_RESULT) {
+        txPhase=TX_IDLE; event(ESP01_SEND_OK);
+    } else if (!strcmp(line,"WIFI DISCONNECT") || !strcmp(line,"WIFI DISCONNECTED")) {
+        if (mode==ESP01_MODE_STATION && phase==READY) resetModule();
+    } else if (!strcmp(line,"CLOSED")) {
+        if (phase==READY) resetModule();
+    } else if (!strcmp(line,"ready")) {
+        if (phase==READY) resetModule();
+    } else {
+        const char *prefix=mode==ESP01_MODE_SOFTAP ? "+CIFSR:APIP,\"" : "+CIFSR:STAIP,\"";
+        if (!strncmp(line,prefix,strlen(prefix))) {
+            char ip[16]={0};
+            if (sscanf(line+strlen(prefix),"%15[^\"]",ip)==1 && ipv4(ip)) strcpy(localIP,ip);
         }
     }
-
-	if(esp01irRXAT != esp01iwRXAT)
-		ESP01ATDecode();
-
-	if(!esp01TimeoutTask)
-		ESP01DOConnection();
-
-	ESP01SENDData();
-
-	// ——— Alive periódico UDP ———
-	if (strcmp(esp01PROTO, "UDP")==0 && esp01Flags.bit.UDPTCPCONNECTED) {
-	    uint32_t now = HAL_GetTick();
-		uint32_t current_interval = (alive_counter < ALIVE_FAST_COUNT) ? ALIVE_INTERVAL_FAST_MS : ALIVE_INTERVAL_SLOW_MS;
-
-	    if ((now - lastAliveTick) >= current_interval) {
-	        // sólo enviamos si no estamos ya en medio de un envío
-	        // y si no hay bytes +IPD pendientes de procesar
-	        if (!esp01Flags.bit.SENDINGDATA
-	            && esp01irRXAT == esp01iwRXAT) {
-	            lastAliveTick = now;
-	            UNER_SendAlive();
-				if (alive_counter < 255) { // Evitar desbordamiento
-					alive_counter++;
-				}
-	        }
-	    }
-	}
 }
-
-void ESP01_AttachChangeState(OnESP01ChangeState aOnESP01ChangeState){
-	aESP01ChangeState = aOnESP01ChangeState;
+static void parseByte(uint8_t c) {
+    rxAt=HAL_GetTick();
+    if (inPacket) {
+        if (packetPos<sizeof(packet)) packet[packetPos]=c;
+        if (++packetPos==packetLen) { inPacket=0; receivedPacket(); }
+        return;
+    }
+    if (c=='>' && txPhase==TX_PROMPT) { gotPrompt=1; lineLen=0; return; }
+    if (c=='\r') return;
+    if (c=='\n') {
+        if (!discardLine && lineLen) { line[lineLen]=0; receivedLine(); }
+        lineLen=0; discardLine=0; return;
+    }
+    if (discardLine) return;
+    if (lineLen>=sizeof(line)-1) { discardLine=1; lineLen=0; return; }
+    // Prompt often has a trailing space; don't prepend it to SEND OK or +IPD.
+    if (lineLen==0 && c==' ') return;
+    line[lineLen++]=(char)c; line[lineLen]=0;
+    if (c==':' && !strncmp(line,"+IPD,",5)) {
+        if (!parseIPD()) discardLine=1;
+        lineLen=0;
+    }
 }
-
-void ESP01_AttachDebugStr(ESP01DebugStr aDbgStrPtrFun){
-	aDbgStr = aDbgStrPtrFun;
+static uint32_t commandTimeout(void) { return step==5 && mode==ESP01_MODE_STATION ? 25000U : 4000U; }
+static void prepareStep(void) {
+    char s[224];
+    switch(step) {
+    case 0: queueCommand("AT\r\n"); break;
+    case 1: queueCommand("ATE0\r\n"); break;
+    case 2: queueCommand(mode==ESP01_MODE_SOFTAP ? "AT+CWMODE=2\r\n" : "AT+CWMODE=1\r\n"); break;
+    case 3:
+        queueCommand(mode==ESP01_MODE_SOFTAP ? "AT+CIPAP=\"" ESP01_AP_IP "\"\r\n" : "AT+CWAUTOCONN=1\r\n"); break;
+    case 4:
+        queueCommand(mode==ESP01_MODE_STATION ? "AT+CWDHCP=1,1\r\n" :
+                     (legacyDhcp ? "AT+CWDHCP=0,1\r\n" : "AT+CWDHCP=1,2\r\n")); break;
+    case 5:
+        if (mode==ESP01_MODE_SOFTAP) snprintf(s,sizeof(s),"AT+CWSAP=\"%s\",\"%s\",6,3\r\n",ssid,password);
+        else snprintf(s,sizeof(s),"AT+CWJAP=\"%s\",\"%s\"\r\n",ssid,password);
+        queueCommand(s); break;
+    case 6: queueCommand("AT+CIFSR\r\n"); break;
+    case 7: queueCommand("AT+CIPMODE=0\r\n"); break;
+    case 8: queueCommand("AT+CIPMUX=0\r\n"); break;
+    case 9: queueCommand("AT+CIPDINFO=1\r\n"); break;
+    case 10:
+        if (tcp) snprintf(s,sizeof(s),"AT+CIPSTART=\"TCP\",\"%s\",%u\r\n",remoteIP,remotePort);
+        else snprintf(s,sizeof(s),"AT+CIPSTART=\"UDP\",\"%s\",%u,%u,0\r\n",remoteIP,remotePort,localPort);
+        queueCommand(s); break;
+    default: break;
+    }
 }
-
-int ESP01_IsHDRRST(){
-	if(esp01ATSate==ESP01ATHARDRST0 || esp01ATSate==ESP01ATHARDRST1 || esp01ATSate==ESP01ATHARDRSTSTOP)
-		return 1;
-	return 0;
-}
-
-
-/* Private Functions */
-static void ESP01ATDecode(){
-	uint16_t i;
-	uint8_t value;
-
-
-	static uint16_t recibidos;
-
-
-	if(esp01ATSate==ESP01ATHARDRST0 || esp01ATSate==ESP01ATHARDRST1 ||
-	   esp01ATSate==ESP01ATHARDRSTSTOP){
-		esp01irRXAT = esp01iwRXAT;
-		return;
-	}
-
-
-	i = esp01iwRXAT;
-	esp01TimeoutDataRx = 2;
-	while(esp01irRXAT != i){
-		value = esp01RXATBuf[esp01irRXAT];
-
-	    // DEBUG: muestro cada byte RX en hex
-	    /*if(aDbgStr){
-	        char dbg[8];
-	        snprintf(dbg, sizeof(dbg), "%02X ", value);
-	        aDbgStr(dbg);
-	    }*/
-
-
-		switch(esp01HState){
-		case 0:
-            indexResponse = 0;
-            indexResponseChar = 4;
-            while(responses[indexResponse] != NULL){
-                if(value == responses[indexResponse][indexResponseChar]){
-                    esp01nBytes = (responses[indexResponse][0] - '0');
-                    esp01nBytes *= 10;
-                    esp01nBytes += (responses[indexResponse][1] - '0');
-                    esp01nBytes--;
-                    break;
-                }
-                indexResponse++;
-            }
-            if(responses[indexResponse] != NULL){
-                esp01HState = 1;
-                indexResponseChar++;
-            }
-			else{
-				esp01TimeoutDataRx = 0;
-				if(esp01Flags.bit.WAITINGSYMBOL){
-					if(value == '>'){
-						esp01Flags.bit.WAITINGSYMBOL = 0;
-						esp01TimeoutTxSymbol = 0;
-					}
-				}
-			}
-			break;
-		case 1:
-            if(value == responses[indexResponse][indexResponseChar]){
-                esp01nBytes--;
-                if(!esp01nBytes || value=='\r'){
-                    esp01HState = (responses[indexResponse][2] - '0');
-                    esp01HState *= 10;
-                    esp01HState += (responses[indexResponse][3] - '0');
-                    break;
-                }
-            }
-            else{
-                indexResponse = 0;
-                while(responses[indexResponse] != NULL){
-                    esp01nBytes = (responses[indexResponse][0] - '0');
-                    esp01nBytes *= 10;
-                    esp01nBytes += (responses[indexResponse][1] - '0');
-                    esp01nBytes -= (indexResponseChar-3);
-                    if(esp01nBytes<128 && value==responses[indexResponse][indexResponseChar]){
-                        if(esp01nBytes == 0){
-                            esp01HState = (responses[indexResponse][2] - '0');
-                            esp01HState *= 10;
-                            esp01HState += (responses[indexResponse][3] - '0');
-                        }
-                        break;
-                    }
-                    indexResponse++;
-                }
-                if(responses[indexResponse] == NULL){
-                    esp01HState = 0;
-                    esp01irRXAT--;
-                    break;
-                }
-            }
-			indexResponseChar++;
-			break;
-		case 2:
-		    if(value == '\n'){
-		        esp01HState = 0;
-		        /*if (aDbgStr) {
-					char dbgBuf[64];
-					sprintf(dbgBuf, "DEBUG: RECIBI OK - estado actual = %d\n", esp01ATSate);
-					aDbgStr(dbgBuf);
-				}*/
-		        switch(indexResponse){
-		        case 0://AT
-		        case 1:
-		            break;
-		        case 2: // OK
-		            if (   esp01ATSate == ESP01ATRESPONSE
-		                || esp01ATSate == ESP01ATCWMODE_RESPONSE
-		                || esp01ATSate == ESP01ATCWDHCP_RESPONSE) {
-		                aDbgStr(">>> DEBUG: marcando ATRESPONSEOK = 1\n");
-		                esp01TimeoutTask = 0;
-		                esp01Flags.bit.ATRESPONSEOK = 1;
-		            }
-		            // CWJAPRESPONSE: OK = comando recibido, no WiFi conectado.
-		            // No avanzamos aqui — esperamos WIFI GOT IP (case 4) que pone WIFICONNECTED=1.
-		            else if (esp01ATSate == ESP01CIPSTARTRESPONSE && strcmp(esp01PROTO, "UDP") == 0) {
-		                esp01Flags.bit.ATRESPONSEOK = 1;
-		                ESP01_NotifyStateChange(ESP01_UDPTCP_CONNECTED);
-		            }
-		            break;
-
-				case 3://ERROR
-					if(esp01Flags.bit.SENDINGDATA){
-						// Abortar SOLO el envío en curso. Antes también se ponía
-						// UDPTCPCONNECTED=0: un simple ERROR de CIPSEND (ESP ocupado)
-						// tiraba abajo el socket y forzaba reabrirlo en el chequeo de
-						// 5s — el ciclo "envía un rato / se corta / se reconecta".
-						// UDP no tiene conexión que se caiga: los cierres reales
-						// llegan como CLOSED / DISCONNECTED y se manejan ahí.
-						esp01Flags.bit.SENDINGDATA = 0;
-						esp01Flags.bit.TXCIPSEND = 0;
-						esp01Flags.bit.WAITINGSYMBOL = 0;
-						esp01TimeoutSending = 0;
-						esp01irTX = esp01iwTX;
-					}
-					break;
-				case 4://WIFI GOT IP
-					esp01TimeoutTask = 0;  // dispara DOConnection → CWJAPRESPONSE ve WIFICONNECTED=1
-					esp01Flags.bit.WIFICONNECTED = 1;
-					aDbgStr(">>> WIFI GOT IP: avanzando a CIFSR\n");
-					ESP01_NotifyStateChange(ESP01_WIFI_CONNECTED);
-					break;
-				case 5://WIFI CONNECTED
-					break;
-				case 6://WIFI DISCONNECT
-				case 7://WIFI DISCONNECTED
-					esp01Flags.bit.UDPTCPCONNECTED = 0;
-					esp01Flags.bit.WIFICONNECTED = 0;
-					ESP01_NotifyStateChange(ESP01_UDPTCP_DISCONNECTED);
-					ESP01_NotifyStateChange(ESP01_WIFI_DISCONNECTED);
-					ESP01_NotifyStateChange(ESP01_WIFI_RECONNECTING);
-					if(esp01ATSate != ESP01CWJAPRESPONSE) {
-						esp01ATSate = ESP01ATRECONNECT;
-					}
-					break;
-				case 8://DISCONNECTED
-					esp01Flags.bit.UDPTCPCONNECTED = 0;
-					ESP01_NotifyStateChange(ESP01_UDPTCP_DISCONNECTED);
-					break;
-				case 9://SEND OK
-					esp01Flags.bit.SENDINGDATA = 0;
-					esp01TimeoutSending = 0;
-					ESP01_NotifyStateChange(ESP01_SEND_OK);
-					break;
-				case 10://CONNECT
-					if (waitingForTCPClient) {
-						waitingForTCPClient = 0;
-						ESP01_USB_DbgStr(">>> Cliente TCP conectado\r\n");
-					}
-					esp01TimeoutTask = 0;
-					esp01Flags.bit.ATRESPONSEOK = 1;
-					esp01Flags.bit.UDPTCPCONNECTED = 1;
-					ESP01_NotifyStateChange(ESP01_UDPTCP_CONNECTED);
-					break;
-				case 11://CLOSED
-					esp01Flags.bit.UDPTCPCONNECTED = 0;
-					ESP01_NotifyStateChange(ESP01_UDPTCP_DISCONNECTED);
-					break;
-				case 13://busy
-					esp01Flags.bit.UDPTCPCONNECTED = 0;
-					esp01Flags.bit.WIFICONNECTED = 0;
-					break;
-				case 15://ready
-					esp01Flags.bit.UDPTCPCONNECTED = 0;
-					esp01Flags.bit.WIFICONNECTED = 0;
-					esp01ATSate = ESP01ATHARDRSTSTOP;
-					break;
-				case 16://busy p
-					break;
-				case 17://busy s
-					break;
-				case 18://FAIL
-				    {
-				        aDbgStr(">>> DEBUG: FAIL received\r\n");
-				        if (esp01ATSate == ESP01CWJAPRESPONSE) {
-				             esp01ATSate = ESP01ATAT;
-				             esp01TimeoutTask = 0;
-				        }
-				        // Asegurar que se marque como desconectado
-				        esp01Flags.bit.WIFICONNECTED = 0;
-				        esp01Flags.bit.UDPTCPCONNECTED = 0;
-				        ESP01_NotifyStateChange(ESP01_WIFI_DISCONNECTED);
-				    }
-				    break;
-				}
-			}
-			break;
-		case 5://CIFR,STAIP
-			if(value == ','){
-				esp01HState = 6;
-				if(aDbgStr != NULL)
-					aDbgStr("+&DBGRESPONSE CIFSR\n");
-			}
-			else{
-				esp01HState = 0;
-				esp01irRXAT--;
-				if(aDbgStr != NULL)
-					aDbgStr("+&DBGERROR CIFSR 5\n");
-			}
-			break;
-		case 6:
-			if(value == '\"'){
-				esp01HState = 7;
-				esp01nBytes = 0;
-			}
-			break;
-		case 7:
-			if(value == '\"' || esp01nBytes==16)
-				esp01HState = 8;
-			else
-				esp01LocalIP[esp01nBytes++] = value;
-			break;
-		case 8:
-			if(value == '\n'){
-				esp01HState = 0;
-				if(esp01nBytes < 16){
-					esp01LocalIP[esp01nBytes] = '\0';
-					esp01Flags.bit.ATRESPONSEOK = 1;
-					esp01TimeoutTask = 0;
-				}
-				else
-					esp01LocalIP[0] = '\0';
-				ESP01_NotifyStateChange(ESP01_WIFI_NEW_IP);
-			}
-			break;
-		case 10:  // acabamos de detectar "+IPD"
-		    esp01HState   = 11;    // pasamos a parsear longitud (y saltar linkId si existe)
-		    esp01nBytes   = 0;     // reiniciar contador de longitud
-		    recibidos     = 0;     // reiniciar contador de payload (para debug)
-		    break;
-
-		case 11:  // salto opcional de linkId y parseo de longitud hasta ':'
-		    if (value == ',') {
-		        // si es la primera coma, puede ser el separador linkId→longitud o linkId único
-		        // simplemente ignoramos y seguimos aquí
-		    }
-		    else if (value >= '0' && value <= '9') {
-		        // acumulamos dígito de longitud
-		        esp01nBytes = esp01nBytes * 10 + (value - '0');
-		    }
-		    else if (value == ':') {
-		        // fin del número de bytes, arrancamos la lectura de payload
-		        lastIPDlen  = esp01nBytes;
-		        esp01HState = 12;
-		    }
-		    else {
-		        // cualquier otro carácter inesperado nos saca al estado base
-		        esp01HState = 0;
-		    }
-		    break;
-
-		case 12:  // leemos byte a byte el payload
-		    // 1) lo metemos en el buffer circular
-		    esp01Handle.bufRX[*esp01Handle.iwRX] = value;
-		    (*esp01Handle.iwRX)++;
-		    if (*esp01Handle.iwRX == esp01Handle.sizeBufferRX)
-		        *esp01Handle.iwRX = 0;
-
-		    // 2) Debug al inicio del payload
-		    if (recibidos == 0) {
-		        USB_Debug(">> +IPD payload begin, len=%u\r\n", esp01nBytes);
-		    }
-		    recibidos++;
-
-		    // 3) decrementamos contador
-		    esp01nBytes--;
-		    if (esp01nBytes == 0) {
-		        // fin de payload:
-		        esp01HState = 0;
-		        // NO tocar los flags de envío acá: recibir un paquete (+IPD) es
-		        // independiente de estar enviando. Antes se limpiaban WAITINGSYMBOL/
-		        // TXCIPSEND/SENDINGDATA — si un paquete de Qt llegaba en el medio de
-		        // un CIPSEND nuestro, abortaba el envío a mitad de camino y el
-		        // siguiente CIPSEND salía encimado → ERROR → reconexión del socket.
-		        // El envío colgado de verdad lo cubre esp01TimeoutSending (1s).
-
-		        // 4) imprimimos en debug los lastIPDlen bytes recibidos
-		        uint16_t start = (*esp01Handle.iwRX + esp01Handle.sizeBufferRX - lastIPDlen)
-		                         % esp01Handle.sizeBufferRX;
-		        for (uint16_t i = 0; i < lastIPDlen; ++i) {
-		            uint8_t c = esp01Handle.bufRX[(start + i) % esp01Handle.sizeBufferRX];
-		            char s[2] = { c, '\0' };
-		            if (aDbgStr) aDbgStr(s);
-		        }
-		        if (aDbgStr) aDbgStr("\r\n");
-
-		        // 5) El código para reconfigurar por UDP ha sido eliminado
-		        //    para mantener main.c como única fuente de configuración.
-		    }
-		    break;
-
-		default:
-			esp01HState = 0;
-			esp01TimeoutDataRx = 0;
-		}
-
-		esp01irRXAT++;
-		if(esp01irRXAT == ESP01RXBUFAT)
-			esp01irRXAT = 0;
-	}
-
-}
-
-static void ESP01DOConnection(){
-	/*if (aDbgStr) {
-		char buf[100];
-		sprintf(buf,
-			">> DOConnection: state=%d, configUDP=%d, udpIniciado=%d, PROTO=%s\r\n",
-			esp01ATSate, configUDPObtenida, udpIniciado, esp01PROTO);
-		aDbgStr(buf);
-	}*/
-
-	// 1) Si ya tengo la config pendiente y no he lanzado UDP
-	/*if (configUDPObtenida && !udpIniciado && strcmp(esp01PROTO, "UDP")==0) {
-		// deshabilito el servidor TCP y cierro el socket
-		ESP01StrToBufTX("AT+CIPSERVER=0,"); ESP01StrToBufTX(esp01LocalPORT); ESP01StrToBufTX("\r\n");
-		ESP01StrToBufTX("AT+CIPCLOSE=0\r\n");
-
-		// apago multiplexado
-		ESP01StrToBufTX("AT+CIPMUX=0\r\n");
-
-		// lanzo el socket UDP con la IP ya intacta en esp01RemoteIP
-		ESP01StrToBufTX("AT+CIPSTART=\"UDP\",\"");
-		ESP01StrToBufTX(esp01RemoteIP);
-		ESP01StrToBufTX("\",");
-		ESP01StrToBufTX(esp01RemotePORT);
-		ESP01StrToBufTX(",");
-		ESP01StrToBufTX(esp01LocalPORT);
-		ESP01StrToBufTX(",0\r\n");
-
-		udpIniciado      = 1;
-		esp01ATSate      = ESP01CIPSTARTRESPONSE;
-		esp01TimeoutTask = 3000;
-		return;
-	}*/
-
-
-    // 2a) Si antes estábamos en ATCONNECTED pero ahora UDPTCPCONNECTED o WIFICONNECTED cayeron, relanzamos la conexión.
-    if (esp01ATSate == ESP01ATCONNECTED && (!esp01Flags.bit.UDPTCPCONNECTED || !esp01Flags.bit.WIFICONNECTED)) {
-        aDbgStr(">>> Conexión perdida, reintentando...\r\n");
-        if (!esp01Flags.bit.WIFICONNECTED) {
-            // WiFi caído: hay que re-autenticar desde el principio
-            esp01ATSate = ESP01ATRECONNECT;
-            ESP01_NotifyStateChange(ESP01_WIFI_RECONNECTING);
-        } else {
-            // WiFi vivo pero UDP caído: reabrir socket directamente
-            esp01ATSate = (strcmp(esp01PROTO, "UDP") == 0) ? ESP01ATPREPUDP : ESP01ATCIPCLOSE;
+static void configure(uint32_t now) {
+    if (!commandLen) prepareStep();
+    if (!waiting) {
+        if (flushCommand()) { waiting=1; deadline=now+commandTimeout(); }
+        return;
+    }
+    if (replyError) {
+        if (step==4 && mode==ESP01_MODE_SOFTAP && !legacyDhcp) {
+            legacyDhcp=1; commandLen=0; waiting=replyError=0; return;
         }
-        esp01TimeoutTask = 0;
+        if (step==3 && mode==ESP01_MODE_STATION) replyOk=1; // optional auto-connect
+        else if (step==9 && mode==ESP01_MODE_STATION) { metadata=0; replyOk=1; }
+        else { logMessage("ESP AT setup error; restarting\r\n"); resetModule(); return; }
+    }
+    if (replyOk) {
+        if (step==6) {
+            if (!localIP[0]) { logMessage("ESP missing IP\r\n"); resetModule(); return; }
+            networkUp=1; event(ESP01_WIFI_NEW_IP);
+        }
+        commandLen=0; waiting=replyOk=replyError=0;
+        if (++step>10) {
+            socketUp=1; phase=READY; aliveAt=now;
+            event(ESP01_UDPTCP_CONNECTED);
+            logMessage("ESP UDP ready; waiting for Qt\r\n");
+        }
+    } else if (expired(now,deadline)) { logMessage("ESP AT setup timeout\r\n"); resetModule(); }
+}
+static void serviceTx(uint32_t now) {
+    if (txPhase==TX_IDLE) return;
+    if (replyError || expired(now,deadline)) {
+        // ESP may still expect binary payload; only a reset safely restores AT framing.
+        logMessage("ESP send failed; resynchronizing\r\n");
+        event(ESP01_SEND_ERROR); resetModule(); return;
+    }
+    if (txPhase==TX_COMMAND) {
+        if (flushCommand()) { txPhase=TX_PROMPT; deadline=now+1000U; }
+    } else if (txPhase==TX_PROMPT && gotPrompt) {
+        txPhase=TX_PAYLOAD; deadline=now+2000U;
+    } else if (txPhase==TX_PAYLOAD) {
+        unsigned count=0;
+        while(payloadPos<payloadLen && count++<TX_BUDGET) {
+            if (!io.aWriteUSARTByte(payload[payloadPos])) break;
+            ++payloadPos;
+        }
+        if (payloadPos==payloadLen) { txPhase=TX_RESULT; deadline=now+2000U; }
+    }
+}
+void ESP01_Init(_sESP01Handle *h) {
+    memset(&io,0,sizeof(io)); if(h) io=*h;
+    notify=NULL; debug=NULL; mode=ESP01_MODE_STATION; phase=OFF; txPhase=TX_IDLE;
+    rxW=rxR=0; rxOverflow=0; localIP[0]=remoteIP[0]=peerIP[0]=0;
+    ssid=password=NULL; networkUp=socketUp=peerKnown=0;
+    commandLen=lineLen=0; waiting=inPacket=discardLine=0;
+    tcp=0; localPort=30000; remotePort=30010;
+}
+void ESP01_SetWIFI(const char *s,const char *p) {
+    if (!credentialsValid(s,p,0)) { logMessage("Invalid WiFi credentials\r\n"); return; }
+    ssid=s; password=p; mode=ESP01_MODE_STATION; tcp=0; resetModule();
+}
+void ESP01_SetSoftAP(const char *s,const char *p) {
+    if (!credentialsValid(s,p,1)) { logMessage("Invalid SoftAP credentials\r\n"); return; }
+    ssid=s; password=p; mode=ESP01_MODE_SOFTAP; tcp=0; resetModule();
+}
+_eESP01STATUS ESP01_StartUDP(const char *ip,uint16_t rp,uint16_t lp) {
+    if (!io.aWriteUSARTByte) return ESP01_NOT_INIT;
+    if (!ip || !ipv4(ip) || !rp) return ESP01_SEND_ERROR;
+    snprintf(remoteIP,sizeof(remoteIP),"%s",ip); remotePort=rp; localPort=lp ? lp : 30000; tcp=0;
+    if (phase==READY || phase==CLOSED) resetModule();
+    return ESP01_UDPTCP_CONNECTING;
+}
+_eESP01STATUS ESP01_StartTCP(const char *ip,uint16_t rp,uint16_t lp) {
+    _eESP01STATUS result=ESP01_StartUDP(ip,rp,lp); tcp=1; return result;
+}
+void ESP01_CloseUDPTCP(void) {
+    // Hardware off also cancels any partial CIPSEND safely.
+    if(io.aDoCHPD) io.aDoCHPD(0);
+    phase=CLOSED; txPhase=TX_IDLE; socketUp=networkUp=0; clearPeer();
+    event(ESP01_UDPTCP_DISCONNECTED);
+}
+_eESP01STATUS ESP01_StateWIFI(void) { return networkUp ? ESP01_WIFI_CONNECTED : ESP01_WIFI_DISCONNECTED; }
+_eESP01STATUS ESP01_StateUDPTCP(void) { return socketUp ? ESP01_UDPTCP_CONNECTED : ESP01_UDPTCP_DISCONNECTED; }
+char *ESP01_GetLocalIP(void) { return networkUp ? localIP : NULL; }
+ESP01_Mode ESP01_GetMode(void) { return mode; }
+int ESP01_HasPeer(void) { return peerKnown; }
+const char *ESP01_GetPeerIP(void) { return peerIP; }
+int ESP01_IsHDRRST(void) { return phase==RESET_LOW || phase==BOOT; }
+int ESP01_IsSending(void) { return txPhase!=TX_IDLE; }
+void ESP01_AttachChangeState(OnESP01ChangeState f) { notify=f; }
+void ESP01_AttachDebugStr(ESP01DebugStr f) { debug=f; }
+void ESP01_USB_DbgStr(const char *s) { USB_DebugStr(s); }
+void ESP01_Timeout10ms(void) { /* deadlines use HAL_GetTick, independent of call frequency */ }
+void ESP01_WriteRX(uint8_t b) {
+    uint16_t next=(rxW+1U)%ESP01RXBUFAT;
+    if(next==rxR) { rxOverflow=1; return; }
+    rx[rxW]=b; rxW=next;
+}
+_eESP01STATUS ESP01_Send(uint8_t *buf,uint16_t offset,uint16_t len,uint16_t ringSize) {
+    if (!socketUp || (mode==ESP01_MODE_SOFTAP && !peerKnown)) return ESP01_UDPTCP_DISCONNECTED;
+    if (txPhase!=TX_IDLE) return ESP01_SEND_BUSY;
+    if (!buf || !len || len>sizeof(payload) || !ringSize || offset>=ringSize || len>ringSize) return ESP01_SEND_ERROR;
+    char s[96];
+    if (peerKnown && !tcp && metadata)
+        snprintf(s,sizeof(s),"AT+CIPSEND=%u,\"%s\",%u\r\n",len,peerIP,peerPort);
+    else snprintf(s,sizeof(s),"AT+CIPSEND=%u\r\n",len);
+    queueCommand(s);
+    for(uint16_t i=0;i<len;++i) payload[i]=buf[(offset+i)%ringSize];
+    payloadLen=len; payloadPos=0; txPhase=TX_COMMAND; deadline=HAL_GetTick()+2000U;
+    return ESP01_SEND_READY;
+}
+void ESP01_Task(void) {
+    if (phase==OFF || phase==CLOSED || !io.aWriteUSARTByte) return;
+    uint32_t now=HAL_GetTick();
+    if (phase==RESET_LOW) {
+        rxR=rxW;
+        if(expired(now,deadline)) { if(io.aDoCHPD) io.aDoCHPD(1); phase=BOOT; deadline=now+1800U; }
         return;
     }
-    // 2b) Si seguimos vivos, sólo esperamos antes de chequear de nuevo
-    if (esp01ATSate == ESP01ATCONNECTED && esp01Flags.bit.UDPTCPCONNECTED) {
-        esp01TimeoutTask = 500; // Chequeo cada 5 segundos
+    if (phase==BOOT) {
+        rxR=rxW;
+        if(expired(now,deadline)) { phase=CONFIGURE; commandLen=0; }
         return;
     }
-
-
-	esp01TimeoutTask = 10;  // 100ms default between AT states (was 1s)
-	switch(esp01ATSate){
-	case ESP01ATIDLE:
-		esp01TimeoutTask = 0;
-		break;
-	case ESP01ATRECONNECT:
-		if(aDbgStr != NULL) aDbgStr("+&DBGRECONNECTING...\n");
-		esp01ATSate = ESP01ATCWJAP; // Intentar reconectar al WiFi
-		esp01TimeoutTask = 100; // Dar un tiempo antes de reintentar
-		break;
-	case ESP01ATHARDRST0:
-		esp01Handle.aDoCHPD(0);
-		if(aDbgStr != NULL)
-			aDbgStr("+&DBGESP01HARDRESET0\n");
-		esp01ATSate = ESP01ATHARDRST1;
-		break;
-	case ESP01ATHARDRST1:
-		esp01Handle.aDoCHPD(1);
-		if(aDbgStr != NULL)
-			aDbgStr("+&DBGESP01HARDRESET1\n");
-		esp01ATSate = ESP01ATHARDRSTSTOP;
-		esp01TimeoutTask = 150;  // 1.5s — ESP8266 boots in ~1s
-		break;
-	case ESP01ATHARDRSTSTOP:
-		esp01ATSate = ESP01ATAT;
-		esp01TriesAT = 0;
-		break;
-	case ESP01ATAT:
-		if(esp01TriesAT){
-			esp01TriesAT--;
-			if(!esp01TriesAT){
-				esp01ATSate = ESP01ATHARDRST0;
-				break;
-			}
-		}
-		else
-			esp01TriesAT = 4;
-
-		esp01Flags.bit.ATRESPONSEOK = 0;
-		aDbgStr(">>> Cambio de estado a ESP01ATAT: lanzando AT\n");
-		ESP01StrToBufTX(ATAT);
-		if(aDbgStr != NULL)
-			aDbgStr("+&DBGESP01AT\n");
-		esp01ATSate = ESP01ATRESPONSE;
-		break;
-	case ESP01ATRESPONSE:
-		if(esp01Flags.bit.ATRESPONSEOK)
-			esp01ATSate = ESP01ATCWMODE_SET;
-		else
-			esp01ATSate = ESP01ATAT;
-		break;
-	case ESP01ATCWMODE_SET:
-	    ESP01StrToBufTX("AT+CWMODE=1\r\n");
-	    esp01Flags.bit.ATRESPONSEOK = 0;
-	    esp01ATSate = ESP01ATCWMODE_RESPONSE;
-	    break;
-
-	case ESP01ATCWMODE_RESPONSE:
-	    if (esp01Flags.bit.ATRESPONSEOK) {
-	        esp01ATSate = ESP01ATCWDHCP_SET;
-	    }
-	    break;
-
-	case ESP01ATCWDHCP_SET:
-	    ESP01StrToBufTX("AT+CWDHCP=1,1\r\n");
-	    esp01Flags.bit.ATRESPONSEOK = 0;
-	    esp01ATSate = ESP01ATCWDHCP_RESPONSE;
-	    break;
-
-	case ESP01ATCWDHCP_RESPONSE:
-	    if (esp01Flags.bit.ATRESPONSEOK) {
-	        esp01ATSate = ESP01ATCWAUTOCONN;
-	    }
-	    break;
-
-	case ESP01ATCWAUTOCONN:
-	    ESP01StrToBufTX("AT+CWAUTOCONN=1\r\n");
-	    esp01Flags.bit.ATRESPONSEOK = 0;
-	    esp01ATSate = ESP01ATCWAUTOCONN_RESPONSE;
-	    break;
-
-	case ESP01ATCWAUTOCONN_RESPONSE:
-	    // Advance whether OK or not — setting persists in flash from first success
-	    esp01ATSate = ESP01ATCWJAP;
-	    break;
-
-
-	case ESP01ATCIPMUX:
-	    if (strcmp(esp01PROTO, "TCP") == 0) {
-	        // multiplicado y server en TCP
-	        ESP01StrToBufTX("AT+CIPMUX=1\r\n");
-	        ESP01StrToBufTX("AT+CIPSERVER=1,80\r\n");
-	        aDbgStr("+&DBGESP01ATCIPMUX+SERVER\n");
-	        esp01ATSate = ESP01ATCIFSR;        // sigue con CIFSR en TCP
-	    } else {
-	        // UDP: multiplex = 0, NO server
-	        ESP01StrToBufTX("AT+CIPMUX=0\r\n");
-	        aDbgStr("+&DBGESP01ATCIPMUX(single)\n");
-	        esp01ATSate = ESP01ATPREPUDP;
-	    }
-	    break;
-	case ESP01ATPREPUDP:
-	    ESP01StrToBufTX("AT+CIPSERVER=0\r\n");
-	    //ESP01StrToBufTX("AT+CIPCLOSE=0\r\n");
-	    ESP01StrToBufTX(ATCIPCLOSE);
-	    ESP01StrToBufTX("AT+CIPMUX=0\r\n");
-	    ESP01StrToBufTX("AT+CIPSTART=\"UDP\",\"");
-	    ESP01StrToBufTX(esp01RemoteIP);
-	    ESP01StrToBufTX("\",");
-	    ESP01StrToBufTX(esp01RemotePORT);
-	    ESP01StrToBufTX(",");
-	    ESP01StrToBufTX(esp01LocalPORT);
-	    ESP01StrToBufTX(",0\r\n");
-	    esp01ATSate      = ESP01CIPSTARTRESPONSE;
-	    esp01TimeoutTask = 3000;
-	    break;
-	case ESP01ATCWJAP:
-		if(esp01Flags.bit.WIFICONNECTED){
-			esp01ATSate = ESP01ATCIFSR;
-			break;
-		}
-		if(esp01SSID == NULL)
-			break;
-		ESP01StrToBufTX(ATCWJAP);
-		ESP01ByteToBufTX('\"');
-		ESP01StrToBufTX(esp01SSID);
-		ESP01ByteToBufTX('\"');
-		ESP01ByteToBufTX(',');
-		ESP01ByteToBufTX('\"');
-		ESP01StrToBufTX(esp01PASSWORD);
-		ESP01ByteToBufTX('\"');
-		ESP01ByteToBufTX('\r');
-		ESP01ByteToBufTX('\n');
-		if(aDbgStr != NULL)
-			aDbgStr("+&DBGESP01ATCWJAP\n");
-		esp01Flags.bit.ATRESPONSEOK = 0;
-		esp01ATSate = ESP01CWJAPRESPONSE;
-		esp01TimeoutTask = 2000;
-		break;
-	case ESP01CWJAPRESPONSE:
-		if(esp01Flags.bit.WIFICONNECTED){
-			// WIFI GOT IP recibido: la conexion es real
-			esp01ATSate = ESP01ATCIFSR;
-			esp01TriesAT = 4;
-		}
-		else
-			esp01ATSate = ESP01ATAT;  // timeout de 20s sin WIFI GOT IP: reintenta
-		break;
-	case ESP01ATCIFSR:
-		esp01LocalIP[0] = '\0';
-		ESP01StrToBufTX(ATCIFSR);
-		if(aDbgStr != NULL)
-			aDbgStr("+&DBGESP01CIFSR\n");
-		esp01Flags.bit.ATRESPONSEOK = 0;
-		esp01ATSate = ESP01CIFSRRESPONSE;
-		break;
-	case ESP01CIFSRRESPONSE:
-		if(esp01Flags.bit.ATRESPONSEOK) {
-			if (strcmp(esp01PROTO, "UDP") == 0)
-				esp01ATSate = ESP01ATPREPUDP;
-			else
-				esp01ATSate = ESP01ATCIPCLOSE;
-		} else {
-			esp01TriesAT--;
-			if(esp01TriesAT == 0){
-				esp01ATSate = ESP01ATAT;
-				break;
-			}
-			esp01ATSate = ESP01ATCIFSR;
-		}
-		break;
-	case ESP01ATCIPCLOSE:
-		if(esp01RemoteIP == NULL)
-			break;
-		ESP01StrToBufTX(ATCIPCLOSE);
-		if(aDbgStr != NULL)
-			aDbgStr("+&DBGESP01ATCIPCLOSE\n");
-		esp01ATSate = ESP01ATCIPSTART;
-		break;
-	case ESP01ATCIPSTART:
-		ESP01StrToBufTX(ATCIPSTART);
-		ESP01ByteToBufTX('\"');
-		ESP01StrToBufTX(esp01PROTO);
-		ESP01ByteToBufTX('\"');
-		ESP01ByteToBufTX(',');
-		ESP01ByteToBufTX('\"');
-		ESP01StrToBufTX(esp01RemoteIP);
-		ESP01ByteToBufTX('\"');
-		ESP01ByteToBufTX(',');
-		ESP01StrToBufTX(esp01RemotePORT);
-		ESP01ByteToBufTX(',');
-		ESP01StrToBufTX(esp01LocalPORT);
-		ESP01StrToBufTX(",0\r\n");  // <-- ¡añadido ,0!
-		if(aDbgStr != NULL)
-			aDbgStr("+&DBGESP01ATCIPSTART\n");
-		esp01Flags.bit.ATRESPONSEOK = 0;
-		esp01Flags.bit.UDPTCPCONNECTED = 0;
-		esp01ATSate = ESP01CIPSTARTRESPONSE;
-		// Si es UDP, usamos un timeout corto para el workaround
-		if (strcmp(esp01PROTO, "UDP") == 0)
-		    esp01TimeoutTask = 3000;   // 1 segundo
-		else
-		    esp01TimeoutTask = 30000;  // 30 s para TCP
-		break;
-	case ESP01CIPSTARTRESPONSE:
-		if (esp01Flags.bit.ATRESPONSEOK) {
-			// ya se abrió el socket UDP
-			esp01ATSate = ESP01ATCONNECTED;
-			esp01Flags.bit.UDPTCPCONNECTED = 1;
-
-			// <<< debug: UDP funcional >>>
-			if (strcmp(esp01PROTO, "UDP")==0 && aDbgStr) {
-				aDbgStr(">>> DEBUG: AT+CIPSTART OK, UDP socket abierto\r\n");
-			}
-
-
-			ESP01_NotifyStateChange(ESP01_UDPTCP_CONNECTED);
-		} else if (tryingTCP) {
-			tryingTCP = 0;
-			ESP01_USB_DbgStr(">>> TCP CONNECT falló, cambiando a UDP...\r\n");
-			// Reintenta con el MISMO destino que ya se había pedido (esp01RemoteIP
-			// quedó seteado por la llamada real hecha desde main.c, vía wifiProfiles[]/
-			// WIFI_PROFILE_ACTIVE) — ya no hay una IP propia hardcodeada acá.
-			ESP01_StartUDP(esp01RemoteIP, atoi(esp01RemotePORT), atoi(esp01LocalPORT));
-		} else {
-			esp01ATSate = ESP01ATCIPSTART;  // reintenta sólo el START
-			esp01TimeoutTask = 1000;        // y dale otro segundo
-		}
-		break;
-
-	case ESP01ATCONNECTED:
-		// si perdimos wifi o la conexión UDP, reintenta
-		if (!esp01Flags.bit.WIFICONNECTED) {
-			esp01ATSate = ESP01ATAT;
-		} else if (!esp01Flags.bit.UDPTCPCONNECTED) {
-			if (strcmp(esp01PROTO, "UDP") == 0)
-				esp01ATSate = ESP01ATPREPUDP;
-			else
-				esp01ATSate = ESP01ATCIPCLOSE;
-		} else {
-			esp01TimeoutTask = 0;
-		}
-		break;
-	}
-}
-
-static void ESP01SENDData(){
-	uint8_t value;
-	uint8_t count = 0;
-
-	if(esp01Flags.bit.WAITINGSYMBOL){
-		if(!esp01TimeoutTxSymbol){
-			// No llegó el '>' a tiempo: abortar SOLO este envío. Antes además
-			// se hacía esp01ATSate = ESP01ATAT — re-inicializaba TODA la máquina
-			// AT (AT/CWMODE/CWJAP/CIPSTART) con el WiFi perfectamente sano, un
-			// ciclo entero de reconexión por un prompt perdido. Si el socket
-			// está caído de verdad, CLOSED/DISCONNECTED o el chequeo periódico
-			// de DOConnection lo reconectan por su cuenta.
-			esp01irTX = esp01iwTX;
-			esp01Flags.bit.WAITINGSYMBOL = 0;
-			esp01Flags.bit.TXCIPSEND = 0;
-			esp01Flags.bit.SENDINGDATA = 0;
-			esp01TimeoutSending = 0;
-			if(aDbgStr) aDbgStr(">>> TIMEOUT: '>' nunca llego, envio abortado\r\n");
-		}
-		return;
-	}
-
-	while ((esp01irTX != esp01iwTX) && (count < ESP01_BURST_LIMIT)) {
-		value = esp01TXATBuf[esp01irTX];
-		if(esp01Flags.bit.TXCIPSEND){
-			if(value == '>')
-				value = '\n';
-		}
-		if(esp01Handle.aWriteUSARTByte(value)){
-			if(esp01Flags.bit.TXCIPSEND){
-				if(esp01TXATBuf[esp01irTX] == '>'){
-					esp01Flags.bit.TXCIPSEND = 0;
-					esp01Flags.bit.WAITINGSYMBOL = 1;
-					esp01TimeoutTxSymbol = 30;  // 300ms (50ms era muy justo: el '>' se pierde si el parser está a mitad de otro token y el timeout abortaba envíos sanos)
-					// Si encontramos el fin de comando, incrementamos y salimos
-					// para respetar el WAITINGSYMBOL
-					esp01irTX++;
-					if(esp01irTX == ESP01TXBUFAT)
-						esp01irTX = 0;
-					return;
-				}
-			}
-			esp01irTX++;
-			if(esp01irTX == ESP01TXBUFAT)
-				esp01irTX = 0;
-
-			count++;
-		} else {
-			// UART ocupada
-			break;
-		}
-	}
-}
-
-static void ESP01StrToBufTX(const char *str){
-	/*// DEBUG: muestro en consola todo lo que voy a enviar
-	    if(aDbgStr){
-	        aDbgStr(">> TX: ");
-	        aDbgStr(str);
-	    }*/
-
-	for(int i=0; str[i]; i++){
-		esp01TXATBuf[esp01iwTX++] = str[i];
-		if(esp01iwTX == ESP01TXBUFAT)
-			esp01iwTX = 0;
-	}
-}
-
-static void ESP01ByteToBufTX(uint8_t value){
-	esp01TXATBuf[esp01iwTX++] = value;
-	if(esp01iwTX == ESP01TXBUFAT)
-		esp01iwTX = 0;
-}
-
-int ESP01_IsSending(void) {
-    return esp01Flags.bit.SENDINGDATA;
-}
-
-void ESP01_USB_DbgStr(const char *dbgStr) {
-    USB_DebugStr(dbgStr);
-}
-
-static void ESP01_NotifyStateChange(_eESP01STATUS state) {
-    ESP01_InternalStateChange(state);
-    if (aESP01ChangeState != NULL) {
-        aESP01ChangeState(state);
+    if(rxOverflow) { logMessage("ESP RX overflow\r\n"); resetModule(); return; }
+    if ((inPacket || lineLen || discardLine) && now-rxAt>1000U) {
+        logMessage("ESP partial RX timeout\r\n"); resetModule(); return;
+    }
+    unsigned count=0;
+    while(rxR!=rxW && count++<RX_BUDGET) {
+        uint8_t b=rx[rxR]; rxR=(rxR+1U)%ESP01RXBUFAT; parseByte(b);
+        if(phase==RESET_LOW) return;
+    }
+    if(phase==CONFIGURE) { configure(now); return; }
+    if(phase!=READY) return;
+    if(peerKnown && now-peerAt>=PEER_LEASE_MS) clearPeer();
+    serviceTx(now);
+    if(phase!=READY || txPhase!=TX_IDLE) return;
+    if(discoveryReply) {
+        char reply[64];
+        int n=snprintf(reply,sizeof(reply),"BALANCIN_V1,%u,%s",(unsigned)mode,localIP);
+        if (ESP01_Send((uint8_t*)reply,0,(uint16_t)n,sizeof(reply))==ESP01_SEND_READY) discoveryReply=0;
+    } else if(now-aliveAt>=5000U && (mode==ESP01_MODE_STATION || peerKnown)) {
+        aliveAt=now; UNER_SendAlive();
     }
 }
-
-static void ESP01_InternalStateChange(_eESP01STATUS state) {
-    switch (state) {
-    	case ESP01_WIFI_CONNECTED:
-			// Cuando ya estamos en la red, arrancamos UDP (single-connection)
-			/*if (!udpIniciado && strcmp(esp01PROTO, "UDP") == 0) {
-				// 1) Aseguramos single-connection
-				ESP01StrToBufTX("AT+CIPMUX=0\r\n");
-				aDbgStr(">>> Forzando single-connection\r\n");
-
-				// 2) Abrimos socket UDP: AT+CIPSTART="UDP","<IP_REMOTA>",<PUERTO_REMOTO>,<PUERTO_LOCAL>,0
-				{
-					char cmd[64];
-					snprintf(cmd, sizeof(cmd),
-							 "AT+CIPSTART=\"UDP\",\"%s\",%d,%d,0\r\n",
-							 esp01RemoteIP,
-							 atoi(esp01RemotePORT),   // puerto remoto
-							 LOCAL_PORT               // tu puerto local
-					);
-					ESP01StrToBufTX(cmd);
-				}
-				aDbgStr(">>> Iniciando socket UDP\r\n");
-				udpIniciado = 1;
-			}*/
-			break;
-
-        case ESP01_WIFI_NEW_IP:
-            // La inicialización de UDP se delega al callback de usuario (appOnESP01ChangeState)
-            // para que pueda especificar la IP de destino correcta.
-            // if (state == ESP01_WIFI_NEW_IP) {
-            //   ESP01_StartUDP(SERVER_IP, 30010, 30000);
-            // }
-            break;
-
-        case ESP01_UDPTCP_CONNECTED:
-            // Una vez conectado el cliente UDP, enviamos UNER_SendAlive
-        	if (!udpIniciado && strcmp(esp01PROTO, "UDP")==0) {
-				udpIniciado = 1;           // impide re-entradas
-				alive_counter = 0; // Reinicia el contador de alives
-				lastAliveTick = HAL_GetTick(); // Inicia el primer alive inmediatamente
-				ESP01_USB_DbgStr(">>> UDP conectado OK\r\n");
-				UNER_SendAlive();
-				if (alive_counter < 255) { alive_counter++; }
-
-
-				ESP01StrToBufTX("AT+CIPSTATUS\r\n");
-
-				// Volvemos a mostrar la configuración
-				aDbgStr("=== Parámetros UDP ===\n");
-				aDbgStr("SSID: ");       aDbgStr(esp01SSID);    aDbgStr("\n");
-				aDbgStr("PASSWORD: ");   aDbgStr(esp01PASSWORD);aDbgStr("\n");
-				aDbgStr("REMOTE IP: ");  aDbgStr(esp01RemoteIP); aDbgStr("\n");
-				aDbgStr("REMOTE PORT: ");aDbgStr(esp01RemotePORT);aDbgStr("\n");
-			}
-            break;
-
-        case ESP01_UDPTCP_DISCONNECTED:
-        	udpIniciado = 0;  // permite que al reconectar vuelva a entrar en UDPTCP_CONNECTED
-            ESP01_USB_DbgStr(">>> UDP desconectado\r\n");
-            break;
-
-        default:
-            break;
-    }
-}
-
-
-
-
-
-/* END Private Functions*/

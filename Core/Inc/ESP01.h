@@ -54,7 +54,7 @@ typedef void (*OnESP01ChangeState)(_eESP01STATUS esp01State);
 typedef void (*ESP01DebugStr)(const char *dbgStr);
 
 
-#define ESP01RXBUFAT		128
+#define ESP01RXBUFAT        1024
 #define ESP01TXBUFAT		256
 
 
@@ -64,9 +64,20 @@ typedef struct{
 	WriteUSARTByte		aWriteUSARTByte;	/**< Puntero a una función que escribe un byte en la USART, devuelve 1 si pudo escribir */
 	uint8_t 			    *bufRX;				    /**< Puntero al buffer donde se guardarán los datos a recibidos */
 	uint16_t			    *iwRX;				    /**< Puntero al índice de escritura del buffer de recepción circular */
+	uint16_t *irRX;                  /* consumer index: prevent RX overwrite */
 	uint16_t			    sizeBufferRX;		  /**< Tamaño en bytes del buffer de recepción*/
 } _sESP01Handle;
 
+// SoftAP is explicit; Station remains the default. Mode changes reset only ESP.
+typedef enum { ESP01_MODE_STATION = 1, ESP01_MODE_SOFTAP = 2 } ESP01_Mode;
+#define ESP01_AP_SSID "Balancin"
+#define ESP01_AP_PASSWORD "Balancin2026"
+#define ESP01_AP_IP "192.168.4.1"
+#define ESP01_DISCOVERY "BALANCIN_DISCOVER_V1"
+void ESP01_SetSoftAP(const char *ssid, const char *password);
+ESP01_Mode ESP01_GetMode(void);
+int ESP01_HasPeer(void);
+const char *ESP01_GetPeerIP(void);
 extern const char *wifiSSID;
 extern const char *wifiPassword;
 extern const char *wifiIp;

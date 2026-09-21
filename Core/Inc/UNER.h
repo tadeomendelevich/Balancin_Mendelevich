@@ -55,6 +55,7 @@ typedef struct {
 // Todas las variables de aplicación que el protocolo puede consultar/modificar.
 // Se registran juntas para evitar una larga serie de funciones Register*.
 typedef struct {
+    uint8_t (*request_wifi_mode)(uint8_t mode);
     uint16_t *adc;
     uint8_t adc_len;
     int16_t *motor_right_velocity;
@@ -138,6 +139,8 @@ typedef union{
  *
  */
 typedef enum{
+    SET_WIFI_MODE = 0xDD,      // one byte: 1=STA, 2=AP; only accepted in IDLE
+    GET_WIFI_STATUS = 0xDE,    // mode, network, socket, peer, IPv4[16]
     ALIVE = 0xF0,
     FIRMWARE = 0xF1,
     SETMOTORSPEED = 0xA1,

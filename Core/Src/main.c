@@ -606,6 +606,10 @@ static const WifiProfile_t wifiProfiles[] = {
     /* 3 */ { "Wifi Habitaciones",         "toyotakia",             "192.168.1.48",  "Wifi Habitaciones" },
 };
 
+#define WIFI_MODO_INICIAL ESP01_MODE_STATION
+static uint8_t wifi_modo_pendiente = 0;
+static uint32_t wifi_cambio_desde_ms = 0;
+
 #define WIFI_PERFIL_ACTIVO  1   	        /* <<< NUMERO DE RED ELEGIDA >>> */
 
 const char *wifiSSID;
@@ -1649,21 +1653,35 @@ static void esp01_chpd(uint8_t val) {
                       val ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-void appOnESP01ChangeState(_eESP01STATUS state) {
-    if (state == ESP01_WIFI_NEW_IP) {
-        ESP01_StartUDP(wifiIp, 30010, 30000);  // Ttenemos IP propia, arrancamos el socket UDP
-        f_wifi_conectado = 1;
-        wifi_splash_hasta_ms = HAL_GetTick() + WIFI_SPLASH_MS;  // splash SSID+IP en display
-    }
+// Mode changes are deferred until after the command ACK and allowed only at rest.
+static uint8_t Wifi_RequestMode(uint8_t mode) {
+    if (estado_robot != ROBOT_STATE_IDLE ||
+        (mode != ESP01_MODE_STATION && mode != ESP01_MODE_SOFTAP)) return 0;
+    wifi_modo_pendiente = mode;
+    wifi_cambio_desde_ms = HAL_GetTick();
+    return 1;
+}
 
-    // Capturamos TODOS los estados que implican pérdida de conexión
-	if (state == ESP01_UDPTCP_DISCONNECTED  ||
-		state == ESP01_WIFI_DISCONNECTED    ||
-		state == ESP01_WIFI_RECONNECTING    ||
-		state == ESP01_NOT_INIT             ||
-		state == ESP01_WIFI_NOT_SETED) {
-		f_wifi_conectado = 0;
-	}
+static void Wifi_ApplyMode(uint8_t mode) {
+    esp01_indice_escritura_rx = esp01_indice_lectura_rx = 0;
+    f_wifi_conectado = 0;
+    if (mode == ESP01_MODE_SOFTAP) {
+        wifiSSID = ESP01_AP_SSID;
+        ESP01_SetSoftAP(ESP01_AP_SSID, ESP01_AP_PASSWORD);
+        ESP01_StartUDP(ESP01_AP_IP, 30010, 30000);
+    } else {
+        wifiSSID = wifiProfiles[WIFI_PERFIL_ACTIVO].ssid;
+        ESP01_SetWIFI(wifiSSID, wifiPassword);
+        ESP01_StartUDP(wifiIp, 30010, 30000);
+    }
+    wifi_splash_hasta_ms = HAL_GetTick() + 10000U;
+}
+
+void appOnESP01ChangeState(_eESP01STATUS state) {
+    if (state == ESP01_WIFI_NEW_IP || state == ESP01_UDPTCP_CONNECTED) {
+        wifi_splash_hasta_ms = HAL_GetTick() + WIFI_SPLASH_MS;
+    }
+    f_wifi_conectado = ESP01_StateUDPTCP() == ESP01_UDPTCP_CONNECTED;
 }
 
 void ProcessEspRxLimited(void) {
@@ -2079,8 +2097,9 @@ void updateDisplay(void) {
     // esté caído o haya disparado el límite de velocidad.
     if (wifi_splash_hasta_ms != 0) {
         if ((int32_t)(wifi_splash_hasta_ms - HAL_GetTick()) > 0) {
-            OLED_Header("WIFI");
-            OLED_Puts7CenteredX("CONECTADO", 0, PANTALLA_ANCHO - 1, 14);
+            OLED_Header(ESP01_GetMode() == ESP01_MODE_SOFTAP ? "WIFI DIRECTO" : "WIFI ROUTER");
+            OLED_Puts7CenteredX(ESP01_StateWIFI() != ESP01_WIFI_CONNECTED ? "INICIANDO" :
+                (ESP01_HasPeer() ? "QT CONECTADO" : "ESPERANDO QT"), 0, PANTALLA_ANCHO - 1, 14);
 
             char ssid_buf[22];
             uint8_t si = 0;
@@ -2104,7 +2123,7 @@ void updateDisplay(void) {
             bi = 0;
             pfx = "PC: ";
             for (; *pfx; pfx++) ip_buf[bi++] = *pfx;
-            for (const char *p = wifiIp; *p != '\0' && bi < sizeof(ip_buf) - 1; p++)
+            for (const char *p = ESP01_HasPeer() ? ESP01_GetPeerIP() : "SIN CLIENTE"; *p != '\0' && bi < sizeof(ip_buf) - 1; p++)
                 ip_buf[bi++] = *p;
             ip_buf[bi] = '\0';
             OLED_Str5Centered(56, ip_buf);
@@ -6316,15 +6335,15 @@ static void Ctrl_Telemetria(void)
         wlog.p_term     = termino_p;
         wlog.i_term     = termino_i;
         wlog.d_term     = termino_d;
-        wlog.motor_der         = motor_derecho_velocidad;
-        wlog.motor_izq         = motor_izquierdo_velocidad;
+        wlog.mR         = motor_derecho_velocidad;
+        wlog.mL         = motor_izquierdo_velocidad;
         wlog.dyn_sp     = setpoint_dinamico_final;
         wlog.dt_ctrl_us = (uint32_t)(dt_ctrl * 1000000.0f);
 
         wlog.line_error          = linea_error;
-        wlog.linea_p              = log_p_line;
-        wlog.linea_i              = log_i_line;
-        wlog.linea_d              = log_d_line;
+        wlog.p_line              = log_p_line;
+        wlog.i_line              = log_i_line;
+        wlog.d_line              = log_d_line;
         wlog.steering_adjustment = ajuste_direccion;
         wlog.adc1                = adc_mediana[0];
         wlog.adc2                = adc_mediana[1];
@@ -6687,6 +6706,7 @@ int main(void)
       .aDoCHPD         = esp01_chpd,                  // Controla CH_PD
       .aWriteUSARTByte = uart_send_byte,          // Envía un byte por UART
       .bufRX           = esp01_buffer_rx,              // Buffer de recepción
+      .irRX            = &esp01_indice_lectura_rx,
       .iwRX            = &esp01_indice_escritura_rx,              // Índice de escritura
       .sizeBufferRX    = sizeof(esp01_buffer_rx)       // Tamaño del buffer
   };
@@ -6696,7 +6716,10 @@ int main(void)
   esp01_chpd(1);  // Pone CH_PD a nivel alto para sacar al módulo de reset
   HAL_Delay(100);
   ESP01_AttachDebugStr(ESP01_USB_DbgStr);
-  ESP01_SetWIFI(wifiSSID, wifiPassword);
+  // Hold KEY while powering/resetting the Black Pill for direct WiFi.
+  uint8_t boot_ap = HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin) == GPIO_PIN_RESET;
+  boton_prev = boot_ap ? 0 : 1;  // release must not become a mode/motor click
+  Wifi_ApplyMode(boot_ap ? ESP01_MODE_SOFTAP : WIFI_MODO_INICIAL);
 
   unerRx.buff = uner_buffer_rx;
   unerRx.mask = RXBUFSIZE - 1;
@@ -6716,6 +6739,7 @@ int main(void)
       .robot_state = &estado_robot,
       .reset_mass_center = &f_reset_centro_masa,
       .send_csv_log = &f_enviar_log_csv,
+      .request_wifi_mode = Wifi_RequestMode,
       .send_wifi_log = &f_enviar_log_wifi,
       .change_display = &f_cambiar_pantalla,
       .kp_line = &KP_LINE, .kd_line = &KD_LINE, .ki_line = &KI_LINE,
@@ -6853,7 +6877,7 @@ int main(void)
 	      // El resto se reparte en subticks
 	      switch (subtick) {
 	          case 0:
-	              ESP01_Task();
+	              /* ESP01 serviced on every main-loop pass below. */
 	              break;
 	          case 1:
 	              break;
@@ -6969,6 +6993,11 @@ int main(void)
 	              }
 	  }
 
+      if (wifi_modo_pendiente && HAL_GetTick() - wifi_cambio_desde_ms >= 300U) {
+          if (estado_robot == ROBOT_STATE_IDLE) Wifi_ApplyMode(wifi_modo_pendiente);
+          wifi_modo_pendiente = 0;
+      }
+      ESP01_Task();
 	  ProcessEspRxLimited();
 	  UNER_Task(); 		// Procesa tramas UNER recibidas
 	  usb_service_tx();
