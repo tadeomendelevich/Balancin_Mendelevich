@@ -2,6 +2,7 @@
  * STA and SoftAP use the same UNER/UDP payloads. No delays in the control loop.
  */
 #include "ESP01.h"
+#include "comunicacion_usb.h"
 #include "stm32f4xx_hal.h"
 #include "UNER.h"
 #include <stdio.h>

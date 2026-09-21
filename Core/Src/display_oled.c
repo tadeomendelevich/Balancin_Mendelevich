@@ -1,4 +1,5 @@
 #include "display_oled.h"
+#include "comunicacion_usb.h"
 #include "ssd1306.h"
 #include "i2c_manager.h"
 #include "ESP01.h"
@@ -17,10 +18,6 @@
 
 static volatile uint32_t wifi_splash_hasta_ms = 0;
 static uint32_t ultimo_display_ms = 0;
-
-/* Depuracion USB compartida con el resto del firmware. */
-extern void USB_Debug(const char *fmt, ...);
-extern void USB_DebugHex(uint8_t b);
 
 static void my_ssd1306_init(void *ctx);
 static int my_ssd1306_write_cmd(void *ctx, uint8_t cmd);

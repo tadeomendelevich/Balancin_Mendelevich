@@ -6,14 +6,13 @@
  */
 
 #include "UNER.h"
+#include "comunicacion_usb.h"
 #include <stddef.h>
 #include <string.h>
 #include <math.h>
 #include "ESP01.h"
 #include "usbd_core.h"    // para USBD_HandleTypeDef, USBD_STATE_CONFIGURED
 
-extern void USB_Debug(const char *fmt, ...);
-extern void USB_DebugStr(const char *dbgStr);
 
 static uint8_t (*request_wifi_mode)(uint8_t mode);
 
@@ -39,10 +38,8 @@ static void flushUdpReplies(void) {
     }
 }
 
-// Prototipo externo de estado USB (ya lo tienes en main.c)
+// Estado de la pila USB generado en usb_device.c
 extern USBD_HandleTypeDef hUsbDeviceFS;
-extern uint8_t usb_enqueue_tx_segments(const uint8_t *first, uint16_t first_len,
-                                       const uint8_t *second, uint16_t second_len);
 
 static void decodeCommand(_sRx *dataRx, _sTx *dataTx);
 static void UNER_SendData(void);

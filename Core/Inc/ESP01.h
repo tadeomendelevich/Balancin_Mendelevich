@@ -226,6 +226,5 @@ void ESP01_USB_DbgStr(const char *dbgStr);
 
 void onESP01StateChange(_eESP01STATUS state);
 
-extern void USB_DebugStr(const char *dbgStr);
 
 #endif /* ESP01_H_ */
