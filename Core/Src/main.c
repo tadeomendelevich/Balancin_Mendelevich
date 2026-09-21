@@ -26,6 +26,8 @@
 #include <string.h>
 #include <math.h>
 #include "comunicacion_usb.h"
+#include "boton_usuario.h"
+#include "telemetria.h"
 #include "display_oled.h"
 #include "MPU6050.h"
 #include "ESP01.h"
@@ -117,11 +119,6 @@
 // Complementary Filter / PID timing
 #define ALFA_COMPLEMENTARIO  0.98f
 #define DT_CTRL_FIJO         0.010f
-
-// LOGGING MACROS
-#define LOG_DECIMACION        5    // Frecuencia de envio de log csv mediante USB
-#define LOG_WIFI_DECIMACION   10   // Frecuencia de envio de log binario mediante WIFI
-#define WIFI_ODOM_PERIODO_MS  500  // Período del push de odometría/línea por WiFi (para graficar en Qt); no ligado a ACTIVATE_WIFI_LOG, arranca solo con la conexión
 
 // Filter Control Parameters
 #define INTEGRAL_MAX   100.0f  // Max Integral Term
@@ -581,10 +578,6 @@ static float linea_integral = 0.0f;
 uint8_t f_reset_centro_masa = 0; // Resetea el centro de gravedad en el cual el auto hace balance
 
 // LOGGING VARIABLES
-static uint32_t log_contador = 0;
-static uint8_t  log_encabezado_enviado = 0;
-static uint32_t ultimo_wifi_odom_ms = 0;   // timestamp del último push de WifiOdomData_t
-static uint16_t wifi_odom_secuencia     = 0;   // contador incremental para detectar pérdida de paquetes en Qt
 uint8_t f_enviar_log_csv = 0;
 uint8_t f_enviar_log_wifi = 0;
 uint8_t f_cambiar_pantalla = 0;
@@ -668,11 +661,6 @@ static float      linea_error_ema   = 0.0f;
 static uint8_t contador_boca_abajo = 0;
 static uint8_t contador_parado = 0;
 static uint8_t contador_caida = 0;
-
-static uint8_t boton_prev = 1;
-static uint32_t boton_ultimo_ms = 0;
-static uint32_t boton_click_tiempo = 0;
-static uint8_t  boton_click_cantidad = 0;
 
 static float manual_setpoint_rampeado = 0.0f;  // último ángulo de avance aplicado en MANUAL (telemetría)
 static float manual_integral_velocidad    = 0.0f;  // integral del PI de velocidad adelante/atrás en MANUAL
@@ -878,6 +866,7 @@ void UpdateADC_MovingAverage(void);
 void calcular_inclinacion(int16_t accel_x, int16_t accel_y, int16_t accel_z, float *out_roll_deg, float *out_pitch_deg);
 
 static void ActualizarPantalla(void);
+static void ProcesarBoton(void);
 
 static void esp01_chpd(uint8_t val);
 void ESP01_AttachChangeState(OnESP01ChangeState aOnESP01ChangeState);
@@ -1433,6 +1422,37 @@ static float ComputeSteeringPID(float vel_der, float vel_izq, float sp)
     if (out >  DIRECCION_SALIDA_MAX) out =  DIRECCION_SALIDA_MAX;   // Saturacion de salida
     if (out < -DIRECCION_SALIDA_MAX) out = -DIRECCION_SALIDA_MAX;
     return out;
+}
+
+/* Acciones de la aplicacion para los gestos detectados cada 10 ms. */
+static void ProcesarBoton(void)
+{
+    uint8_t nivel = HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin);
+    BotonUsuarioEventos eventos = BotonUsuario_Actualizar(nivel, HAL_GetTick());
+    if (eventos.pulsacion_iniciada && f_caido) {
+        caida_alerta_hasta_ms = 0;
+        Pantalla_ForzarActualizacion();
+    }
+    if (eventos.pulsacion_larga)
+        f_cambiar_pantalla = (f_cambiar_pantalla + 1) % 8;
+
+    if (eventos.clicks == 1) {
+        estado_robot = (estado_robot == ROBOT_STATE_IDLE)
+                ? ROBOT_STATE_BALANCE_ONLY : ROBOT_STATE_IDLE;
+    } else if (eventos.clicks == 2) {
+        if (estado_robot == ROBOT_STATE_IDLE || estado_robot == ROBOT_STATE_BALANCE_ONLY) {
+            estado_robot = ROBOT_STATE_LINE_FOLLOWING;
+            obj_ignorar_hasta_ms = HAL_GetTick() + 4000U;
+        } else {
+            estado_robot = ROBOT_STATE_IDLE;
+        }
+    } else if (eventos.clicks >= 3) {
+        static const uint8_t modos[] = {
+            ROBOT_STATE_BALANCE_AND_SPEED, ROBOT_STATE_MANUAL_CONTROL, ROBOT_STATE_MOTOR_TEST
+        };
+        uint8_t modo = modos[(eventos.clicks >= 5) ? 2 : eventos.clicks - 3];
+        estado_robot = (estado_robot == modo) ? ROBOT_STATE_IDLE : modo;
+    }
 }
 
 static void ActualizarPantalla(void)
@@ -5227,121 +5247,51 @@ static void Ctrl_MezclaMotores(void)
 static void Ctrl_Telemetria(void)
 {
     roll_grados = roll_filtrado_grados;
-
-    log_contador++;
-
-    if (f_enviar_log_wifi && (log_contador % LOG_WIFI_DECIMACION == 0)) {
-        WifiLogData_t wlog;
-        wlog.t_ms       = HAL_GetTick();
-        wlog.roll_filt  = roll_filtrado_grados;
-        wlog.output     = salida_pid;
-        wlog.p_term     = termino_p;
-        wlog.i_term     = termino_i;
-        wlog.d_term     = termino_d;
-        wlog.mR         = motor_derecho_velocidad;
-        wlog.mL         = motor_izquierdo_velocidad;
-        wlog.dyn_sp     = setpoint_dinamico_final;
-        wlog.dt_ctrl_us = (uint32_t)(dt_ctrl * 1000000.0f);
-
-        wlog.line_error          = linea_error;
-        wlog.p_line              = log_p_line;
-        wlog.i_line              = log_i_line;
-        wlog.d_line              = log_d_line;
-        wlog.steering_adjustment = ajuste_direccion;
-        wlog.adc1                = adc_mediana[0];
-        wlog.adc2                = adc_mediana[1];
-        wlog.adc3                = adc_mediana[2];
-        wlog.adc4                = adc_mediana[3];
-
-        UNER_SendWifiLogData(&wlog);
-    }
-
-    // Push de odometría/línea por WiFi para graficar (mapa XY, franja de línea) en
-    // Qt: independiente de ACTIVATE_WIFI_LOG, arranca solo con f_wifi_conectado y a
-    // un ritmo bajo (WIFI_ODOM_PERIODO_MS) para no competir por ancho de banda/CPU
-    // con la telemetría de control ya existente.
-    if (f_wifi_conectado && (uint32_t)(HAL_GetTick() - ultimo_wifi_odom_ms) >= WIFI_ODOM_PERIODO_MS) {
-        ultimo_wifi_odom_ms = HAL_GetTick();
-
-        WifiOdomData_t odata;
-        odata.seq           = wifi_odom_secuencia++;
-        odata.t_ms          = HAL_GetTick();
-        odata.x_m           = odom_x_m;
-        odata.y_m           = odom_y_m;
-        odata.theta_deg     = odom_theta_grados;
-        odata.line_error    = linea_error_display;
-        odata.line_detected = linea_detectada_display;
-        odata.robot_state   = estado_robot;
-        odata.line_state    = (uint8_t)linea_estado;
-        odata.adc5          = adc_mediana[4];  // sensores de objeto: menos = más cerca,
-        odata.adc6          = adc_mediana[5];  // ~4095 = nada adelante — para graficar
-        odata.adc7          = adc_mediana[6];  // la barrera/cuerpo frente al robot en Qt
-        odata.adc8          = adc_mediana[7];
-        odata.roll_deg      = roll_filtrado_grados;  // balanceo → Vista 3D de Qt
-        odata.lat_deg       = inclinacion_lateral_ema;          // banking lateral → Vista 3D de Qt
-
-        UNER_SendWifiOdomData(&odata);
-    }
-
-    if (f_enviar_log_csv && !log_encabezado_enviado) {
-        USB_DebugStr("t_ms,dt_us,dt_ctrl_us,accel_roll,roll_accel_filtrado,gyro_y,giro_dps_clampeado,roll_filt,dyn_sp,error,p,i,d,salida_pid,pwm_comando,pwm_saturado,sat,motor_der,motor_izq,pitch,accel_x,accel_y,accel_z,giro_x,giro_y,giro_z\r\n");
-        log_encabezado_enviado = 1;
-    }
-
-    if (f_enviar_log_csv && (log_contador % LOG_DECIMACION == 0)) {
-        char buf[128];
-
-        int roll_i   = (int)(roll_filtrado_grados * 1000.0f);
-        int p_i      = (int)(termino_p * 1000.0f);
-        int i_i      = (int)(termino_i * 1000.0f);
-        int d_i      = (int)(termino_d * 1000.0f);
-        int sp_i     = (int)(setpoint_dinamico_final * 1000.0f);
-        int error_i  = (int)(error * 1000.0f);
-        int gyrof_i  = (int)(giro_dps_clampeado * 1000.0f);
-        int accel_i  = (int)(accel_angulo_grados * 1000.0f);
-        int accelf_i = (int)(roll_accel_filtrado * 1000.0f);
-        int output_i = (int)(salida_pid * 1000.0f);
-        int pwmcmd_i = (int)(pwm_comando * 100.0f);
-        int pwmsat_i = (int)(pwm_saturado * 100.0f);
-        int pitch_i  = (int)(pitch_grados * 1000.0f);
-
-        int ax_i = (int)accel_x;
-        int ay_i = (int)accel_y;
-        int az_i = (int)accel_z;
-        int gx_i = (int)giro_x;
-        int gy_i = (int)giro_y;
-        int gz_i = (int)giro_z;
-
-        int len = snprintf(buf, sizeof(buf),
-            "%lu,%lu,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d\r\n",
-            HAL_GetTick(),                 // t_ms
-            (uint32_t)(dt_real * 1000000.0f), // dt_us
-            (uint32_t)(dt_ctrl * 1000000.0f), // dt_ctrl_us
-            accel_i,                       // accel_roll x1000
-            accelf_i,                      // roll_accel_filtrado x1000
-            (int)(giro_velocidad_dps * 1000.0f),// gyro_y x1000
-            gyrof_i,                       // giro_dps_clampeado x1000
-            roll_i,                        // roll_filt x1000
-            sp_i,                          // dyn_sp x1000
-            error_i,                       // error x1000
-            p_i,                           // p x1000
-            i_i,                           // i x1000
-            d_i,                           // d x1000
-            output_i,                      // salida_pid x1000
-            pwmcmd_i,                      // pwm_comando x100
-            pwmsat_i,                      // pwm_saturado x100
-            flag_saturacion,                      // sat
-            motor_derecho_velocidad,            // motor_der
-            motor_izquierdo_velocidad,             // motor_izq
-            pitch_i,                       // pitch x1000
-            ax_i, ay_i, az_i,              // accel raw
-            gx_i, gy_i, gz_i               // gyro raw
-        );
-
-        if (len > 0) {
-            USB_DebugSend((uint8_t*)buf, (uint16_t)len);
-        }
-    }
+    // Foto reutilizable: no aumenta la pila ni permite modificar el control.
+    static TelemetriaDatos datos;
+    datos.f_enviar_log_wifi = f_enviar_log_wifi;
+    datos.f_enviar_log_csv = f_enviar_log_csv;
+    datos.f_wifi_conectado = f_wifi_conectado;
+    datos.flag_saturacion = flag_saturacion;
+    datos.linea_detectada_display = linea_detectada_display;
+    datos.estado_robot = estado_robot;
+    datos.linea_estado = linea_estado;
+    datos.motor_derecho_velocidad = motor_derecho_velocidad;
+    datos.motor_izquierdo_velocidad = motor_izquierdo_velocidad;
+    datos.accel_x = accel_x;
+    datos.accel_y = accel_y;
+    datos.accel_z = accel_z;
+    datos.giro_x = giro_x;
+    datos.giro_y = giro_y;
+    datos.giro_z = giro_z;
+    datos.roll_filtrado_grados = roll_filtrado_grados;
+    datos.salida_pid = salida_pid;
+    datos.termino_p = termino_p;
+    datos.termino_i = termino_i;
+    datos.termino_d = termino_d;
+    datos.setpoint_dinamico_final = setpoint_dinamico_final;
+    datos.dt_ctrl = dt_ctrl;
+    datos.linea_error = linea_error;
+    datos.log_p_line = log_p_line;
+    datos.log_i_line = log_i_line;
+    datos.log_d_line = log_d_line;
+    datos.ajuste_direccion = ajuste_direccion;
+    datos.odom_x_m = odom_x_m;
+    datos.odom_y_m = odom_y_m;
+    datos.odom_theta_grados = odom_theta_grados;
+    datos.linea_error_display = linea_error_display;
+    datos.inclinacion_lateral_ema = inclinacion_lateral_ema;
+    datos.error = error;
+    datos.giro_dps_clampeado = giro_dps_clampeado;
+    datos.accel_angulo_grados = accel_angulo_grados;
+    datos.roll_accel_filtrado = roll_accel_filtrado;
+    datos.pwm_comando = pwm_comando;
+    datos.pwm_saturado = pwm_saturado;
+    datos.pitch_grados = pitch_grados;
+    datos.dt_real = dt_real;
+    datos.giro_velocidad_dps = giro_velocidad_dps;
+    memcpy(datos.adc_mediana, adc_mediana, sizeof(datos.adc_mediana));
+    Telemetria_Actualizar(&datos);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -5621,7 +5571,7 @@ int main(void)
   ESP01_AttachDebugStr(ESP01_USB_DbgStr);
   // Hold KEY while powering/resetting the Black Pill for direct WiFi.
   uint8_t boot_ap = HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin) == GPIO_PIN_RESET;
-  boton_prev = boot_ap ? 0 : 1;  // release must not become a mode/motor click
+  BotonUsuario_Init(boot_ap ? 0 : 1);  // release must not become a mode/motor click
   Wifi_ApplyMode(boot_ap ? ESP01_MODE_SOFTAP : WIFI_MODO_INICIAL);
 
   unerRx.buff = uner_buffer_rx;
@@ -5805,91 +5755,7 @@ int main(void)
 	              break;
 	      }
 
-	      // ── Botón KEY: simple / doble / triple / largo ──────────────────────────
-	      {
-	                  uint8_t boton_ahora = HAL_GPIO_ReadPin(KEY_GPIO_Port, KEY_Pin);
-	                  uint32_t now    = HAL_GetTick();
-
-	                  // Flanco de bajada: empieza pulsación
-	                  if (boton_prev == 1 && boton_ahora == 0) {
-	                      // Cierra al instante CAIDA/LIMITE, pero NO consume el
-	                      // click: al soltarlo seguirá contando para elegir modo.
-	                      if (f_caido) {
-	                          caida_alerta_hasta_ms = 0;
-	                          Pantalla_ForzarActualizacion();
-	                      }
-	                      boton_ultimo_ms = now;
-	                  }
-
-	                  // Click largo: detectar mientras está presionado, sin esperar soltar
-	                  if (boton_ahora == 0 && boton_ultimo_ms != 0 && (now - boton_ultimo_ms) > 800) {
-	                      f_cambiar_pantalla = (f_cambiar_pantalla + 1) % 8;  // 8 pantallas (6=OBJ, 7=ODOM)
-	                      boton_ultimo_ms = 0;   // ← evita que se dispare repetidamente
-	                  }
-
-	                  // Flanco de subida: soltó el botón
-	                  if (boton_prev == 0 && boton_ahora == 1) {
-	                      uint32_t boton_sostenido_ms = now - boton_ultimo_ms;
-
-	                      if (boton_ultimo_ms != 0 && boton_sostenido_ms > 20) {
-	                          uint32_t since_last = now - boton_click_tiempo;
-	                          boton_click_tiempo = now;  // ← siempre actualizar al soltar
-
-	                          if (since_last < 400 && boton_click_cantidad > 0) {
-	                              // Continúa la secuencia
-	                              boton_click_cantidad++;
-	                          } else {
-	                              // Nueva secuencia
-	                              boton_click_cantidad = 1;
-	                          }
-	                      }
-	                      boton_ultimo_ms = 0;
-	                  }
-
-	                  // Resolución por timeout: 400ms desde el último click sin otro click
-	                  if (boton_click_cantidad > 0 && (now - boton_click_tiempo) > 400) {
-
-	                      if (boton_click_cantidad == 1) {
-	                          if (estado_robot == ROBOT_STATE_IDLE) {
-	                              estado_robot = ROBOT_STATE_BALANCE_ONLY;
-	                          } else {
-	                              estado_robot = ROBOT_STATE_IDLE;
-	                          }
-
-	                      } else if (boton_click_cantidad == 2) {
-	                          if (estado_robot == ROBOT_STATE_IDLE ||
-	                              estado_robot == ROBOT_STATE_BALANCE_ONLY) {
-	                              estado_robot = ROBOT_STATE_LINE_FOLLOWING;
-	                              obj_ignorar_hasta_ms = HAL_GetTick() + 4000U;
-	                          } else {
-	                              estado_robot = ROBOT_STATE_IDLE;
-	                          }
-
-	                      } else if (boton_click_cantidad == 3) {
-	                          if (estado_robot == ROBOT_STATE_BALANCE_AND_SPEED) {
-	                              estado_robot = ROBOT_STATE_IDLE;
-	                          } else {
-	                              estado_robot = ROBOT_STATE_BALANCE_AND_SPEED;
-	                          }
-	                      } else if (boton_click_cantidad == 4) {
-                              if (estado_robot == ROBOT_STATE_MANUAL_CONTROL) {
-                                  estado_robot = ROBOT_STATE_IDLE;
-                              } else {
-                                  estado_robot = ROBOT_STATE_MANUAL_CONTROL;
-                              }
-                          } else if (boton_click_cantidad >= 5) {
-                              if (estado_robot == ROBOT_STATE_MOTOR_TEST) {
-                                  estado_robot = ROBOT_STATE_IDLE;
-                              } else {
-                                  estado_robot = ROBOT_STATE_MOTOR_TEST;
-                              }
-                          }
-
-	                      boton_click_cantidad = 0;
-	                  }
-
-	                  boton_prev = boton_ahora;
-	              }
+	      ProcesarBoton();
 	  }
 
       if (wifi_modo_pendiente && HAL_GetTick() - wifi_cambio_desde_ms >= 300U) {

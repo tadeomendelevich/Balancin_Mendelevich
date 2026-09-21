@@ -4,6 +4,8 @@
 "./Core/Src/fonts.o"
 "./Core/Src/i2c_manager.o"
 "./Core/Src/main.o"
+"./Core/Src/boton_usuario.o"
+"./Core/Src/telemetria.o"
 "./Core/Src/comunicacion_usb.o"
 "./Core/Src/display_oled.o"
 "./Core/Src/ssd1306.o"
