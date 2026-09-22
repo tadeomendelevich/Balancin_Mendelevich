@@ -28,6 +28,7 @@
 #include "comunicacion_usb.h"
 #include "boton_usuario.h"
 #include "telemetria.h"
+#include "control_motores.h"
 #include "display_oled.h"
 #include "MPU6050.h"
 #include "ESP01.h"
@@ -1015,84 +1016,6 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
 static int uart_send_byte(uint8_t byte) {
     return (HAL_UART_Transmit(&huart1, &byte, 1, 2) == HAL_OK) ? 1 : 0;
 }
-
-void PWM_init(void)
-{
-    // TIM3 → PB4 (CH1), PB5 (CH2)
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-
-    // TIM4 → PB6 (CH1), PB7 (CH2)
-    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);
-
-    // Duty inicial 0%
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0); // PB4
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0); // PB5
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0); // PB6
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 0); // PB7
-}
-
-// Motor derecho: TIM3 -> PB4 (CH1 = avance), PB5 (CH2 = reversa)
-// Motor izquierdo: TIM4 -> PB6 (CH1 = reversa), PB7 (CH2 = avance)
-void MotorControl(int16_t setMotorRight, int16_t setMotorLeft)
-{
-    // Si ambos son cero, apagar completamente los canales PWM
-    if (setMotorRight == 0 && setMotorLeft == 0) {
-        HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1); // PB4
-        HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_2); // PB5
-        HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_1); // PB6
-        HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_2); // PB7
-        return;
-    }
-
-    // Asegurarse que los canales estén activos antes de escribir duty
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);
-
-    // Limitar a [-100, 100]
-    if (setMotorRight > 100)  setMotorRight = 100;
-    if (setMotorRight < -100) setMotorRight = -100;
-    if (setMotorLeft > 100)   setMotorLeft  = 100;
-    if (setMotorLeft < -100)  setMotorLeft  = -100;
-
-    uint32_t arr3 = __HAL_TIM_GET_AUTORELOAD(&htim3);
-    uint32_t arr4 = __HAL_TIM_GET_AUTORELOAD(&htim4);
-
-    uint32_t dutyR = (setMotorRight >= 0) ? (uint32_t)setMotorRight : (uint32_t)(-setMotorRight);
-    uint32_t dutyL = (setMotorLeft  >= 0) ? (uint32_t)setMotorLeft  : (uint32_t)(-setMotorLeft);
-
-    // De % de potencia a registro de comparación del timer: el contador PWM
-    // cuenta de 0 a ARR (959) y el pin está en alto mientras cuenta < CCR, así
-    // que duty% = CCR/(ARR+1). Despejando: CCR = (ARR+1)·duty/100.
-    // Ej.: 50% → CCR=480 → pin en alto 480 de cada 960 ticks del timer.
-    uint32_t ccrR = ((arr3 + 1) * dutyR) / 100U;   // Regla de tres: % de duty -> cuentas del timer
-    uint32_t ccrL = ((arr4 + 1) * dutyL) / 100U;   // Regla de tres: duty [%] -> cuentas del timer (CCR)
-
-    if (ccrR > arr3) ccrR = arr3;
-    if (ccrL > arr4) ccrL = arr4;
-
-    // ----- Motor derecho (TIM3) -----
-    if (setMotorRight >= 0) {
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, ccrR);
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
-    } else {
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, ccrR);
-    }
-
-    // ----- Motor izquierdo (TIM4) -----
-    if (setMotorLeft >= 0) {
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, ccrL);
-    } else {
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, ccrL);
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 0);
-    }
-}
-
 
 int mpu_writeReg(void *ctx, uint8_t devAddr, uint8_t regAddr, uint8_t *data, uint16_t len)
 {
@@ -5296,7 +5219,7 @@ static void Ctrl_Telemetria(void)
 
 // ─────────────────────────────────────────────────────────────────────
 // Etapa 17 — Salida a motores: paro por "en el aire", compensación de
-// zona muerta (estática/cinética según la rueda gire o no) y MotorControl.
+// zona muerta (estática/cinética según la rueda gire o no) y ControlMotores_Aplicar.
 // ─────────────────────────────────────────────────────────────────────
 static void Ctrl_SalidaMotores(void)
 {
@@ -5308,7 +5231,7 @@ static void Ctrl_SalidaMotores(void)
 
     if (estado_robot == ROBOT_STATE_MOTOR_TEST) {
         // Modo test: SETMOTORSPEED controla directamente, sin PID ni compensación
-        MotorControl(motor_derecho_velocidad, -motor_izquierdo_velocidad);
+        ControlMotores_Aplicar(motor_derecho_velocidad, -motor_izquierdo_velocidad);
     } else if ((estado_robot != ROBOT_STATE_IDLE) && !f_caido) {
         // Zona neutra: comandos chicos van a 0 en vez de saltar a ±DEADBAND
         // (ver MOTOR_COMANDO_NEUTRO — anti-temblor cerca del equilibrio).
@@ -5395,9 +5318,9 @@ static void Ctrl_SalidaMotores(void)
             }
         }
 
-        MotorControl(mR_comp, mL_comp);
+        ControlMotores_Aplicar(mR_comp, mL_comp);
     } else {
-        MotorControl(0, 0);
+        ControlMotores_Aplicar(0, 0);
     }
 }
 
@@ -5553,7 +5476,7 @@ int main(void)
 
   I2C_Manager_Init();
 
-  PWM_init();
+  ControlMotores_Init(&htim3, &htim4);
 
   static _sESP01Handle esp01Handle = {
       .aDoCHPD         = esp01_chpd,                  // Controla CH_PD
