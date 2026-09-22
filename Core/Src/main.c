@@ -484,12 +484,10 @@ TIM_HandleTypeDef htim5;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-uint8_t es250us, tmo100ms, es10ms, es2ms;
+uint8_t tmo100ms, es10ms;
 
 
 //static uint8_t ema_initialized = 0;
-static uint8_t contador_alive, contador_mpu6050;
-uint8_t mpu_dato_listo = 0;
 uint8_t mpu_inicializado = 0;
 static volatile uint8_t mpu_pedido_pendiente = 0;
 static float roll_grados = 0.0f;	// Ángulo de balanceo (eje Y, usado para el equilibrio)
@@ -610,7 +608,6 @@ static float dt_real        = 0.0f;		// Monitoreo del perÃ­odo real entre mues
 
 static float velocidad_est     = 0.0f;  // velocidad estimada fusionada (gyro + accel)
 static float velocidad_est_ema   = 0.0f;  // versión filtrada para el setpoint
-static float vel_desde_accel   = 0.0f;  // velocidad integrada del acelerómetro (m/s)
 static float setpoint_dinamico_objetivo = 0.0f;  // setpoint variable calculado cada ciclo
 static float setpoint_dinamico_final = 0.0f;
 static float setpoint_base_rampeado  = 0.0f;
@@ -663,15 +660,12 @@ static uint8_t contador_boca_abajo = 0;
 static uint8_t contador_parado = 0;
 static uint8_t contador_caida = 0;
 
-static float manual_setpoint_rampeado = 0.0f;  // último ángulo de avance aplicado en MANUAL (telemetría)
 static float manual_integral_velocidad    = 0.0f;  // integral del PI de velocidad adelante/atrás en MANUAL
 static float manual_rumbo_recto_rampeado = 0.0f; // corrección de rumbo recto (mismo algoritmo que REV_STRAIGHT en OBJ_REVERSE) cuando no hay giro comandado en MANUAL
 
-static float linea_angulo_rampeado      = 0.0f;  // rampa de avance en line follower
 static float linea_deficit_angulo_extra     = 0.0f;  // corrección P de angulo por deficit de velocidad encoder
 static float linea_escape_reversa_angulo     = 0.0f;  // extra de angulo si encoders muestran reversa
 static float linea_integral_velocidad      = 0.0f;  // integral del PI de velocidad (idea 1)
-static float linea_direccion_fb_int      = 0.0f;  // integral del inner steering PI (idea 2)
 static float vel_rueda_der_rps      = 0.0f;  // velocidad rueda derecha, accesible fuera del bloque encoder
 static float vel_rueda_izq_rps       = 0.0f;  // velocidad rueda izquierda, accesible fuera del bloque encoder
 // ── Estación por rueda (Opción A) ──
@@ -945,7 +939,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     }
 
     if (htim->Instance == TIM2) {        // 250 µs
-        es250us = 1;
         SampleEncoders250us();
     }
 
@@ -2298,12 +2291,10 @@ static void Ctrl_CambiosDeEstado(void)
         velocidad_est        = 0.0f;
         velocidad_est_ema      = 0.0f;
         velocidad_est_lenta_ema = 0.0f;
-        vel_desde_accel      = 0.0f;
         linea_integral_velocidad   = 0.0f;
         linea_deficit_angulo_extra = 0.0f;
         linea_escape_reversa_angulo  = 0.0f;
         balance_hold_activo = 0;
-        linea_direccion_fb_int   = 0.0f;
         vel_rueda_der_rps   = 0.0f;
         vel_rueda_izq_rps    = 0.0f;
         linea_estado          = LINE_STATE_FOLLOWING;
@@ -2321,7 +2312,6 @@ static void Ctrl_CambiosDeEstado(void)
         setpoint_base_rampeado     = SETPOINT_ANGLE + setpoint_trim;
         setpoint_freno_rampeado    = 0.0f;
         linea_perdida_ms        = HAL_GetTick();
-        linea_angulo_rampeado   = 0.0f;
         perdida_avance_integral_vel = 0.0f;
         todos_negros_inicio_ms  = 0;
         ultima_linea_parcial_ms = 0;
@@ -2379,7 +2369,6 @@ static void Ctrl_CambiosDeEstado(void)
         velocidad_est        = 0.0f;
         velocidad_est_ema      = 0.0f;
         velocidad_est_lenta_ema = 0.0f;
-        vel_desde_accel      = 0.0f;
         setpoint_dinamico_objetivo    = SETPOINT_ANGLE + setpoint_trim;
         setpoint_dinamico_final  = SETPOINT_ANGLE + setpoint_trim;
         setpoint_base_rampeado     = SETPOINT_ANGLE + setpoint_trim;
@@ -2397,7 +2386,6 @@ static void Ctrl_CambiosDeEstado(void)
             manual_setpoint_comando     = 0.0f;
             manual_direccion_comando     = 0.0f;
             manual_ultimo_cmd_ms      = HAL_GetTick();
-            manual_setpoint_rampeado  = 0.0f;
             manual_integral_velocidad     = 0.0f;
             manual_rumbo_recto_rampeado = 0.0f;
             ajuste_direccion     = 0.0f;
@@ -2862,7 +2850,6 @@ static void Ctrl_SetpointDinamico(void)	// Depende del modo en el que este, cont
             }
         }
 
-        linea_angulo_rampeado = setpoint_base_objetivo; // mantener variable para telemetría
     } else if (estado_robot == ROBOT_STATE_MANUAL_CONTROL || manual_override_linea) {
         // Control manual normal (joystick/comandos WiFi-USB). El banco de pruebas
         // del giro de 90° que vivía acá (activado con el joystick en reposo) se
@@ -2921,7 +2908,6 @@ static void Ctrl_SetpointDinamico(void)	// Depende del modo en el que este, cont
             float manual_empuje = AntiStall_Tick(8, 1, ANTIATASCO_MAX_MANUAL);
             manual_angulo_pedido += (manual_angulo_pedido > 0.0f) ? manual_empuje : -manual_empuje;
         }
-        manual_setpoint_rampeado = manual_angulo_pedido; // telemetría/consistencia con el resto del archivo
         setpoint_base_objetivo   = SETPOINT_ANGLE + setpoint_trim + manual_angulo_pedido;
         // Freno_AnguloSegunModo devuelve 0 directo si el estado es
         // LINE_FOLLOWING (ver la función) — acá "estado_robot" sigue siendo
@@ -3152,7 +3138,6 @@ static void Ctrl_DeteccionCaida(void)
             velocidad_est        = 0.0f;
             velocidad_est_ema      = 0.0f;
             velocidad_est_lenta_ema = 0.0f;
-            vel_desde_accel      = 0.0f;
             linea_integral       = 0.0f;
             linea_error_previo     = 0.0f;
             linea_error_ema      = 0.0f;
@@ -3241,7 +3226,6 @@ static void Ctrl_DeteccionCaida(void)
             velocidad_est              = 0.0f;
             velocidad_est_ema            = 0.0f;
             velocidad_est_lenta_ema       = 0.0f;
-            vel_desde_accel            = 0.0f;
             linea_integral             = 0.0f;
             linea_error_previo           = 0.0f;
             linea_error_ema            = 0.0f;
@@ -3266,7 +3250,6 @@ static void Ctrl_DeteccionCaida(void)
             velocidad_est       = 0.0f;
             velocidad_est_ema     = 0.0f;
             velocidad_est_lenta_ema = 0.0f;
-            vel_desde_accel     = 0.0f;
             setpoint_dinamico_objetivo   = SETPOINT_ANGLE + setpoint_trim;
             setpoint_dinamico_final = SETPOINT_ANGLE + setpoint_trim;
             setpoint_base_rampeado    = SETPOINT_ANGLE + setpoint_trim;
@@ -3596,7 +3579,6 @@ static void LineState_Lost(void)
         linea_integral       = 0.0f;
         linea_error_previo     = 0.0f;
         linea_perdida_ms        = HAL_GetTick();
-        linea_direccion_fb_int   = 0.0f;
         linea_estado          = LINE_STATE_FOLLOWING;
     } else {
         linea_estado          = LINE_STATE_LOST_BRAKE;
@@ -3626,7 +3608,6 @@ static void LineState_LostBrake(void)
         linea_integral        = 0.0f;
         linea_error_previo      = 0.0f;
         linea_perdida_ms         = HAL_GetTick();
-        linea_direccion_fb_int    = 0.0f;
         linea_estado           = LINE_STATE_FOLLOWING;
         lrot_freno_inicio_ms  = 0;
         return;
@@ -5575,9 +5556,6 @@ int main(void)
 
   tmo100ms = 10;
   es10ms   = 0;
-  es250us  = 0;
-  contador_mpu6050 = 0;
-  contador_alive = 0;
 
   motor_derecho_velocidad = 0;
   motor_izquierdo_velocidad  = 0;
