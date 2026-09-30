@@ -709,7 +709,7 @@ static float    accel_movimiento_ema             = 0.0f;  // variación reciente
 static uint32_t lrot_freno_inicio_ms        = 0;  // inicio del frenado previo al giro 180°
 static uint8_t  linea_ciclos_quietos          = 0;  // ciclos consecutivos con velocidad cruda baja (gate de quietud de LOST_BRAKE/EDGE_WAIT)
 static uint32_t lrot_asentar_inicio_ms       = 0;  // inicio de la pausa de estabilización post-180°
-static uint32_t borde_espera_inicio_ms         = 0;  // inicio del frenado previo al giro de 90° (perdida por un extremo)
+static uint32_t borde_espera_inicio_ms         = 0;  // inicio del frenado previo al giro de 45° (perdida por un extremo)
 static uint8_t  obj_rot_inicializado  = 0;
 static int32_t  obj_rot_der0           = 0;
 static int32_t  obj_rot_izq0           = 0;
@@ -1520,6 +1520,44 @@ static float   pwm_saturado = 0.0f;                   // PWM común final (±50)
 static uint8_t flag_saturacion = 0;
 static float   log_p_line = 0.0f, log_i_line = 0.0f, log_d_line = 0.0f;
 
+// Reinicios compartidos: cada grupo conserva sus asignaciones y su orden.
+static void ReiniciarSetpoints(void)
+{
+    setpoint_dinamico_objetivo = SETPOINT_ANGLE + setpoint_trim;
+    setpoint_dinamico_final = SETPOINT_ANGLE + setpoint_trim;
+    setpoint_base_rampeado = SETPOINT_ANGLE + setpoint_trim;
+    setpoint_freno_rampeado = 0.0f;
+}
+
+static void ReiniciarVelocidad(void)
+{
+    velocidad_est = 0.0f;
+    velocidad_est_ema = 0.0f;
+    velocidad_est_lenta_ema = 0.0f;
+}
+
+static void ReiniciarPIDLinea(void)
+{
+    linea_integral = 0.0f;
+    linea_error_previo = 0.0f;
+    linea_error_ema = 0.0f;
+}
+
+static void ReiniciarEstadoGiro(void)
+{
+    obj_rot_inicializado = 0;
+    obj_rot_fase = 0;
+    obj_rot_rumbo = 0.0f;
+    obj_rot_fase1_ms = 0;
+}
+
+static void RegistrarLineaRecuperada(void)
+{
+    linea_vista_desde_entrada = 1;
+    linea_integral = 0.0f;
+    linea_error_previo = 0.0f;
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Etapa 1 — Lectura del IMU + métrica de manipulación.
 // Devuelve 0 si el MPU todavía no tiene dato nuevo (el ciclo no corre).
@@ -1973,14 +2011,9 @@ static void Ctrl_LecturaYVelocidadLinea(void)
                 obj_esquive_dir      = obj_esquive_prox_dir;
                 obj_esquive_prox_dir = (int8_t)-obj_esquive_prox_dir;   // Alternancia de sentido: invierte el signo en cada objeto
                 ajuste_direccion = 0.0f;
-                linea_integral       = 0.0f;
-                linea_error_previo     = 0.0f;
-                linea_error_ema      = 0.0f;
+                ReiniciarPIDLinea();
                 obj_rev_rumbo_rampeado     = 0.0f;
-                obj_rot_inicializado = 0;
-                obj_rot_fase       = 0;
-                obj_rot_rumbo     = 0.0f;
-                obj_rot_fase1_ms   = 0;
+                ReiniciarEstadoGiro();
                 obj_pared_linea_confirma_cnt = 0;
             }
         }
@@ -2100,10 +2133,7 @@ static void Ctrl_LecturaYVelocidadLinea(void)
                         obj_giro_final_pendiente_ms = 0;	// Seteo banderas para realizar el giro
                         perpendicular_obj_freno_inicio_ms = 0;
                         linea_estado          = LINE_STATE_PERPENDICULAR_ROTATE;
-                        obj_rot_inicializado = 0;
-                        obj_rot_fase       = 0;
-                        obj_rot_rumbo     = 0.0f;
-                        obj_rot_fase1_ms   = 0;
+                        ReiniciarEstadoGiro();
                         obj_rot_inicio_ms    = 0;
                         ajuste_direccion = 0.0f;
                     }
@@ -2145,14 +2175,14 @@ static void Ctrl_LecturaYVelocidadLinea(void)
         // La recta 1 − |e|/0.45 vale 1 centrado y llega a 0 con |e|=0.45
         // (línea ya bien afuera del centro); elevarla al cuadrado hace la
         // caída suave cerca del centro (0.1 de error solo quita ~40%) y
-        // agresiva en curvas (0.3 de error quita ~90%): recto rápido, curva lento.
-        // Floor 10%: en curva cerrada el robot frena casi al mínimo (era 25%).
-        // Sin floor: factor_velocidad→0 → linea_pi_angulo_pedido=0 → pwm_saturado→0 → spin puro.
+        // agresiva en curvas: recto rápido, curva lento.
+        // Con línea visible, la velocidad deseada tiene un piso del 20% del objetivo.
+        // Sin línea visible, la velocidad deseada es cero.
         float factor_velocidad = fmaxf(0.0f, 1.0f - fabsf(linea_error) / 0.45f);   // Interpolacion lineal: 1 centrado, 0 con |e|>=0.45
         factor_velocidad *= factor_velocidad;   // Al cuadrado: caida suave cerca del centro, agresiva en curva
         linea_vel_avance_deseada = linea_detectada_cruda
             ? fmaxf(LINE_SPEED_TARGET * 0.20f, LINE_SPEED_TARGET * factor_velocidad)
-            : 0.0f;	// Si la velocidad calculada es mayor que el 20% de la velocidad de linea (predeter. 2,5m/s)
+            : 0.0f;	// Con línea: máximo entre el piso del 20% y la velocidad calculada
 
         // Para el PI de línea el deadband debe ser de tipo "cero o valor real".
         float linea_vel_avance_cruda = fmaxf(0.0f, -velocidad_est_ema);	// Solo guardo la velocidad hacia adelante (negativo=adelante)
@@ -2232,13 +2262,6 @@ static void Ctrl_LecturaYVelocidadLinea(void)
             linea_pi_angulo_pedido = 0.0f;	// Dejo de pedir avance
         }
 
-    } else if ((estado_robot == ROBOT_STATE_BALANCE_AND_SPEED) ||	// Si no estoy en modo seguidor de linea
-               (estado_robot == ROBOT_STATE_BALANCE_ONLY)) {
-        // velocidad_est ya actualizado desde encoders al inicio del ciclo
-        linea_detectada = 0;	// Reseteo variables y flags
-        linea_detectada_cruda = 0;
-        linea_detect_confirma_cnt = 0;
-        linea_detect_libera_cnt = 0;
     } else {
         linea_detectada = 0;
         linea_detectada_cruda = 0;
@@ -2284,13 +2307,9 @@ static void Ctrl_CambiosDeEstado(void)
         display_before_line = f_cambiar_pantalla;  // guardar display actual
         f_cambiar_pantalla    = 1;                 // cambiar al display de línea
         integral            = 0.0f;
-        linea_integral       = 0.0f;
-        linea_error_previo     = 0.0f;
-        linea_error_ema      = 0.0f;
+        ReiniciarPIDLinea();
         ajuste_direccion = 0.0f;
-        velocidad_est        = 0.0f;
-        velocidad_est_ema      = 0.0f;
-        velocidad_est_lenta_ema = 0.0f;
+        ReiniciarVelocidad();
         linea_integral_velocidad   = 0.0f;
         linea_deficit_angulo_extra = 0.0f;
         linea_escape_reversa_angulo  = 0.0f;
@@ -2307,10 +2326,7 @@ static void Ctrl_CambiosDeEstado(void)
         obj_esquive_prox_dir = 1;
         linea_centrada_al_perder = 1;
         ultimo_detectado_solo_borde   = 0;
-        setpoint_dinamico_objetivo    = SETPOINT_ANGLE + setpoint_trim;
-        setpoint_dinamico_final  = SETPOINT_ANGLE + setpoint_trim;
-        setpoint_base_rampeado     = SETPOINT_ANGLE + setpoint_trim;
-        setpoint_freno_rampeado    = 0.0f;
+        ReiniciarSetpoints();
         linea_perdida_ms        = HAL_GetTick();
         perdida_avance_integral_vel = 0.0f;
         todos_negros_inicio_ms  = 0;
@@ -2353,10 +2369,7 @@ static void Ctrl_CambiosDeEstado(void)
         integral            = 0.0f;
         pwm_saturado_prev        = 0.0f;
         rueda_posc_anclada     = 0;   // estación por rueda: ancla nueva al entrar
-        setpoint_dinamico_objetivo    = SETPOINT_ANGLE + setpoint_trim;
-        setpoint_dinamico_final  = SETPOINT_ANGLE + setpoint_trim;
-        setpoint_base_rampeado     = SETPOINT_ANGLE + setpoint_trim;
-        setpoint_freno_rampeado    = 0.0f;
+        ReiniciarSetpoints();
     }
 
     if ((estado_robot == ROBOT_STATE_BALANCE_ONLY ||
@@ -2366,13 +2379,8 @@ static void Ctrl_CambiosDeEstado(void)
 
         integral            = 0.0f;
         ajuste_direccion = 0.0f;
-        velocidad_est        = 0.0f;
-        velocidad_est_ema      = 0.0f;
-        velocidad_est_lenta_ema = 0.0f;
-        setpoint_dinamico_objetivo    = SETPOINT_ANGLE + setpoint_trim;
-        setpoint_dinamico_final  = SETPOINT_ANGLE + setpoint_trim;
-        setpoint_base_rampeado     = SETPOINT_ANGLE + setpoint_trim;
-        setpoint_freno_rampeado    = 0.0f;
+        ReiniciarVelocidad();
+        ReiniciarSetpoints();
         pwm_saturado_prev        = 0.0f;
         rueda_posc_anclada     = 0;   // estación por rueda: ancla nueva al entrar
                                    // (sin esto quedaba el ancla del modo anterior
@@ -2631,7 +2639,7 @@ static void Ctrl_SetpointDinamico(void)	// Depende del modo en el que este, cont
             linea_deficit_angulo_extra   = 0.0f;
             linea_escape_reversa_angulo    = 0.0f;
         } else if (linea_estado == LINE_STATE_EDGE_ASENTAR) {
-            // Estabilización post-90°: upright con freno de encoders, sin avance
+            // Estabilización post-45°: upright con freno de encoders, sin avance
             setpoint_base_objetivo  = SETPOINT_ANGLE + setpoint_trim;
             setpoint_freno_objetivo = Freno_AnguloSegunModo(ROBOT_STATE_BALANCE_ONLY);
             linea_deficit_angulo_extra   = 0.0f;
@@ -3135,20 +3143,13 @@ static void Ctrl_DeteccionCaida(void)
             f_caido = 1;
             integral            = 0.0f;
             balance_hold_activo = 0;
-            velocidad_est        = 0.0f;
-            velocidad_est_ema      = 0.0f;
-            velocidad_est_lenta_ema = 0.0f;
-            linea_integral       = 0.0f;
-            linea_error_previo     = 0.0f;
-            linea_error_ema      = 0.0f;
+            ReiniciarVelocidad();
+            ReiniciarPIDLinea();
             ajuste_direccion = 0.0f;
             giro_dps_clampeado              = 0.0f;
             motor_derecho_velocidad  = 0;
             motor_izquierdo_velocidad   = 0;
-            setpoint_dinamico_objetivo    = SETPOINT_ANGLE + setpoint_trim;
-            setpoint_dinamico_final  = SETPOINT_ANGLE + setpoint_trim;
-            setpoint_base_rampeado     = SETPOINT_ANGLE + setpoint_trim;
-            setpoint_freno_rampeado    = 0.0f;
+            ReiniciarSetpoints();
             pwm_saturado_prev        = 0.0f;
             obj_rev_rumbo_rampeado     = 0.0f;
             perdida_avance_integral_vel = 0.0f;
@@ -3223,17 +3224,10 @@ static void Ctrl_DeteccionCaida(void)
             roll_filtrado_grados = accel_angulo_grados;
             integral                  = 0.0f;
             balance_hold_activo       = 0;
-            velocidad_est              = 0.0f;
-            velocidad_est_ema            = 0.0f;
-            velocidad_est_lenta_ema       = 0.0f;
-            linea_integral             = 0.0f;
-            linea_error_previo           = 0.0f;
-            linea_error_ema            = 0.0f;
+            ReiniciarVelocidad();
+            ReiniciarPIDLinea();
             ajuste_direccion       = 0.0f;
-            setpoint_dinamico_objetivo    = SETPOINT_ANGLE + setpoint_trim;
-            setpoint_dinamico_final  = SETPOINT_ANGLE + setpoint_trim;
-            setpoint_base_rampeado     = SETPOINT_ANGLE + setpoint_trim;
-            setpoint_freno_rampeado    = 0.0f;
+            ReiniciarSetpoints();
             contador_parado       = 0;
             contador_boca_abajo   = 0;
             contador_caida          = 0;
@@ -3247,13 +3241,8 @@ static void Ctrl_DeteccionCaida(void)
             giro_dps_clampeado = 0.0f;
             roll_filtrado_grados = accel_angulo_grados;
             integral           = 0.0f;
-            velocidad_est       = 0.0f;
-            velocidad_est_ema     = 0.0f;
-            velocidad_est_lenta_ema = 0.0f;
-            setpoint_dinamico_objetivo   = SETPOINT_ANGLE + setpoint_trim;
-            setpoint_dinamico_final = SETPOINT_ANGLE + setpoint_trim;
-            setpoint_base_rampeado    = SETPOINT_ANGLE + setpoint_trim;
-            setpoint_freno_rampeado   = 0.0f;
+            ReiniciarVelocidad();
+            ReiniciarSetpoints();
             ajuste_direccion = 0.0f;
         }
     }
@@ -3558,7 +3547,7 @@ static void LineState_Following(void)
             linea_centrada_al_perder = !ultimo_detectado_solo_borde;
             ultimo_detectado_solo_borde   = 0;
             // Centrado → secuencia de giro 180° (LOST/LOST_BRAKE/LOST_ROTATE).
-            // Por un extremo (curva) → secuencia de giro 90° hacia ese lado
+            // Por un extremo (curva) → secuencia de giro 45° hacia ese lado
             // (EDGE_WAIT/EDGE_ROTATE/EDGE_AVANZA).
             linea_estado = linea_centrada_al_perder
                        ? LINE_STATE_LOST
@@ -3575,9 +3564,7 @@ static void LineState_Following(void)
 static void LineState_Lost(void)
 {
     if (linea_detectada) {
-        linea_vista_desde_entrada = 1;
-        linea_integral       = 0.0f;
-        linea_error_previo     = 0.0f;
+        RegistrarLineaRecuperada();
         linea_perdida_ms        = HAL_GetTick();
         linea_estado          = LINE_STATE_FOLLOWING;
     } else {
@@ -3626,10 +3613,7 @@ static void LineState_LostBrake(void)
         // salida de LINE_STATE_FOLLOWING); el caso "por los extremos" va
         // directo a LINE_STATE_EDGE_WAIT y nunca pasa por este estado.
         linea_estado          = LINE_STATE_LOST_ROTATE;
-        obj_rot_inicializado = 0;
-        obj_rot_fase       = 0;
-        obj_rot_rumbo     = 0.0f;
-        obj_rot_fase1_ms   = 0;
+        ReiniciarEstadoGiro();
         obj_rot_inicio_ms    = 0;
         lrot_freno_inicio_ms = 0;
     }
@@ -3720,9 +3704,7 @@ static void LineState_LostRotate(void)
             // Bypass de LOST_ASENTAR: arranca a avanzar sin esperar. Si ya
             // quedó sobre la línea, directo a FOLLOWING.
             if (linea_detectada) {
-                linea_vista_desde_entrada = 1;
-                linea_integral         = 0.0f;
-                linea_error_previo       = 0.0f;
+                RegistrarLineaRecuperada();
                 linea_perdida_ms          = HAL_GetTick();
                 linea_estado            = LINE_STATE_FOLLOWING;
             } else {
@@ -3770,9 +3752,7 @@ static void LineState_LostAsentar(void)
     ajuste_direccion = 0.0f;
 
     if (linea_detectada) {
-        linea_vista_desde_entrada = 1;
-        linea_integral         = 0.0f;
-        linea_error_previo       = 0.0f;
+        RegistrarLineaRecuperada();
         linea_perdida_ms          = HAL_GetTick();
         linea_estado            = LINE_STATE_FOLLOWING;
         lrot_asentar_inicio_ms  = 0;
@@ -3808,9 +3788,7 @@ static void LineState_LostAvanza(void)
     // 5s a pedido del usuario para dar más tiempo de búsqueda).
     const uint32_t PERDIDA_AVANCE_TIMEOUT_MS = 10000U;
     if (linea_detectada) {
-        linea_vista_desde_entrada = 1;
-        linea_integral     = 0.0f;
-        linea_error_previo   = 0.0f;
+        RegistrarLineaRecuperada();
         linea_perdida_ms      = HAL_GetTick();
         linea_estado        = LINE_STATE_FOLLOWING;
         ajuste_direccion = 0.0f;
@@ -3872,7 +3850,7 @@ static void LineState_LostAvanza(void)
 static void LineState_EdgeWait(void)
 {
     // Perdida por un extremo (curva): frena hasta velocidad baja (o
-    // timeout) antes del giro de 90°. La entrada a este estado ya
+    // timeout) antes del giro de 45°. La entrada a este estado ya
     // ocurrió >=1s después de perder la línea (ver salida de FOLLOWING),
     // así que solo falta esperar a que el robot esté quieto.
     // Mismo gate de quietud sostenida que LOST_BRAKE (ver comentario ahí).
@@ -3896,10 +3874,7 @@ static void LineState_EdgeWait(void)
     if (linea_ciclos_quietos >= EWAIT_QUIET_CYCLES ||
         elapsed >= EWAIT_TIMEOUT) {
         linea_estado          = LINE_STATE_EDGE_ROTATE;
-        obj_rot_inicializado = 0;
-        obj_rot_fase       = 0;
-        obj_rot_rumbo     = 0.0f;
-        obj_rot_fase1_ms   = 0;
+        ReiniciarEstadoGiro();
         obj_rot_inicio_ms    = 0;
         borde_espera_inicio_ms  = 0;
     }
@@ -3908,14 +3883,10 @@ static void LineState_EdgeWait(void)
 // EDGE_ROTATE: gira 45° hacia el lado por el que se fue la línea.
 static void LineState_EdgeRotate(void)
 {
-    // Gira 60° (antes 90°, a pedido del usuario) hacia el lado donde se
-    // vio la línea por última vez (linea_busqueda_dir: +1=izquierda,
-    // -1=derecha, convención "izq=positivo"). Misma lógica giro_z+encoder
-    // que LOST_ROTATE. No sale anticipadamente si ve la línea (igual
-    // que LOST_ROTATE) — siempre completa el giro por encoder.
-    // Bajado de 60° a 45°. EROT_ENC_TARGET y
-    // EROT_SLOWDOWN_DEG escalados en proporción 45/90 respecto a los
-    // valores base de 90° (440 y 55).
+    // Objetivo de giro: 45°, con sentido dado por linea_busqueda_dir.
+    // Referencia de encoder: 220 counts; desaceleración en los últimos 28°.
+    // No termina por detectar línea: sale por encoder y tiempo mínimo de
+    // frenado, por timeout o por exceso de giro medido con gyro/encoder.
     const float  EROT_ENC_TARGET   = 220.0f;
     const float  EROT_PIVOT        = 14.0f;
     const float  EROT_BRAKE        = 16.0f;  // ver comentario en LOST_ROTATE
@@ -3984,9 +3955,7 @@ static void LineState_EdgeRotate(void)
             // Si ya quedó justo sobre la línea al terminar el giro, no hace
             // falta avanzar nada: directo a FOLLOWING.
             if (linea_detectada) {
-                linea_vista_desde_entrada = 1;
-                linea_integral         = 0.0f;
-                linea_error_previo       = 0.0f;
+                RegistrarLineaRecuperada();
                 linea_perdida_ms          = HAL_GetTick();
                 linea_estado            = LINE_STATE_FOLLOWING;
                 lrot_asentar_inicio_ms  = 0;
@@ -4114,9 +4083,7 @@ static void LineState_PerpendicularRotate(void)
             linea_estado = LINE_STATE_FOLLOWING;
             perpendicular_desde_esquive = 0;
             perpendicular_obj_freno_inicio_ms = 0;
-            linea_vista_desde_entrada = 1;
-            linea_integral       = 0.0f;
-            linea_error_previo     = 0.0f;
+            RegistrarLineaRecuperada();
             linea_perdida_ms        = HAL_GetTick();
             obj_rot_inicializado = 0;
             obj_rot_fase       = 0;
@@ -4153,7 +4120,7 @@ static void LineState_PerpendicularRotate(void)
 // EDGE_ASENTAR: pausa de estabilización post-45° antes de avanzar.
 static void LineState_EdgeAsentar(void)
 {
-    // Post-90°: pausa de estabilización idéntica a LOST_ASENTAR (mismo
+    // Post-45°: pausa de estabilización idéntica a LOST_ASENTAR (mismo
     // fix: timeout es colchón de seguridad, no corte normal).
     const uint32_t BORDE_ASENTAR_MIN_MS   = 400U;
     const uint32_t BORDE_ASENTAR_TIMEOUT_MS  = 3000U;
@@ -4164,9 +4131,7 @@ static void LineState_EdgeAsentar(void)
     ajuste_direccion = 0.0f;
 
     if (linea_detectada) {
-        linea_vista_desde_entrada = 1;
-        linea_integral         = 0.0f;
-        linea_error_previo       = 0.0f;
+        RegistrarLineaRecuperada();
         linea_perdida_ms          = HAL_GetTick();
         linea_estado            = LINE_STATE_FOLLOWING;
         lrot_asentar_inicio_ms  = 0;
@@ -4198,9 +4163,7 @@ static void LineState_EdgeAvanza(void)
     // colchón de seguridad → reposo total (GIVEN_UP).
     const uint32_t BORDE_AVANCE_TIMEOUT_MS = 10000U;
     if (linea_detectada) {
-        linea_vista_desde_entrada = 1;
-        linea_integral     = 0.0f;
-        linea_error_previo   = 0.0f;
+        RegistrarLineaRecuperada();
         linea_perdida_ms      = HAL_GetTick();
         linea_estado        = LINE_STATE_FOLLOWING;
         ajuste_direccion = 0.0f;
@@ -4255,9 +4218,7 @@ static void LineState_GivenUp(void)
 {
     ajuste_direccion = 0.0f;
     if (linea_detectada) {
-        linea_vista_desde_entrada = 1;
-        linea_integral       = 0.0f;
-        linea_error_previo     = 0.0f;
+        RegistrarLineaRecuperada();
         linea_perdida_ms        = HAL_GetTick();
         linea_estado          = LINE_STATE_FOLLOWING;
     }
@@ -4322,9 +4283,7 @@ static void LineState_ObjFrenoReversa(void)
             obj_frente_confirmado        = 0;
             obj_rev_rumbo_rampeado            = 0.0f;
             ajuste_direccion        = 0.0f;
-            linea_integral              = 0.0f;
-            linea_error_previo            = 0.0f;
-            linea_error_ema             = 0.0f;
+            ReiniciarPIDLinea();
             linea_perdida_ms               = now;
             return;
         }
@@ -4384,10 +4343,7 @@ static void LineState_ObjFrenoReversa(void)
          (now - obj_freno_inicio_ms) >= OBJ_DISTANCIA_TIMEOUT_MS) &&
         obj_frente_confirmado) {
         linea_estado          = LINE_STATE_OBJ_GIRO_ESQUIVE;
-        obj_rot_inicializado = 0;
-        obj_rot_fase       = 0;
-        obj_rot_rumbo     = 0.0f;
-        obj_rot_fase1_ms   = 0;
+        ReiniciarEstadoGiro();
         ajuste_direccion = 0.0f;
         obj_freno_inicio_ms  = 0;
         obj_pre_giro_ms   = 0;
@@ -4576,9 +4532,7 @@ static void LineState_ObjPausaGiro(void)
     }
     if (f_caido) {
         linea_estado        = LINE_STATE_FOLLOWING;
-        linea_integral     = 0.0f;
-        linea_error_previo   = 0.0f;
-        linea_error_ema    = 0.0f;
+        ReiniciarPIDLinea();
         linea_perdida_ms      = HAL_GetTick();
         obj_hold_inicio_ms = 0;
         obj_ignorar_hasta_ms = HAL_GetTick() + 5000U;
@@ -4643,9 +4597,7 @@ static void LineState_ObjBordearPared(void)
         obj_pared_linea_confirma_cnt = 0;
         obj_giro_final_pendiente_ms = HAL_GetTick();
         linea_estado          = LINE_STATE_FOLLOWING;
-        linea_integral       = 0.0f;
-        linea_error_previo     = 0.0f;
-        linea_error_ema      = 0.0f;
+        ReiniciarPIDLinea();
         linea_perdida_ms        = HAL_GetTick();
         ajuste_direccion = 0.0f;
         obj_pared_avance_inicio_ms = 0;
@@ -4721,9 +4673,7 @@ static void LineState_ObjParedLibre(void)
         obj_pared_linea_confirma_cnt = 0;
         obj_giro_final_pendiente_ms = HAL_GetTick();
         linea_estado          = LINE_STATE_FOLLOWING;
-        linea_integral       = 0.0f;
-        linea_error_previo     = 0.0f;
-        linea_error_ema      = 0.0f;
+        ReiniciarPIDLinea();
         linea_perdida_ms        = HAL_GetTick();
         ajuste_direccion = 0.0f;
         obj_pared_libre_inicializado = 0;
@@ -4774,9 +4724,7 @@ static void LineState_ObjGiroPared(void)
         obj_pared_linea_confirma_cnt = 0;
         obj_giro_final_pendiente_ms = HAL_GetTick();
         linea_estado          = LINE_STATE_FOLLOWING;
-        linea_integral       = 0.0f;
-        linea_error_previo     = 0.0f;
-        linea_error_ema      = 0.0f;
+        ReiniciarPIDLinea();
         linea_perdida_ms        = HAL_GetTick();
         ajuste_direccion = 0.0f;
         linea_pivot_activo   = 0;
@@ -5567,10 +5515,7 @@ int main(void)
   KD_value = KD;
   KI_value = KI;
   KV_brake_value = KV_FRENO_FUERTE;
-  setpoint_dinamico_objetivo = SETPOINT_ANGLE + setpoint_trim;
-  setpoint_dinamico_final = SETPOINT_ANGLE + setpoint_trim;
-  setpoint_base_rampeado = SETPOINT_ANGLE + setpoint_trim;
-  setpoint_freno_rampeado = 0.0f;
+  ReiniciarSetpoints();
 
   // Initialize DWT for micros()
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
