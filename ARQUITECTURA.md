@@ -31,7 +31,7 @@ flowchart TB
 
     subgraph FW["FIRMWARE STM32F411 @ 96 MHz"]
         CTRL["Lazo de control 100 Hz<br/>ControlCiclo10ms"]
-        LOOP["while(1)<br/>tareas no criticas"]
+        BUCLE["while(1)<br/>tareas no criticas"]
     end
 
     subgraph EXT_OUT["Actuadores y UI"]
@@ -44,15 +44,15 @@ flowchart TB
 
     MPU -->|"I2C1 + DMA<br/>14 bytes"| CTRL
     ENC -->|"polling 4 kHz<br/>TIM2"| CTRL
-    ADC -->|"DMA circular<br/>trigger TIM2"| LOOP
-    KEY -->|"gestos"| LOOP
+    ADC -->|"DMA circular<br/>trigger TIM2"| BUCLE
+    KEY -->|"gestos"| BUCLE
 
     CTRL -->|"2 porcentajes<br/>firmados"| MOT
-    LOOP --> OLED
-    LOOP --> LED
+    BUCLE --> OLED
+    BUCLE --> LED
 
     CTRL <-->|"USB CDC<br/>protocolo UNER"| QT
-    LOOP <-->|"WiFi UDP<br/>:30000 RX / :30010 TX"| QT
+    BUCLE <-->|"WiFi UDP<br/>:30000 RX / :30010 TX"| QT
 
     style FW fill:#e8f0fe,stroke:#4285f4,stroke-width:2px
     style QT fill:#fff4e5,stroke:#f9ab00,stroke-width:2px
@@ -274,14 +274,14 @@ app sin que el compilador diga nada.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant TIM1 as TIM1 @100Hz
-    participant Loop as while(1)
+    participant TIM1 as TIM1 100Hz
+    participant Bucle as bucle while
     participant Ciclo as ControlCiclo10ms
     participant Mot as control_motores
 
-    TIM1->>Loop: es10ms = 1
-    Note over Loop: el ISR solo marca el flag,<br/>el trabajo corre en el loop
-    Loop->>Ciclo: mpu_dato_listo_ctrl?
+    TIM1->>Bucle: es10ms = 1
+    Note over Bucle: el ISR solo marca el flag,<br/>el trabajo corre en el bucle
+    Bucle->>Ciclo: mpu_dato_listo_ctrl?
 
     Ciclo->>Ciclo: 1. Ctrl_LeerIMU
     Note right of Ciclo: sin dato nuevo -> RETURN
