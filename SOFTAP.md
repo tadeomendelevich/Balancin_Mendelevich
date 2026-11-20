@@ -10,12 +10,16 @@
 - En Windows conectarse a esa red (la indicación «sin Internet» es normal).
 - En Qt elegir **Directo al robot (SoftAP)**. El socket UDP se abre al iniciar Qt;
   si se cerró manualmente, usar **Abrir UDP**. Qt envía descubrimiento cada 2 s.
-- Alternativa con USB: conectar el puerto serial en Qt, seleccionar la conexión
-  y pulsar **Aplicar modo al robot por USB**. El firmware acepta el cambio solo
-  en **IDLE**. Reinicia únicamente la ESP; el modo elegido dura hasta reiniciar
-  la Black Pill. No se escribe Flash del STM32.
-- Para volver a Station: elegir Router y aplicarlo por USB, o reiniciar sin KEY;
-  reconectar Windows al router y elegir Router en Qt.
+- Con Qt conectado al robot por Wi-Fi, seleccionar la conexión deseada y pulsar
+  **Aplicar modo al robot**. Qt envía la orden por UDP al modo actual; el robot
+  debe estar en **IDLE**. También se admite USB si no hay enlace Wi-Fi.
+  La ESP se reinicia después de enviar la respuesta. El modo elegido dura hasta
+  reiniciar la Black Pill. No se escribe Flash del STM32.
+- Al pasar de Station a SoftAP, conectar Windows a **Balancin** después de
+  recibir la confirmación. Al volver a Station, reconectar Windows al router.
+- Para volver a Station: con Windows todavía conectado a **Balancin**, elegir
+  Router en Qt y pulsar **Aplicar modo al robot**. Tras recibir el ACK, conectar
+  Windows al router. Otra opción es reiniciar sin KEY.
 
 No hay cambio automático ni modo híbrido: se evita cambiar de red durante una
 maniobra. El selector de Qt elige cómo buscar al robot; el botón separado es el
@@ -47,9 +51,10 @@ Nuevos comandos UNER:
 | `0xDD` SET_WIFI_MODE | 1 byte: 1=Station, 2=SoftAP | ACK `0x0D` o rechazo `0xFF`, seguido del modo solicitado |
 | `0xDE` GET_WIFI_STATUS | sin datos | modo, red lista, socket listo, cliente conocido (4 bytes), IP ASCII en 16 bytes con cero final |
 
-El cambio se difiere 300 ms para entregar el ACK. Se revalida IDLE antes de
-aplicarlo. El firmware acepta el comando por UNER; la UI lo envía exclusivamente
-por USB para conservar un canal de recuperación al cambiar de red.
+El cambio se difiere al menos 300 ms y espera a que termine el envío UDP
+pendiente, hasta un máximo de 5 s. Se revalida IDLE antes de aplicarlo.
+La UI envía el comando por el enlace Wi-Fi activo, o por USB si solo ese
+enlace está disponible. Cambiar el selector de Qt no cambia la red de Windows.
 
 ## Driver y compatibilidad AT
 
@@ -83,7 +88,9 @@ ni reemplaza la prueba de radio, alimentación y latencia con el robot real.
 2. Reiniciar manteniendo KEY, comprobar SSID y dirección en el OLED, conectar
    Windows y Qt directo. Confirmar asignación DHCP y ACK sin activar motores.
 3. Cerrar/abrir Qt; probar otra notebook después de 10 s sin cliente anterior.
-4. Desde USB probar cambio en IDLE; verificar rechazo estando en modo activo.
+4. Por Wi-Fi probar Station → SoftAP y SoftAP → Station en IDLE; verificar
+   recepción del ACK antes de cambiar Windows de red y rechazo en modo activo.
+   Repetir por USB como vía alternativa.
 5. Repetir prueba de control con el robot en condiciones habituales de ensayo.
 
 ## Respaldo y reversión

@@ -111,7 +111,26 @@ static void test_interleaving(void) {
     ESP01_CloseUDPTCP(); run(10000); assert(!socketUp && phase==CLOSED);
     puts("PASS receive while transmitting, binary prompt byte, explicit close");
 }
+static void test_mode_round_trip(void) {
+    init(1); run(2500); hello("192.168.4.2");
+    uint8_t request[]={'U','N','E','R',3,':',0xDD,1,0};
+    for(unsigned i=0;i<sizeof(request)-1;++i) request[8]^=request[i];
+    datagram("192.168.4.2",30010,request,sizeof(request)); run(30);
+    assert(appW==sizeof(request) && !memcmp(appRx,request,sizeof(request)));
+    ESP01_SetWIFI("TestRouter","testpass");
+    assert(ESP01_StartUDP("192.168.100.5",30010,30000)==ESP01_UDPTCP_CONNECTING);
+    run(2500);
+    assert(mode==ESP01_MODE_STATION && socketUp && networkUp && !peerKnown);
+    assert(!strcmp(ESP01_GetLocalIP(),"192.168.100.20"));
+    hello("192.168.100.77"); assert(peerKnown);
+    ESP01_SetSoftAP("Balancin","Balancin2026");
+    assert(ESP01_StartUDP("192.168.4.1",30010,30000)==ESP01_UDPTCP_CONNECTING);
+    run(2500);
+    assert(mode==ESP01_MODE_SOFTAP && socketUp && networkUp && !peerKnown);
+    assert(!strcmp(ESP01_GetLocalIP(),"192.168.4.1"));
+    puts("PASS SoftAP to Station to SoftAP, UDP command delivery and peer reset");
+}
 int main(void) {
-    test_station(); test_ap(); test_fragmentation(); test_timeouts(); test_interleaving();
+    test_station(); test_ap(); test_fragmentation(); test_timeouts(); test_interleaving(); test_mode_round_trip();
     puts("All ESP01 integration simulations passed."); return 0;
 }

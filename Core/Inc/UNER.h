@@ -247,6 +247,7 @@ void UNER_RegisterBindings(const UNER_Bindings_t *bindings);
 void UNER_PushByte(uint8_t byte);
 
 void UNER_Task(void);
+uint8_t UNER_WifiTxPending(void);
 
 void UNER_SendAlive(void);
 

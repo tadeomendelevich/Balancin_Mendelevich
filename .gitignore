@@ -9,3 +9,4 @@ Debug/
 *.elf
 *.map
 *.list
+__pycache__/

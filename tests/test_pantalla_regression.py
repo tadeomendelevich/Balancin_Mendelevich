@@ -29,6 +29,9 @@ def main():
         ["git", "show", BASE + ":Core/Src/main.c"], cwd=ROOT
     ).decode("utf-8")
     new = (ROOT / "Core/Src/display_oled.c").read_text(encoding="utf-8")
+    current_main = (ROOT / "Core/Src/main.c").read_text(encoding="utf-8")
+    assert current_main.count("Pantalla_MostrarWifi(5000U);") == 1
+    assert "#define WIFI_SPLASH_MS  4000" in current_main
     header = (ROOT / "Core/Inc/display_oled.h").read_text(encoding="utf-8")
     data_type = between(header, "typedef struct {", "} PantallaDatos;") + "} PantallaDatos;\n"
     fields = re.findall(r"^    (\w+) (\w+)(\[[^]]+\])?;", data_type, re.M)
@@ -203,6 +206,10 @@ int main(void) {
     now=39; assert(Pantalla_Procesar(0,&pending,&ready));
     now=UINT32_MAX-10; Pantalla_MostrarWifi(100);
     assert(wifi_splash_hasta_ms==89);
+    now=UINT32_MAX-5; Pantalla_MostrarWifi(5000);
+    assert(wifi_splash_hasta_ms==89); // otro aviso no prolonga la pantalla visible
+    now=90; Pantalla_MostrarWifi(10000);
+    assert(wifi_splash_hasta_ms==5090); // cada aparicion tiene tope de 5 s
     return 0;
 }
 '''

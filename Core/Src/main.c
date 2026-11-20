@@ -517,7 +517,7 @@ static uint16_t adc_mediana[BARRAS_CANTIDAD] = {0};
 
 uint8_t i2c1_tx_ocupado = 0;
 
-uint8_t dato_tx, dato_rx;
+uint8_t dato_rx;
 static uint8_t uner_buffer_rx[RXBUFSIZE];
 static uint8_t uner_buffer_tx[TXBUFSIZE];
 static _sRx    unerRx;
@@ -549,7 +549,7 @@ static const WifiProfile_t wifiProfiles[] = {
 static uint8_t wifi_modo_pendiente = 0;
 static uint32_t wifi_cambio_desde_ms = 0;
 
-#define WIFI_PERFIL_ACTIVO  1   	        /* <<< NUMERO DE RED ELEGIDA >>> */
+#define WIFI_PERFIL_ACTIVO  0   	        /* <<< NUMERO DE RED ELEGIDA >>> */
 
 const char *wifiSSID;
 const char *wifiPassword;
@@ -752,7 +752,6 @@ static uint8_t  perpendicular_desde_esquive   = 0;     // el PERPENDICULAR_ROTAT
 static uint32_t perpendicular_obj_freno_inicio_ms   = 0;     // inicio real del contrafreno suave del giro final de esquive
 static uint32_t obj_pared_acerca_inicio_ms = 0;    // timestamp de entrada a WALL_APPROACH
 static uint32_t obj_pared_avance_inicio_ms = 0;         // timestamp de entrada a OBJ_BORDEAR_PARED (init de PI/estado, no se usa para ignorar línea)
-static uint32_t obj_pared_perdida_ms      = 0;         // (sin uso para ignorar línea, ver obj_pared_sec_inicio_ms)
 static uint8_t  obj_pared_libre_inicializado = 0;     // flag sesión actual de OBJ_PARED_LIBRE
 static uint32_t obj_pared_sec_inicio_ms = 0;         // timestamp de entrada a TODA la secuencia de wall-following
                                                     // (BORDEAR_PARED/PARED_LIBRE/GIRO_PARED); se fija UNA sola vez
@@ -767,7 +766,6 @@ static uint8_t encoder_muestreo_inicializado = 0;
 static uint8_t encoder_der_estado_prev = 0;
 static uint8_t encoder_izq_estado_prev  = 0;
 
-static uint8_t uart_byte_tx = 0;
 
 static int16_t accel_x = 0, accel_y = 0, accel_z = 0;
 static int16_t giro_x = 0, giro_y = 0, giro_z = 0;
@@ -856,7 +854,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin);
 void MPU6050_RegisterPlatform(MPU6050_Platform_t *plat);
 void MPU6050_ProcessDMA(void);
 
-void UpdateADC_MovingAverage(void);
+void ActualizarMedianaADC(void);
 
 void calcular_inclinacion(int16_t accel_x, int16_t accel_y, int16_t accel_z, float *out_roll_deg, float *out_pitch_deg);
 
@@ -1117,7 +1115,7 @@ void calcular_inclinacion(int16_t accel_x, int16_t accel_y, int16_t accel_z,
     *out_pitch_deg = atan2f(-accel_x, denom) * (180.0f / M_PI);   // Trigonometria: cateto opuesto (X) / adyacente (YZ)
 }
 
-void UpdateADC_MovingAverage(void) {
+void ActualizarMedianaADC(void) {
     // Copia coherente de los últimos 32 barridos completos (~8ms). A diferencia
     // del filtro anterior, que elegía una sola de las ~40 secuencias disponibles
     // cada 10ms, la mediana usa el flujo real de 4kHz y rechaza pulsos aislados a
@@ -1191,7 +1189,7 @@ static void Wifi_ApplyMode(uint8_t mode) {
         ESP01_SetWIFI(wifiSSID, wifiPassword);
         ESP01_StartUDP(wifiIp, 30010, 30000);
     }
-    Pantalla_MostrarWifi(10000U);
+    Pantalla_MostrarWifi(5000U);
 }
 
 void appOnESP01ChangeState(_eESP01STATUS state) {
@@ -3170,7 +3168,6 @@ static void Ctrl_DeteccionCaida(void)
             obj_hold_inicio_ms    = 0;
             obj_pared_acerca_inicio_ms = 0;
             obj_pared_avance_inicio_ms      = 0;
-            obj_pared_perdida_ms           = 0;
             obj_pared_sec_inicio_ms      = 0;
             obj_pared_libre_inicializado = 0;
             lrot_freno_inicio_ms        = 0;
@@ -3298,7 +3295,7 @@ static void Ctrl_PIDBalance(void)
         {
             float error_abs = fabsf(error);
             float abs_gyro  = fabsf(giro_dps_clampeado);
-            float balance_escala_pi = 1.0f;
+            float balance_escala_p = 1.0f;
             float balance_escala_d  = 1.0f;
 
             // Excluye también LOST_AVANZA/EDGE_AVANZA/OBJ_BUSCAR_PARED: sin
@@ -3307,7 +3304,7 @@ static void Ctrl_PIDBalance(void)
             // pared) se agregó porque "casi no avanza" — mismo patrón de bug.
             // MANUAL_CONTROL nunca había tenido esta exclusión: con un comando de
             // adelante/atrás activo, apenas la inclinación real se acercaba al
-            // setpoint (error chico) el hold entraba y ponía balance_escala_pi=0,
+            // setpoint (error chico) el hold entraba y ponía balance_escala_p=0,
             // matando la autoridad del PID justo cuando tenía que sostener el
             // avance — la causa real de "el comando llega pero no logra avanzar
             // ni retroceder". Solo se excluye mientras hay un comando activo
@@ -3346,30 +3343,27 @@ static void Ctrl_PIDBalance(void)
                 // x = |error|/1.5° (recortado a 1) es "qué tan lejos del
                 // equilibrio estoy" en escala 0..1; escala_suave recorre la
                 // recta de 0.35 (error 0) a 1.0 (error ≥ 1.5°). Cerca del
-                // equilibrio el PID trabaja al 35% para no vibrar por ruido
-                // de sensor; lejos recupera autoridad completa.
+                // equilibrio P y D se escalan al 35% para reducir la respuesta
+                // al ruido; lejos recuperan su ganancia completa. I no se escala.
                 float x = error_abs / ZONA_SUAVE_ANGULO_GRADOS;   // Normalizacion a escala 0..1
                 if (x > 1.0f) x = 1.0f;
                 float escala_suave = ZONA_SUAVE_ESCALA_MIN + (1.0f - ZONA_SUAVE_ESCALA_MIN) * x;   // Interpolacion lineal (lerp) entre 0.35 y 1.0
 
                 if (balance_hold_activo) {
-                    // Hold: silencia P/I (sin chatter por offset residual de
-                    // angulo) pero deja el D VIVO — parado de verdad D~0 igual
-                    // (gyro en cero), y apenas el robot empieza a caerse el D
-                    // frena la caida ANTES de que el error cruce el umbral de
-                    // salida del hold. Con D tambien apagado (version previa,
-                    //) el hold era "motores muertos hasta que
-                    // la caida ya tomo impulso" -> bamboleo permanente.
-                    balance_escala_pi = 0.0f;
+                    // Hold: anula P y mantiene D con la escala suave.
+                    // I conserva el valor calculado al inicio del ciclo;
+                    // aquí se descarga la integral un 2%; después se aplica
+                    // la acumulación y los límites habituales del ciclo.
+                    balance_escala_p = 0.0f;
                     balance_escala_d  = escala_suave;
                     integral *= 0.98f;   // Decaimiento exponencial: descarga la integral mientras dura el hold
                 } else {
-                    balance_escala_pi = escala_suave;
+                    balance_escala_p = escala_suave;
                     balance_escala_d  = escala_suave;
                 }
             }
 
-            termino_p *= balance_escala_pi;
+            termino_p *= balance_escala_p;
             termino_d *= balance_escala_d;
         }
 
@@ -4633,7 +4627,6 @@ static void LineState_ObjBordearPared(void)
         ajuste_direccion        = 0.0f;
         obj_pared_avance_inicio_ms      = 0;
         obj_pared_libre_inicializado = 0;
-        obj_pared_perdida_ms           = HAL_GetTick();  // arranca la ventana de 2s de ignorar línea en WALL_CLEAR/WALL_TURN
     } else {
         // Avanza hacia adelante con ángulo fijo; yaw-lock se aplica al calcular motores.
         ajuste_direccion = 0.0f;
@@ -5567,7 +5560,7 @@ int main(void)
 
 	      // Estas dos van siempre — son rápidas y críticas
 	      ESP01_Timeout10ms();
-	      UpdateADC_MovingAverage();
+	      ActualizarMedianaADC();
 
 	      // El resto se reparte en subticks
 	      switch (subtick) {
@@ -5604,7 +5597,8 @@ int main(void)
 	      ProcesarBoton();
 	  }
 
-      if (wifi_modo_pendiente && HAL_GetTick() - wifi_cambio_desde_ms >= 300U) {
+      if (wifi_modo_pendiente && HAL_GetTick() - wifi_cambio_desde_ms >= 300U &&
+          (!UNER_WifiTxPending() || HAL_GetTick() - wifi_cambio_desde_ms >= 5000U)) {
           if (estado_robot == ROBOT_STATE_IDLE) Wifi_ApplyMode(wifi_modo_pendiente);
           wifi_modo_pendiente = 0;
       }
@@ -5622,11 +5616,6 @@ int main(void)
           ActualizarPantalla();
       }
 
-	  if (dato_tx && huart1.gState == HAL_UART_STATE_READY) {
-	      uart_byte_tx = dato_tx;
-	      dato_tx = 0;
-	      HAL_UART_Transmit_IT(&huart1, &uart_byte_tx, 1);
-	  }
   }
   /* USER CODE END 3 */
 }

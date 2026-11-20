@@ -42,16 +42,23 @@ static void validReply(unsigned size) {
 int main(void) {
     uint8_t rxBuf[256]={0},txBuf[256]={0}; _sRx r={.buff=rxBuf}; _sTx t={.buff=txBuf};
     UNER_Init(&r,&t); UNER_Bindings_t b={.request_wifi_mode=request}; UNER_RegisterBindings(&b);
+    assert(!UNER_WifiTxPending());
     uint8_t ap=2;
     commandFrame(SET_WIFI_MODE,&ap,1); validReply(10); assert(usb[7]==ACK && usb[8]==2 && requests==1);
+    assert(UNER_WifiTxPending());
     // Busy transport retains the response until the next task iteration.
     idle=0; commandFrame(SET_WIFI_MODE,&ap,1); validReply(10); assert(usb[7]==UNKNOWN && udpReplyCount==1);
+    assert(UNER_WifiTxPending());
     busy=0; UNER_Task(); assert(udpLen==10 && udp[7]==UNKNOWN && udpReplyCount==0);
     unsigned previous=requests; commandFrame(SET_WIFI_MODE,NULL,0); assert(usb[7]==UNKNOWN && requests==previous);
     commandFrame(GET_WIFI_STATUS,NULL,0); validReply(28); assert(usb[7]==1 && usb[10]==1);
     assert(!strcmp((char*)usb+11,"192.168.4.1"));
     modeValue=2; peer=0; busy=0; UNER_Task(); assert(!udpReplyCount);
+    assert(!UNER_WifiTxPending());
     WifiLogData_t telemetry={0}; UNER_SendWifiLogData(&telemetry); assert(!udpReplyCount);
+    idle=1; peer=1; uint8_t station=1;
+    commandFrame(SET_WIFI_MODE,&station,1); validReply(10);
+    assert(usb[7]==ACK && usb[8]==1 && requests==previous+1);
     puts("PASS UNER mode command length, ACK/rejection, status layout, busy reply queue, AP without peer");
     return 0;
 }

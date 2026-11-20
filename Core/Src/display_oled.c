@@ -169,7 +169,11 @@ void Pantalla_Init(I2C_HandleTypeDef *hi2c, uint8_t *busy_flag)
 
 void Pantalla_MostrarWifi(uint32_t duracion_ms)
 {
-    wifi_splash_hasta_ms = HAL_GetTick() + duracion_ms;
+    uint32_t ahora = HAL_GetTick();
+    if (wifi_splash_hasta_ms != 0 &&
+        (int32_t)(wifi_splash_hasta_ms - ahora) > 0) return;
+    if (duracion_ms > 5000U) duracion_ms = 5000U;
+    wifi_splash_hasta_ms = ahora + duracion_ms;
 }
 
 void Pantalla_ForzarActualizacion(void)

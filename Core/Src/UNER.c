@@ -25,6 +25,9 @@ static _sTx *unerTx;
 static uint8_t udpReplies[UDP_REPLY_QUEUE_SIZE][TXBUFSIZE];
 static uint16_t udpReplyLength[UDP_REPLY_QUEUE_SIZE];
 static uint8_t udpReplyHead, udpReplyTail, udpReplyCount;
+uint8_t UNER_WifiTxPending(void) {
+    return udpReplyCount != 0U || ESP01_IsSending();
+}
 static void flushUdpReplies(void) {
     if (ESP01_StateUDPTCP() != ESP01_UDPTCP_CONNECTED ||
         (ESP01_GetMode() == ESP01_MODE_SOFTAP && !ESP01_HasPeer())) {
