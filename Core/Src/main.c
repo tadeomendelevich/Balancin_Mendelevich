@@ -330,7 +330,9 @@
 // Parado no hay rumbo que mantener: el target va a 0 suave por el mismo slew.
 // Mismo signo/convencion que REVERSA_RECTA_KP_VELOCIDAD: si empeora el desvio en
 // vez de corregirlo, probar +1.0.
-#define REVERSA_RECTA_KP_COUNTS  -0.4f  // PWM por count de diferencia acumulada L/R
+#define REVERSA_RECTA_KP_COUNTS  0.0f   // APAGADA a proposito: con cualquier valor negativo (-0.4, -0.2, menos)
+                                        // la reversa salia torcida a la izquierda; sin correccion se va apenas a la
+                                        // derecha y el esquive queda mucho mejor. Original: -0.4 (PWM por count L/R)
 #define REVERSA_RECTA_QUIETO_MS  250U   // ms sin ticks de encoder para considerar "quieto" (sin corrección)
 
 #define LINEA_DETECCION_CONFIRMA_CICLOS  3U     // 30ms: confirma que la línea reapareció
@@ -415,7 +417,7 @@
 // extra y timeout para no pasarse de largo girando).
 #define OBJ_GIRO_ADC_OK            3200.0f  // ADC7 debajo de esto = giro bien terminado
 #define OBJ_GIRO_ADC_OK_CICLOS     3        // ciclos seguidos con ADC7 < GOOD para confirmar (30ms, anti-glitch)
-#define OBJ_GIRO_AJUSTE_EXTRA_MAX  150.0f   // counts extra máximos del ajuste fino (~36°)
+#define OBJ_GIRO_AJUSTE_EXTRA_MAX  40.0f    // counts extra máximos del ajuste fino (~10°): es un retoque, no otro giro
 #define OBJ_GIRO_AJUSTE_EXTRA_MS   1500U    // timeout del ajuste fino
 // Avance buscando la pared: mismo PI de velocidad que OBJ_BORDEAR_PARED (más cauteloso,
 // target más bajo) en vez de ángulo fijo sin ningún control -- se aceleraba sin límite
@@ -444,6 +446,7 @@
 #define OBJ_PARED_PIVOT_POTENCIA         8.0f   // potencia del pivot en WALL_TURN/OBJ_BORDEAR_PARED
 #define OBJ_PARED_LINEA_IGNORAR_MS       5000U  // ms desde la entrada al wall-following en que se ignora la línea (si es corto, ve la línea al arrancar el bordeo y aborta la esquiva)
 #define OBJ_PARED_LINEA_CONFIRMA_CICLOS  5U     // lecturas consecutivas (5×10ms=50ms) antes de abandonar el bordeo por línea
+#define OBJ_PARED_LINEA_MIN_SENSORES     2U     // sensores de línea A LA VEZ sobre el umbral para ARRANCAR esa confirmación (1 solo = ruido)
 #define OBJ_PARED_LIBRE_COUNTS           100    // counts de encoder a avanzar tras perder la pared, antes de girar
 
 
@@ -760,6 +763,7 @@ static uint32_t obj_pared_sec_inicio_ms = 0;         // timestamp de entrada a T
 static int32_t  obj_pared_libre_der0 = 0;
 static int32_t  obj_pared_libre_izq0 = 0;
 static uint8_t  obj_pared_linea_confirma_cnt = 0;     // debounce compartido por los 3 estados de pared
+static uint8_t  linea_sensores_activos       = 0;     // sensores de línea sobre el umbral en ESTE ciclo (sin contar los de cuarentena)
 
 volatile uint8_t contador_tick2ms = 0;
 static uint8_t encoder_muestreo_inicializado = 0;
@@ -1234,6 +1238,12 @@ static uint8_t ObjWall_LineConfirmed(uint8_t linea_detectada, uint8_t linea_igno
         obj_pared_linea_confirma_cnt = 0;
         return 0;
     }
+    // Para ARRANCAR la cuenta hacen falta 2 sensores a la vez: un pico de ruido en
+    // uno solo sacaba al robot del esquive dando vuelta a la caja. Una vez arrancada
+    // sigue con linea_detectada (que se sostiene unos ciclos despues de pasar la
+    // cinta): pedir 2 sensores en CADA ciclo impediria confirmar un cruce rapido.
+    if (obj_pared_linea_confirma_cnt == 0 && linea_sensores_activos < OBJ_PARED_LINEA_MIN_SENSORES)
+        return 0;
     if (obj_pared_linea_confirma_cnt < OBJ_PARED_LINEA_CONFIRMA_CICLOS)
         obj_pared_linea_confirma_cnt++;
     return (obj_pared_linea_confirma_cnt >= OBJ_PARED_LINEA_CONFIRMA_CICLOS);
@@ -2033,11 +2043,13 @@ static void Ctrl_LecturaYVelocidadLinea(void)
         // Sustracción de baseline: peso = señal por encima del fondo de cada sensor.
         // Si el ADC no supera el umbral, contribuye 0 (ruido/luz ambiente).
         float linea_peso[4];
+        linea_sensores_activos = 0;
         for (int i = 0; i < 4; i++) {
             float signal = linea_adc_crudo[i] - ADC_LINEA_BASE[i];   // Sustraccion de baseline: quita el fondo propio de cada sensor
-            linea_peso[i] = (!linea_canal_cuarentena[i] && linea_adc_crudo[i] > LINEA_UMBRAL_ADC)	// Si el sensor no esta en cuarentena
-                 ? fmaxf(signal, 0.0f) : 0.0f;	// ademas, si el sensor da mayor al umbral de deteccion de adc
-        }	// fmaxf(signal, 0.0f) si es valor negativo lo igualo a cero
+            uint8_t sobre_umbral = (!linea_canal_cuarentena[i] && linea_adc_crudo[i] > LINEA_UMBRAL_ADC);	// Si el sensor no esta en cuarentena y supera el umbral
+            linea_peso[i] = sobre_umbral ? fmaxf(signal, 0.0f) : 0.0f;	// fmaxf(signal, 0.0f): si es valor negativo lo igualo a cero
+            if (sobre_umbral) linea_sensores_activos++;	// Cuantos ven linea a la vez (lo usa la confirmacion del bordeado)
+        }
         suma_pesos = linea_peso[0] + linea_peso[1] + linea_peso[2] + linea_peso[3];   // Suma de pesos: denominador del centroide (0 = nadie ve linea)
 
         // Presencia de línea con debounce en ambos sentidos. Antes esta
@@ -2265,6 +2277,7 @@ static void Ctrl_LecturaYVelocidadLinea(void)
     } else {
         linea_detectada = 0;
         linea_detectada_cruda = 0;
+        linea_sensores_activos = 0;
         linea_detect_confirma_cnt = 0;
         linea_detect_libera_cnt = 0;
     }
@@ -2702,8 +2715,15 @@ static void Ctrl_SetpointDinamico(void)	// Depende del modo en el que este, cont
                                               -OBJ_PAUSA_POSICION_ANGULO_MAX, OBJ_PAUSA_POSICION_ANGULO_MAX);   // Tope 1.5 grados: es un hold, no una maniobra
                 }
             }
-            setpoint_base_objetivo  = SETPOINT_ANGLE + setpoint_trim + pausa_angulo_correccion;   // Vertical + trim, corrida lo justo para volver al punto
-            setpoint_freno_objetivo = Freno_AnguloSegunModo(ROBOT_STATE_BALANCE_ONLY);	// Detengo el movimiento mediante la funcion especifica
+            // Termino D: frena la inercia que trae el giro. Mismo amortiguador que la
+            // fase STOP (OBJ_FRENO_REVERSA), donde ya se validó: velocidad RAPIDA y
+            // zona muerta chica. Sin esto el P solo oscila (doble integrador) y el
+            // freno general, con velocidad lenta y zona muerta de 0.35 m/s, llega tarde.
+            float pausa_amortiguacion = clampf_local(
+                OBJ_DISTANCIA_AMORTIGUACION_KV * apply_deadbandf(velocidad_est_ema, OBJ_DISTANCIA_VEL_ZONA_MUERTA),   // Inclina en contra del movimiento
+                -OBJ_DISTANCIA_AMORTIGUACION_MAX, OBJ_DISTANCIA_AMORTIGUACION_MAX);
+            setpoint_base_objetivo  = SETPOINT_ANGLE + setpoint_trim + pausa_angulo_correccion + pausa_amortiguacion;   // Vertical + P (volver al punto) + D (no pasarse)
+            setpoint_freno_objetivo = 0.0f;   // El D reemplaza al freno general (igual que en la fase STOP): no se apilan
             linea_deficit_angulo_extra   = 0.0f;
             linea_escape_reversa_angulo    = 0.0f;
         } else if (linea_estado == LINE_STATE_OBJ_BUSCAR_PARED) {
@@ -4305,7 +4325,10 @@ static void LineState_ObjFrenoReversa(void)
         // actividad de encoders);
         // quieto, el target decae a 0 por el slew (anti-pivoteo).
         float correccion_objetivo = 0.0f;
-        if ((now - obj_rev_ultimo_mov_ms) < REVERSA_RECTA_QUIETO_MS) {
+        // Recien despues del frenado (fase 2): durante el frenado el robot todavia
+        // viene de seguir la linea, girando, y no hay rumbo "derecho" que sostener.
+        if (obj_pre_giro_ms != 0 &&
+            (now - obj_rev_ultimo_mov_ms) < REVERSA_RECTA_QUIETO_MS) {
             correccion_objetivo = clampf_local(
                 REVERSA_RECTA_KP_COUNTS * (float)(rev_dr - rev_dl),
                 -REVERSA_RECTA_MAX, REVERSA_RECTA_MAX);
@@ -4323,6 +4346,17 @@ static void LineState_ObjFrenoReversa(void)
         if (fabsf(velocidad_est_ema) < BRAKE_VEL_THR + 0.10f ||
             (now - obj_freno_inicio_ms) > BRAKE_TIMEOUT) {
             obj_pre_giro_ms = now;  // arranca fase 2
+            // Ancla de la reversa recta: el rumbo con que quedo FRENADO frente al
+            // objeto. Si se anclaba al detectar el objeto (todavia a velocidad y
+            // girando sobre la linea), la curva del frenado se acumulaba como
+            // "desvio" y la correccion la deshacia al retroceder: robot torcido.
+            __disable_irq();
+            obj_rev_der0 = encoder_derecho;
+            obj_rev_izq0 = encoder_izquierdo;
+            __enable_irq();
+            obj_rev_rumbo_rampeado = 0.0f;
+            obj_rev_ultimos_counts = 0;
+            obj_rev_ultimo_mov_ms  = now;
         }
     }
 
@@ -4489,9 +4523,14 @@ static void LineState_ObjGiroEsquive(void)
             obj_rot_adc_ok_cnt = 0;
         }
         float extra_counts = rot_counts - obj_rot_fase2_c0;
+        // Mismo tope de 108 grados que la fase 1. La fase 2 solo sabe girar MAS
+        // (asume que no ver la pared = giro corto): si en realidad el lateral no la
+        // ve por otra razon, sin este tope seguia girando y alejaba el sensor del objeto.
+        int overshoot_fase2 = (abs_heading > LINE_ROT_ABS_TARGET * 1.2f);
 
         if (obj_rot_adc_ok_cnt >= OBJ_GIRO_ADC_OK_CICLOS ||
             extra_counts >= OBJ_GIRO_AJUSTE_EXTRA_MAX ||
+            overshoot_fase2 ||
             (HAL_GetTick() - obj_rot_fase2_ms) > OBJ_GIRO_AJUSTE_EXTRA_MS) {
             obj_rot_inicializado = 0;
             obj_rot_fase       = 0;
