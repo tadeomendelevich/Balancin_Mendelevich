@@ -1991,6 +1991,7 @@ static void Ctrl_LecturaYVelocidadLinea(void)
             }
             if (obj_confirma_cnt >= OBJ_DETECCION_ANTIRREBOTE_CICLOS &&
                 !obj_falso_disparo_bloqueo &&
+                !f_caido &&                                     // Caido, A5-A8 ven el piso de cerca: no es un objeto
                 linea_estado == LINE_STATE_FOLLOWING &&
                 HAL_GetTick() >= obj_ignorar_hasta_ms) {	// Entro en modo esquive, pongo banderas y contadores en 0
                 // Directo a la fase STOP: el hold de distancia frena la inercia
@@ -2119,6 +2120,7 @@ static void Ctrl_LecturaYVelocidadLinea(void)
                 } else {
                     f_en_el_aire = 0;
                     if (linea_estado == LINE_STATE_FOLLOWING &&
+                        !f_caido &&                             // Caido y quieto tambien cuenta como "asentado"
                         accel_asentado &&
                         todo_negro_transcurrido_ms > PERPENDICULAR_ANTIRREBOTE_MS &&
                         todo_negro_transcurrido_ms < PERPENDICULAR_DURACION_MAX_MS &&
@@ -3178,9 +3180,12 @@ static void Ctrl_DeteccionCaida(void)
             linea_acel_avance_ema       = 0.0f;
             linea_vel_avance_prev      = 0.0f;
             linea_prediccion_valida   = 0;
-            // Si se cayó durante la evasión (LINE_STATE_OBJ_*, últimos del enum, de ahí
-            // el ">="), abandona la evasión y vuelve a FOLLOWING en vez de retomarla.
-            if (linea_estado >= LINE_STATE_OBJ_FRENO_REVERSA) {
+            // Si se cayó durante el giro perpendicular o la evasión (PERPENDICULAR_ROTATE
+            // y LINE_STATE_OBJ_*, los últimos del enum, de ahí el ">="), los abandona y
+            // vuelve a FOLLOWING en vez de retomarlos. Este bloque corre UNA vez, al caer:
+            // caído, ningún LineState_* se ejecuta (Ctrl_MezclaMotores sale antes), así
+            // que el sub-estado quedaría congelado y se reanudaría al levantarlo.
+            if (linea_estado >= LINE_STATE_PERPENDICULAR_ROTATE) {
                 linea_estado                 = LINE_STATE_FOLLOWING;
                 linea_vista_desde_entrada      = 0;
                 linea_centrada_al_perder  = 1;
@@ -3233,8 +3238,11 @@ static void Ctrl_DeteccionCaida(void)
             error_previo          = 0.0f;
             rueda_posc_anclada     = 0;   // estación por rueda: ancla nueva tras la caída
         } else {
-            motor_derecho_velocidad = 0;
-            motor_izquierdo_velocidad  = 0;
+            // Sigue caido: corre en CADA ciclo hasta recuperarse.
+            if (estado_robot != ROBOT_STATE_MOTOR_TEST) {   // En MOTOR_TEST los motores los manda Qt, no el PID
+                motor_derecho_velocidad = 0;
+                motor_izquierdo_velocidad  = 0;
+            }
             giro_dps_clampeado = 0.0f;
             roll_filtrado_grados = accel_angulo_grados;
             integral           = 0.0f;
