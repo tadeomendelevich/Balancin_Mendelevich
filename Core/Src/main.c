@@ -447,6 +447,7 @@
 #define OBJ_PARED_LINEA_IGNORAR_MS       5000U  // ms desde la entrada al wall-following en que se ignora la línea (si es corto, ve la línea al arrancar el bordeo y aborta la esquiva)
 #define OBJ_PARED_LINEA_CONFIRMA_CICLOS  5U     // lecturas consecutivas (5×10ms=50ms) antes de abandonar el bordeo por línea
 #define OBJ_PARED_LINEA_MIN_SENSORES     2U     // sensores de línea A LA VEZ sobre el umbral para ARRANCAR esa confirmación (1 solo = ruido)
+#define OBJ_PARED_GIRO_NETO_MAX_GRADOS   450.0f // giro NETO (con signo) de todo el bordeado; rodear la caja entera son 360. Pasado eso gira en circulos: se rinde
 #define OBJ_PARED_LIBRE_COUNTS           100    // counts de encoder a avanzar tras perder la pared, antes de girar
 
 
@@ -764,6 +765,7 @@ static int32_t  obj_pared_libre_der0 = 0;
 static int32_t  obj_pared_libre_izq0 = 0;
 static uint8_t  obj_pared_linea_confirma_cnt = 0;     // debounce compartido por los 3 estados de pared
 static uint8_t  linea_sensores_activos       = 0;     // sensores de línea sobre el umbral en ESTE ciclo (sin contar los de cuarentena)
+static float    obj_pared_giro_neto          = 0.0f;  // giro neto (gyro, CON signo) desde que arranco el bordeado [grados]
 
 volatile uint8_t contador_tick2ms = 0;
 static uint8_t encoder_muestreo_inicializado = 0;
@@ -1247,6 +1249,19 @@ static uint8_t ObjWall_LineConfirmed(uint8_t linea_detectada, uint8_t linea_igno
     if (obj_pared_linea_confirma_cnt < OBJ_PARED_LINEA_CONFIRMA_CICLOS)
         obj_pared_linea_confirma_cnt++;
     return (obj_pared_linea_confirma_cnt >= OBJ_PARED_LINEA_CONFIRMA_CICLOS);
+}
+
+// Abandona el bordeado: pasa a GIVEN_UP, que queda haciendo balance con freno
+// por encoders, sin buscar la linea, hasta volver a verla o recibir un comando
+// manual. La usan las dos salidas: pared perdida 5 s y giro neto de mas de
+// OBJ_PARED_GIRO_NETO_MAX_GRADOS (girando en circulos).
+static void ObjPared_Rendirse(void)
+{
+    linea_estado               = LINE_STATE_GIVEN_UP;
+    ajuste_direccion           = 0.0f;
+    obj_pared_perdida_desde_ms = 0;
+    obj_pared_rev_latch        = 0;
+    obj_pared_trabado_ms       = 0;
 }
 
 // Si el robot pide moverse y no se mueve (friccion), le suma angulo de a poco
@@ -1751,17 +1766,24 @@ static void Ctrl_LatchesPared(void)
             if (obj_pared_perdida_desde_ms == 0) {
                 obj_pared_perdida_desde_ms = HAL_GetTick();
             } else if (HAL_GetTick() - obj_pared_perdida_desde_ms >= OBJ_PARED_PERDIDA_TIMEOUT_MS) {
-                linea_estado                 = LINE_STATE_GIVEN_UP;
-                ajuste_direccion        = 0.0f;
-                obj_pared_perdida_desde_ms  = 0;
-                obj_pared_rev_latch         = 0;
-                obj_pared_trabado_ms          = 0;
+                ObjPared_Rendirse();
             }
         }
+
+        // ── Giro neto: corta el girar en circulos ──
+        // El timeout de arriba no alcanza: girando en circulos, en cada vuelta el
+        // lateral barre la caja, la ve un instante y lo reinicia. Se integra el
+        // giro CON signo: el bamboleo del balance va y viene y se cancela solo,
+        // pero girar en circulos lo hace crecer sin parar. Rodear la caja entera
+        // son 360 grados netos, asi que un esquive normal nunca llega al tope.
+        obj_pared_giro_neto += ((float)giro_z / 100.0f) * DT_CTRL_FIJO;   // Integracion de Euler del rumbo
+        if (fabsf(obj_pared_giro_neto) > OBJ_PARED_GIRO_NETO_MAX_GRADOS)
+            ObjPared_Rendirse();
     } else {
         obj_pared_rev_latch        = 0;
         obj_pared_trabado_ms         = 0;
         obj_pared_perdida_desde_ms = 0;
+        obj_pared_giro_neto        = 0.0f;   // Fuera del bordeado: la proxima secuencia arranca de cero
     }
 }
 
@@ -4865,7 +4887,8 @@ static void Ctrl_MotoresLinea(void)
              linea_estado == LINE_STATE_OBJ_BORDEAR_PARED ||
              linea_estado == LINE_STATE_OBJ_PARED_LIBRE ||
              linea_estado == LINE_STATE_LOST_AVANZA ||
-             linea_estado == LINE_STATE_EDGE_AVANZA)) {
+             linea_estado == LINE_STATE_EDGE_AVANZA ||
+             linea_estado == LINE_STATE_GIVEN_UP)) {   // Si se rinde todavia girando, frena la rotacion que traia
             // 0.23 = 0.3*(100/131): misma restauración de ganancia efectiva
             // que la corrección de yaw de balance común (ver ahí). giro_z crudo
             // con zona muerta (sin filtro — ver GIROZ_RUMBO_ASIST_ZONA_MUERTA).
